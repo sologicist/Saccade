@@ -308,7 +308,7 @@ async function createWindow() {
   win = new BaseWindow({
     width: 1140,
     height: 700,
-    title: 'AutoCua',
+    title: 'Saccade',
     backgroundColor: BACKGROUND,
     show: false,
     acceptFirstMouse: true,   // macOS: the click that focuses the window lands too

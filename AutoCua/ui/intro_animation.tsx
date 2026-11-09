@@ -22,9 +22,8 @@ const SIDE: [string, string][] = [
     ['Coder use', 'coderuse'], ['Scraper use', 'scraperuse'], ['Minion', 'minion'],
 ];
 
-// "Automatic Computer use agent": per word, the letters that stay for
-// "AutoCua" and the ones that fade.
-const WORDS: [string, string][] = [['Auto', 'matic'], ['C', 'omputer'], ['u', 'se'], ['a', 'gent']];
+
+const WORDS: [string, string][] = [['Saccade', '']];
 
 function Bot({ name, file }: { name: string; file: string }) {
     return (
@@ -56,14 +55,14 @@ export function IntroAnimation() {
                 </div>
             </div>
 
-            <div className="title" role="img" aria-label="AutoCua: Automatic Computer use agent">
+            <div className="title" role="img" aria-label="Saccade: Supervised AI automation">
                 {WORDS.map(([keep, fade], i) => [
                     i > 0 ? <i className="gap" key={'gap' + i}>{'\u00A0'}</i> : null,
                     <span className="word" key={'word' + i}><Letters text={keep} cls="keep" /><Letters text={fade} cls="fade" /></span>,
                 ])}
             </div>
 
-            <div className="sheen" aria-hidden="true"><div className="sheen-art"><Letters text="AutoCua" /></div></div>
+            <div className="sheen" aria-hidden="true"><div className="sheen-art"><Letters text="Saccade" /></div></div>
         </div>
     );
 }

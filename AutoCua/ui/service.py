@@ -3712,7 +3712,7 @@ def open_github():
     navigate the pywebview window itself). Fixed URL — no arbitrary-URL opener."""
     try:
         import webbrowser
-        webbrowser.open("https://github.com/AutoCua/AutoCua")
+        webbrowser.open("https://github.com/sologicist/Saccade")
         return jsonify({'status': 'ok'})
     except Exception:
         debug_exception("open_github")

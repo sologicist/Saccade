@@ -17,14 +17,20 @@ requires = ["maturin>=1.15,<2"]
 build-backend = "maturin"
 
 [project]
-name = "AutoCua"
+name = "Saccade"
 version = "0.1.9"
-description = "AutoCua: an AI agent that operates your computer, shell, browser and iPhone"
+description = "Saccade: supervised AI automation for web platforms with extensible business procedures"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt"]
-authors = [{ name = "Ashish Yadav" }]
+authors = [
+    { name = "Ashish Yadav" },
+    { name = "YA" }
+]
+maintainers = [
+    { name = "YA" }
+]
 keywords = ["agent", "automation", "computer-use", "browser-agent", "llm", "ios"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -94,8 +100,8 @@ dependencies = [
 ios = ["pymobiledevice3>=10; sys_platform == 'darwin'"]
 
 [project.urls]
-Homepage = "https://github.com/AutoCua/AutoCua"
-Source = "https://github.com/AutoCua/AutoCua"
+Homepage = "https://github.com/sologicist/Saccade"
+Source = "https://github.com/sologicist/Saccade"
 
 [tool.maturin]
 # The crate lives inside the package (AutoCua/web) and is imported as
