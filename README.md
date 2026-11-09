@@ -1,10 +1,12 @@
 <div align="center">
 
-<img src="AutoCua/logo/autocua-bots.png" alt="AutoCua" width="820"/>
+<h1>Saccade</h1>
 
-<h1>AutoCua</h1>
+<h3>Supervised AI automation for web platforms. Powered by AutoCua.</h3>
 
-<h3>Automatic Computer Use Agent.<br/>A team of AI agents that works your Mac, Windows, Linux, phone and browser.</h3>
+Saccade is built on the AutoCua project. 
+Original project: https://github.com/sologicist/AutoCua 
+Saccade V1 focuses on web automation, business procedures, supervised execution, and continuous improvement.
 
 [![PyPI](https://img.shields.io/pypi/v/AutoCua?color=4c6ef5&label=pypi)](https://pypi.org/project/AutoCua/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-4c6ef5)](https://pypi.org/project/AutoCua/)

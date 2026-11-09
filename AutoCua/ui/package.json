@@ -1,9 +1,8 @@
 {
-  "name": "autocua-ui",
+  "name": "saccade-ui",
   "private": true,
   "version": "0.1.0",
-  "description": "AutoCua's UI in React + TSX: `npm run build` writes index.js (the page) beside index.html, which loads it; the build is committed and ships with the package.",
-  "type": "module",
+  "description": "Saccade web interface — AI-powered browser automation and supervised business workflows",  "type": "module",
   "scripts": {
     "build": "vite build",
     "watch": "vite build --watch",

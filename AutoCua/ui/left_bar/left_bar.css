@@ -288,3 +288,20 @@ body.settings-open .left-bar-toggle {
     margin-left: auto;
     pointer-events: auto;
 }
+
+/* Saccade branding */
+.left-bar .left-bar-header {
+    gap: 12px;
+}
+
+.left-bar-brand-name {
+    font-size: 21px;
+    font-weight: 650;
+    letter-spacing: -0.6px;
+    color: #30343a;
+    white-space: nowrap;
+}
+
+body.left-bar-collapsed .left-bar-brand-name {
+    display: none;
+}

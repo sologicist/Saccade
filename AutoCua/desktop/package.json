@@ -1,9 +1,9 @@
 {
-  "name": "autocua-desktop",
-  "productName": "AutoCua",
+  "name": "saccade-desktop",
+  "productName": "Saccade",
   "version": "0.1.0",
   "private": true,
-  "description": "AutoCua's desktop window: the app in AutoCua/ui, in Chromium",
+  "description": "Saccade desktop interface for supervised AI web automation",
   "main": "main.js",
   "scripts": {
     "postinstall": "install-electron",
