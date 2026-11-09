@@ -30,7 +30,8 @@ authors = [
 ]
 maintainers = [
     { name = "YA" }
-]keywords = ["agent", "automation", "computer-use", "browser-agent", "llm", "ios"]
+]
+keywords = ["agent", "automation", "computer-use", "browser-agent", "llm", "ios"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

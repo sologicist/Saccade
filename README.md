@@ -5,7 +5,7 @@
 <h3>Supervised AI automation for web platforms. Powered by AutoCua.</h3>
 
 Saccade is built on the AutoCua project. 
-Original project: https://github.com/sologicist/AutoCua 
+Original project: https://github.com/ComputerUseAgent/AutoCua
 Saccade V1 focuses on web automation, business procedures, supervised execution, and continuous improvement.
 
 [![PyPI](https://img.shields.io/pypi/v/AutoCua?color=4c6ef5&label=pypi)](https://pypi.org/project/AutoCua/)
