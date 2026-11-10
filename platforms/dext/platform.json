@@ -1,0 +1,13 @@
+
+{
+  "schema_version": 1,
+  "id": "dext",
+  "name": "Dext",
+  "engine": "web",
+  "start_url": "https://app.dext.com/login",
+  "allowed_hosts": [
+    "app.dext.com"
+  ],
+  "browser": "chrome",
+  "max_steps": 45
+}

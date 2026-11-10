@@ -121,6 +121,9 @@ python-source = "."
 # it, and rust.py builds it from them on the first Android run. One line per
 # platform's suffix; the one that matches nothing is skipped.
 include = [
+    # Technical platform metadata lives beside AutoCua in source and site-packages.
+    # Include only configuration files, never local platform customer data.
+    { path = "platforms/*/platform.json", format = ["sdist", "wheel"] },
     { path = "AutoCua/android/agent_native.pyd", format = "wheel" },   # Windows
     { path = "AutoCua/android/agent_native.so", format = "wheel" },    # macOS, Linux
 ]
@@ -134,6 +137,7 @@ exclude = [
     { path = "AutoCua/web/Cargo.lock", format = "wheel" },
     { path = "AutoCua/web/build.rs", format = "wheel" },
     # never shipped
+    "platforms/*/data/**",
     "AutoCua/web/target/**",
     "AutoCua/web/scratchpad/**",
     "AutoCua/android/target/**",
