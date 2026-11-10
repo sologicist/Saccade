@@ -270,7 +270,8 @@ fn load_domains(root: &Path) -> Option<Vec<Domain>> {
     }
     let mut domains = Vec::new();
     for (name, sites) in by_file {
-        read_domain_file(root, &canonical_root, &name, MAX_PROCEDURE_SIZE)?;
+        // Contents are checked only when this domain applies. A missing skill
+        // for another site must not disable otherwise valid domain knowledge.
         domains.push(Domain { name, root: root.to_path_buf(), canonical_root: canonical_root.clone(), sites, on_site: false });
     }
     Some(domains)
@@ -299,8 +300,8 @@ pub fn new_run(dir: &Path, domain_dir: &Path) {
     if let Ok(mut s) = SKILLS.lock() {
         *s = skills;
     }
-    // Invalid manifests or files fail closed together; generic skills above
-    // remain available independently of domain knowledge.
+    // Invalid manifests fail closed together. Applicable skill files are
+    // guarded at render time; generic skills remain independently available.
     let domain = load_domains(domain_dir).unwrap_or_default();
     if let Ok(mut d) = DOMAIN.lock() {
         *d = domain;
@@ -397,13 +398,13 @@ pub fn domain_block() -> String {
         return String::new();
     };
     let mut shown = Vec::new();
-    for d in domain.iter() {
-        // A missing or unsafe file invalidates the entire domain catalog,
-        // including when that entry belongs to another site.
+    for d in domain.iter().filter(|d| d.on_site) {
+        // Fail closed across all procedures applying to the current URL. A
+        // file for another domain is neither read nor required for this block.
         let Some(content) = read_domain_file(&d.root, &d.canonical_root, &d.name, MAX_PROCEDURE_SIZE) else {
             return String::new();
         };
-        if d.on_site && !content.trim().is_empty() {
+        if !content.trim().is_empty() {
             let sites: Vec<&str> = d.sites.iter().map(|site| site.key.as_str()).collect();
             shown.push(format!("{} - {}\n{}", d.name, sites.join(", "), content.trim()));
         }
@@ -640,7 +641,6 @@ mod tests {
         let generic = Fixture::new();
         generic.write("scraping.md", "Generic scraping procedure.");
         for manifest in [
-            r#"{"app.dext.com":"dext.md","other.test":"missing.md"}"#,
             r#"{"app.dext.com":"dext.md","other.test":"../outside.md"}"#,
             r#"{"app.dext.com":"dext.md","app.dext.com":"dext.md"}"#,
         ] {
@@ -670,7 +670,88 @@ mod tests {
         domain.write("dext.md", "Updated procedure.");
         assert!(domain_block().contains("Updated procedure."));
         std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        assert!(domain_block().contains("Updated procedure."));
+        std::fs::remove_file(domain.0.join("dext.md")).unwrap();
         assert!(domain_block().is_empty());
+        domain.write("dext.md", "Restored procedure.");
+        assert!(domain_block().contains("Restored procedure."));
+    }
+
+    #[test]
+    fn unrelated_missing_files_do_not_disable_the_active_domain() {
+        let _state = STATE_TEST.lock().unwrap();
+        let domain = Fixture::new();
+        let generic = Fixture::new();
+        domain.catalog();
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().contains("Dext procedure"));
+
+        std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        assert!(domain_block().contains("Dext procedure"));
+        follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+        assert!(domain_block().is_empty());
+        domain.write("google_sheets.md", "Restored Sheets procedure.");
+        assert!(domain_block().contains("Restored Sheets procedure."));
+
+        // Startup validates the manifest independently of other sites' files.
+        std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().contains("Dext procedure"));
+        follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+        assert!(domain_block().is_empty());
+        domain.write("google_sheets.md", "Sheets restored after startup.");
+        assert!(domain_block().contains("Sheets restored after startup."));
+    }
+
+    #[test]
+    fn unsafe_content_is_rejected_only_when_its_domain_applies() {
+        let _state = STATE_TEST.lock().unwrap();
+        let domain = Fixture::new();
+        let generic = Fixture::new();
+        domain.catalog();
+        for bytes in [vec![0xff], vec![b'x'; MAX_PROCEDURE_SIZE as usize + 1]] {
+            std::fs::write(domain.0.join("google_sheets.md"), bytes).unwrap();
+            new_run(&generic.0, &domain.0);
+            follow_url("https://app.dext.com/login");
+            assert!(domain_block().contains("Dext procedure"));
+            follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+            assert!(domain_block().is_empty());
+        }
+        std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        std::fs::create_dir(domain.0.join("google_sheets.md")).unwrap();
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().contains("Dext procedure"));
+        follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+        assert!(domain_block().is_empty());
+    }
+
+    #[test]
+    fn all_applicable_procedures_fail_closed_if_one_is_unavailable() {
+        let _state = STATE_TEST.lock().unwrap();
+        let domain = Fixture::new();
+        let generic = Fixture::new();
+        domain.catalog();
+        domain.write("skills.json", r#"{
+            "app.dext.com": "dext.md",
+            "app.dext.com/invoices": "invoice_safety.md",
+            "docs.google.com/spreadsheets": "google_sheets.md"
+        }"#);
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().contains("Dext procedure"));
+        follow_url("https://app.dext.com/invoices/synthetic-id");
+        assert!(domain_block().is_empty());
+        domain.write("invoice_safety.md", "Synthetic invoice safety procedure.");
+        let restored = domain_block();
+        assert!(restored.contains("Dext procedure"));
+        assert!(restored.contains("Synthetic invoice safety procedure."));
+        std::fs::remove_file(domain.0.join("dext.md")).unwrap();
+        assert!(domain_block().is_empty());
+        follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+        assert!(domain_block().contains("Google Sheets procedure."));
     }
 
     #[test]
@@ -695,10 +776,14 @@ mod tests {
         assert!(domain_block().contains(&largest));
         domain.write("dext.md", &format!("{largest}p"));
         assert!(domain_block().is_empty());
-        assert!(load_domains(&domain.0).is_none());
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().is_empty());
         std::fs::write(domain.0.join("dext.md"), [0xff]).unwrap();
         assert!(domain_block().is_empty());
-        assert!(load_domains(&domain.0).is_none());
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().is_empty());
     }
 
     #[cfg(any(unix, windows))]
@@ -748,9 +833,20 @@ mod tests {
             return;
         }
         assert!(domain_block().is_empty());
-        assert!(load_domains(&domain.0).is_none());
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().is_empty());
         std::fs::remove_file(domain.0.join("dext.md")).unwrap();
         domain.write("dext.md", "Dext procedure.");
+        std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        link_file(&outside.0.join("private.md"), &domain.0.join("google_sheets.md")).unwrap();
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/login");
+        assert!(domain_block().contains("Dext procedure."));
+        follow_url("https://docs.google.com/spreadsheets/d/synthetic-id/edit");
+        assert!(domain_block().is_empty());
+        std::fs::remove_file(domain.0.join("google_sheets.md")).unwrap();
+        domain.write("google_sheets.md", "Google Sheets procedure.");
         outside.write("manifest.json", r#"{"app.dext.com":"dext.md"}"#);
         std::fs::remove_file(domain.0.join("skills.json")).unwrap();
         link_file(&outside.0.join("manifest.json"), &domain.0.join("skills.json")).unwrap();

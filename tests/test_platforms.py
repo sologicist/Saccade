@@ -105,7 +105,7 @@ class PlatformContracts(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             platform.id = "changed"
 
-    def test_procedure_is_referenced_without_copying_its_content(self):
+    def test_populated_procedure_is_referenced_without_copying_its_content(self):
         procedure_path = self.domain_dir / "dext.md"
         procedure_path.write_text("Synthetic procedure.\n", encoding="utf-8")
         platform = self.load()
@@ -505,10 +505,12 @@ class PlatformContracts(unittest.TestCase):
 class RepositoryPlatformIntegration(unittest.TestCase):
     """Verify the shipped platform and upstream manifest stay consistent."""
 
-    def test_dext_uses_the_single_empty_native_procedure(self):
+    def test_dext_uses_the_single_native_procedure(self):
         platform = load_platform("dext")
         self.assertEqual(platform.procedure_path, REPOSITORY_ROOT / DOMAIN_DIRECTORY / "dext.md")
-        self.assertEqual(platform.procedure_path.read_bytes(), b"")
+        self.assertTrue(platform.procedure_path.is_file())
+        # Validate UTF-8 without fixing the contents of an operator-taught procedure.
+        platform.procedure_path.read_text(encoding="utf-8")
         self.assertEqual(platform.allowed_hosts, ("app.dext.com",))
         self.assertEqual(platform.start_url, "https://app.dext.com/login")
         self.assertFalse((REPOSITORY_ROOT / "platforms/dext/agent.md").exists())
