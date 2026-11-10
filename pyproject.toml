@@ -134,6 +134,7 @@ exclude = [
     { path = "AutoCua/web/Cargo.lock", format = "wheel" },
     { path = "AutoCua/web/build.rs", format = "wheel" },
     # never shipped
+    "platforms/*/data/**",
     "AutoCua/web/target/**",
     "AutoCua/web/scratchpad/**",
     "AutoCua/android/target/**",

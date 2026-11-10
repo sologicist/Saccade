@@ -141,6 +141,9 @@ screen_record.py
 /AutoCua_data/vault/*
 !/AutoCua_data/vault/README.md
 
+# Local platform customer references must never be versioned.
+/platforms/*/data/
+
 # LEGACY chat location (pre-AutoCua_data) — kept ignored until every checkout has
 # migrated, so a contributor who pulls this change before launching the app can't
 # commit real chat transcripts still sitting in the package folder.
