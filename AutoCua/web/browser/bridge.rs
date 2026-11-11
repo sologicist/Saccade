@@ -191,10 +191,12 @@ pub fn launch_chrome(
 /// LaunchServices without bringing Chrome to the front (the main agent may be
 /// working on the screen). Says whether the request went out, not whether the
 /// worker woke: `take_chrome` waits for its dial.
-fn wake_extension(extension_id: &str) -> bool {
+fn wake_command(chrome: &Path, extension_id: &str, user_data_dir: Option<&Path>) -> Command {
     let url = format!("chrome-extension://{extension_id}/wake.html");
-    let Ok(chrome) = crate::browser::find_chrome() else { return false };
-    let mut cmd = if cfg!(target_os = "macos") {
+    // LaunchServices addresses an application, not a named Chrome profile.
+    // A dedicated profile therefore uses Chrome's own singleton routing on
+    // every OS, with its exact user-data-dir argument.
+    if cfg!(target_os = "macos") && user_data_dir.is_none() {
         let bundle = chrome
             .ancestors()
             .find(|p| p.extension().is_some_and(|e| e == "app"))
@@ -208,9 +210,17 @@ fn wake_extension(extension_id: &str) -> bool {
         c
     } else {
         let mut c = Command::new(chrome);
+        if let Some(directory) = user_data_dir {
+            c.arg(format!("--user-data-dir={}", directory.display()));
+        }
         c.arg(&url);
         c
-    };
+    }
+}
+
+fn wake_extension(extension_id: &str, user_data_dir: Option<&Path>) -> bool {
+    let Ok(chrome) = crate::browser::find_chrome() else { return false };
+    let mut cmd = wake_command(&chrome, extension_id, user_data_dir);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.status().is_ok_and(|s| s.success())
 }
@@ -350,6 +360,49 @@ pub fn open_on_chrome(src: &Path, user_data_dir: Option<PathBuf>) -> SResult<Arc
     let mut bridge = Bridge::open(src, &dest)
         .map_err(|e| ScanErr::s(format!("could not open the bridge to AutoCuaBridge: {e}")))?;
     bridge.take_chrome(user_data_dir)?;
+    Ok(Arc::new(Mutex::new(bridge)))
+}
+
+/// A platform's extension and websocket credentials belong to its dedicated
+/// profile. Publishing them in the generic staged copy would let an already
+/// running personal Chrome dial this run's authenticated bridge instead.
+fn open_scoped_bridge(src: &Path, user_data_dir: &Path) -> io::Result<Bridge> {
+    if !user_data_dir.is_absolute() {
+        return Err(io::Error::other("A scoped Chrome profile must use an absolute directory."));
+    }
+    let manifest: Value = serde_json::from_slice(&fs::read(src.join("manifest.json"))?)
+        .map_err(io::Error::other)?;
+    if manifest.get("key").is_some() {
+        return Err(io::Error::other("A scoped bridge requires a path-derived extension identity, without a shared manifest key."));
+    }
+    fs::create_dir_all(user_data_dir)?;
+    for path in [user_data_dir.to_path_buf(), user_data_dir.join(".saccade-bridge")] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let mut unsafe_path = metadata.file_type().is_symlink() || !metadata.is_dir();
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    unsafe_path |= metadata.file_attributes() & 0x400 != 0;
+                }
+                if unsafe_path {
+                    return Err(io::Error::other("Scoped Chrome profile and bridge directories must be ordinary local directories."));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let destination = user_data_dir.join(".saccade-bridge");
+    // ProfileLease already serializes this dedicated profile. The generic
+    // idle bridge's global lock and configuration belong to another browser.
+    Bridge::open_with(src, &destination, false)
+}
+
+pub fn open_scoped_chrome(src: &Path, user_data_dir: PathBuf) -> SResult<Arc<Mutex<Bridge>>> {
+    let mut bridge = open_scoped_bridge(src, &user_data_dir)
+        .map_err(|error| ScanErr::s(format!("Could not open the dedicated platform bridge: {error}")))?;
+    bridge.take_chrome(Some(user_data_dir))?;
     Ok(Arc::new(Mutex::new(bridge)))
 }
 
@@ -538,7 +591,7 @@ impl Bridge {
             // Nobody dialled: the worker is stopped, or this Chrome has no
             // extension. Wake it before concluding the latter: its wake-up page,
             // opened as a tab of this Chrome, starts the worker and closes itself.
-            if wake_extension(&self.extension_id) && self.wait_connected(WAKE_WAIT)? {
+            if wake_extension(&self.extension_id, user_data_dir.as_deref()) && self.wait_connected(WAKE_WAIT)? {
                 self.note_launch(user_data_dir, true, Vec::new());
                 return Ok(());
             }
@@ -851,6 +904,114 @@ impl Bridge {
             Some(ws) => ws.send(Message::Text(msg.to_string())).is_ok(),
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod scoped_profile_tests {
+    use super::*;
+    use tungstenite::client::IntoClientRequest;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("saccade-private-bridge-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            fs::create_dir_all(root.join("source")).unwrap();
+            fs::write(root.join("source/manifest.json"), r#"{
+                "manifest_version":3,"name":"Synthetic bridge","version":"1.0",
+                "background":{"service_worker":"background.js"}
+            }"#).unwrap();
+            fs::write(root.join("source/background.js"), "// Synthetic extension fixture.\n").unwrap();
+            Self(root)
+        }
+
+        fn bridge(&self, profile: &str) -> Bridge {
+            open_scoped_bridge(&self.0.join("source"), &self.0.join(profile)).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Each fixture owns a new synthetic root. No Chrome is launched.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scoped_profiles_stage_distinct_extension_identities_and_private_credentials() {
+        let fixture = Fixture::new();
+        let first = fixture.bridge("profile-one");
+        let second = fixture.bridge("profile-two");
+        assert_eq!(first.staged(), fixture.0.join("profile-one/.saccade-bridge"));
+        assert_eq!(second.staged(), fixture.0.join("profile-two/.saccade-bridge"));
+        assert_ne!(first.extension_id(), second.extension_id());
+        assert_ne!(first.token(), second.token());
+        assert!(first._run_lock.is_none());
+        assert!(second._run_lock.is_none());
+        for (own, other) in [(&first, &second), (&second, &first)] {
+            let config: Value = serde_json::from_slice(&fs::read(own.staged().join("config.json")).unwrap()).unwrap();
+            let entries = config["bridges"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["port"], own.port());
+            assert_eq!(entries[0]["token"], own.token());
+            assert!(!config.to_string().contains(other.token()));
+            assert_eq!(own.origin, format!("chrome-extension://{}", own.extension_id()));
+        }
+    }
+
+    #[test]
+    fn scoped_staging_rejects_relative_profiles_and_non_directory_destinations() {
+        let fixture = Fixture::new();
+        assert!(open_scoped_bridge(&fixture.0.join("source"), Path::new("relative-profile")).is_err());
+        let profile = fixture.0.join("profile");
+        fs::create_dir(&profile).unwrap();
+        fs::write(profile.join(".saccade-bridge"), "Synthetic ordinary file.").unwrap();
+        assert!(open_scoped_bridge(&fixture.0.join("source"), &profile).is_err());
+        let mut manifest: Value = serde_json::from_slice(&fs::read(fixture.0.join("source/manifest.json")).unwrap()).unwrap();
+        manifest["key"] = json!("Synthetic shared identity must not be accepted.");
+        fs::write(fixture.0.join("source/manifest.json"), manifest.to_string()).unwrap();
+        assert!(open_scoped_bridge(&fixture.0.join("source"), &fixture.0.join("another-profile")).is_err());
+    }
+
+    #[test]
+    fn waking_a_named_profile_cannot_route_to_personal_chrome() {
+        let fixture = Fixture::new();
+        let profile = fixture.0.join("dedicated");
+        let command = wake_command(Path::new("synthetic-chrome"), "extension-id", Some(&profile));
+        let args: Vec<String> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec![format!("--user-data-dir={}", profile.display()),
+            "chrome-extension://extension-id/wake.html".to_string()]);
+        let generic = wake_command(Path::new("synthetic-chrome"), "extension-id", None);
+        assert!(!generic.get_args().any(|arg| arg.to_string_lossy().starts_with("--user-data-dir=")));
+    }
+
+    fn handshake(expected_origin: String, expected_token: String, origin: &str, token: &str) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accept_extension(stream, &expected_token, &expected_origin).is_some()
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut request = format!("ws://{address}/bridge?token={token}").into_client_request().unwrap();
+        request.headers_mut().insert("origin", origin.parse().unwrap());
+        let accepted = tungstenite::client(request, stream).is_ok();
+        assert_eq!(server.join().unwrap(), accepted);
+        accepted
+    }
+
+    #[test]
+    fn another_profiles_extension_cannot_authenticate_even_with_the_current_token() {
+        let fixture = Fixture::new();
+        let first = fixture.bridge("profile-one");
+        let second = fixture.bridge("profile-two");
+        assert!(!handshake(first.origin.clone(), first.token.clone(), &second.origin, first.token()));
+        assert!(!handshake(first.origin.clone(), first.token.clone(), &first.origin, second.token()));
+        assert!(handshake(first.origin.clone(), first.token.clone(), &first.origin, first.token()));
     }
 }
 

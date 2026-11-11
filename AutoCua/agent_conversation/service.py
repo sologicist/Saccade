@@ -68,6 +68,7 @@ class ConversationService:
     # user's own data folder rather than inside the package, a traversal would
     # be far more destructive — so validate before building the path.
     _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+    _platform_lock = threading.RLock()
 
     # ── storage paths ──────────────────────────────────────────────────────
     def root(self) -> Path:
@@ -94,6 +95,81 @@ class ConversationService:
 
     def _session_file(self, session_id) -> Path:
         return self._session_dir(session_id) / "conversation.json"
+
+    def get_platform_binding(self, session_id):
+        """Return (bound, context), distinguishing a generic chat from a new chat.
+
+        Damaged or changed persisted context is an error, never permission to
+        resume a formerly scoped conversation as an unrestricted generic run.
+        """
+        from AutoCua.saccade.platform_config import _check_path, _unique_object
+        from AutoCua.saccade.session_context import SessionConflictError, _validate_context
+
+        path = self._session_dir(session_id) / "platform_session.json"
+        with self._platform_lock:
+            if not path.exists() and not path.is_symlink():
+                marked = "platform_session_version" in self._read_index().get(str(session_id), {})
+                history_path = self._session_file(session_id)
+                if not marked and history_path.is_file():
+                    try:
+                        marked = "platform_session_version" in json.loads(history_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                if marked:
+                    raise SessionConflictError("Platform session metadata is missing. Operator review is required before resuming this chat.")
+                return False, None
+            try:
+                _check_path(path, self.root().resolve())
+                if path.stat().st_size > 65_536:
+                    raise ValueError("Platform session metadata exceeds its size limit.")
+                data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+                if (
+                    not isinstance(data, dict)
+                    or set(data) != {"schema_version", "platform_context"}
+                    or type(data.get("schema_version")) is not int
+                    or data.get("schema_version") != 1
+                ):
+                    raise ValueError("Invalid platform session metadata schema.")
+                context = data["platform_context"]
+                if context is not None:
+                    context = _validate_context(context)
+                return True, context
+            except (OSError, ValueError, TypeError) as error:
+                raise SessionConflictError(f"Cannot resume platform session: {error}") from error
+
+    def bind_platform_context(self, session_id, context):
+        """Persist the exact binding before an agent starts; never replace it silently."""
+        from AutoCua.saccade.session_context import SessionConflictError, _validate_context
+
+        if context is not None:
+            context = _validate_context(context)
+        with self._platform_lock:
+            bound, existing = self.get_platform_binding(session_id)
+            if bound:
+                if existing != context:
+                    raise SessionConflictError("This chat's platform session is fixed. Open a new chat to change it.")
+                return
+            path = self._session_dir(session_id) / "platform_session.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Persist intent first: losing the separate context file must never
+            # turn an already bound chat into an unrestricted generic session.
+            index = self._read_index()
+            index.setdefault(str(session_id), {})["platform_session_version"] = 1
+            index_path = self._index_file()
+            marker_temporary = index_path.with_name("index.platform-session.tmp")
+            try:
+                marker_temporary.write_text(json.dumps(index, indent=2), encoding="utf-8")
+                os.replace(marker_temporary, index_path)
+            finally:
+                marker_temporary.unlink(missing_ok=True)
+            payload = {"schema_version": 1, "platform_context": context}
+            temporary = path.with_name(path.name + ".tmp")
+            try:
+                temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
 
     def _memory_log_file(self, session_id) -> Path:
         # The TRUE, human-readable memory log (exact payload sent to the model).
@@ -362,8 +438,11 @@ class ConversationService:
         f = self._session_file(session_id)
         try:
             f.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"session_id": str(session_id), "history": history}
+            if self._read_index().get(str(session_id), {}).get("platform_session_version"):
+                payload["platform_session_version"] = 1
             with open(f, "w", encoding="utf-8") as fh:
-                json.dump({"session_id": str(session_id), "history": history}, fh, indent=2)
+                json.dump(payload, fh, indent=2)
         except Exception:
             logger.exception("write session %s", session_id)
 
@@ -741,6 +820,11 @@ class ConversationService:
             "agent_mode": meta.get("agent_mode", ""),
             "run_pkg": meta.get("run_pkg") or "",   # legacy rows: lets the sidebar infer the mode icon
         } for sid, meta in index.items()]
+        for item in items:
+            try:
+                item["platform_context"] = self.get_platform_binding(item["id"])[1]
+            except ValueError as error:
+                item["platform_context_error"] = str(error)
         items.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
         return items
 
@@ -764,6 +848,7 @@ class ConversationService:
             "last_done_message": meta.get("last_done_message", ""),
             "run_pkg": meta.get("run_pkg") or "",
             "agent_mode": meta.get("agent_mode", ""),
+            "platform_context": self.get_platform_binding(session_id)[1],
             "exchanges": self._read_exchanges(session_id),
         }
 

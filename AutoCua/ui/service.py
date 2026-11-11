@@ -65,6 +65,10 @@ from AutoCua import data_extraction
 
 # Resumable chat memory + per-chat token tracker. Platform-agnostic, pure-stdlib.
 from AutoCua.agent_conversation.service import conversation
+from AutoCua.saccade.session_context import (
+    UNBOUND, SessionContextError, resolve_platform_context, validate_session_settings,
+)
+from AutoCua.saccade.profile_lease import ProfileBusyError, acquire_web_profile
 from AutoCua.memory_compression.memory_tracker import MemoryTracker
 
 # Markdown -> HTML for everything the agent writes to the user (scratchpad
@@ -2225,7 +2229,30 @@ def start_agent():
     return _start_agent_run(request.get_json() or {})
 
 
+@app.route('/api/platforms', methods=['GET'])
+def registered_platforms():
+    """Expose validated platform metadata without loading procedure contents into chat."""
+    from AutoCua.saccade.platform_registry import list_platforms
+    try:
+        return jsonify({'platforms': [
+            {'id': platform.id, 'name': platform.name, 'engine': platform.engine,
+             'browser': platform.browser, 'start_url': platform.start_url}
+            for platform in list_platforms()
+        ]})
+    except (OSError, ValueError) as error:
+        return jsonify({'error': str(error)}), 400
+
+
+_agent_start_lock = threading.RLock()
+
+
 def _start_agent_run(data, via=None, hooks=None):
+    """Serialize reservations before a run can replace the active UI state."""
+    with _agent_start_lock:
+        return _start_agent_run_locked(data, via=via, hooks=hooks)
+
+
+def _start_agent_run_locked(data, via=None, hooks=None):
     """The run behind /api/start-agent, so a task from elsewhere (the Telegram
     bot) starts the same way and the page shows it as a sent message. data:
     the chat box's fields (provider, model, task, session_id, mode, os,
@@ -2236,9 +2263,13 @@ def _start_agent_run(data, via=None, hooks=None):
     chat session id)). Returns the route's response."""
     global active_agent_stop_event, active_agent_session_id, _latest_run_id, _run_thread
 
+    profile_lease = None
+    thread_started = False
     try:
+        if not isinstance(data, dict):
+            raise SessionContextError("The session request must be a JSON object.")
         hooks = hooks or {}
-        if via and _run_thread is not None and _run_thread.is_alive():
+        if _run_thread is not None and _run_thread.is_alive():
             return jsonify({'error': 'AutoCua is busy with another task'}), 409
         provider = data.get('provider')
         model = data.get('model')
@@ -2247,6 +2278,11 @@ def _start_agent_run(data, via=None, hooks=None):
 
         if not all([provider, model, task]):
             return jsonify({'error': 'Missing provider, model, or task'}), 400
+        if any(not isinstance(value, str) for value in (provider, model, task)):
+            raise SessionContextError("Provider, model and task must be strings.")
+        if any(data.get(key) is not None and not isinstance(data[key], str)
+               for key in ('mode', 'os', 'speed')):
+            raise SessionContextError("Mode, OS and speed must be strings.")
 
         # ── Agent mode: mobile+ios runs the iOS agent, mobile+android the Android
         # agent; anything else = host desktop ──
@@ -2257,6 +2293,8 @@ def _start_agent_run(data, via=None, hooks=None):
                    else 'android' if (agent_mode == 'mobile' and device_os == 'android')
                    else 'web' if agent_mode == 'web'
                    else PLATFORM_PKG)
+        if run_pkg != 'web' and data.get('platform_id') not in (None, ''):
+            raise SessionContextError("A platform can only be selected for Web use.")
         # Every Computer use run is recorded, on a machine that can (not Web use
         # or iOS: their screen box goes once the task is done).
         record = agent_mode == 'computer' and run_recorder.supported()
@@ -2299,6 +2337,29 @@ def _start_agent_run(data, via=None, hooks=None):
         if prior_history is not None and saved_pkg and saved_pkg != run_pkg:
             prior_history = None
 
+        platform_context = None
+        browser_profile = None
+        if run_pkg == 'web':
+            bound, saved_context = conversation.get_platform_binding(chat_session_id)
+            # Existing unbound chats predate platform sessions and are generic.
+            resumed = req_session_id not in (None, 'new') and str(req_session_id) == chat_session_id
+            if not bound and not resumed:
+                saved_context = UNBOUND
+            platform_context = resolve_platform_context(data, saved_context=saved_context)
+            browser_profile = (platform_context['browser_profile'] if platform_context
+                               else data.get('browser_profile'))
+            if platform_context:
+                if 'browser_profile' in data and data['browser_profile'] != browser_profile:
+                    raise SessionContextError("Platform sessions require their dedicated Chrome profile.")
+                if data.get('browser_port') is not None or data.get('single_tab'):
+                    raise SessionContextError("Platform sessions do not support browser side channels or parallel tabs.")
+                validate_session_settings(
+                    platform_context, provider, model, data.get('speed', 'quality'),
+                    data.get('headless', False), browser_profile,
+                )
+            profile_lease = acquire_web_profile(browser_profile)
+            conversation.bind_platform_context(chat_session_id, platform_context)
+
         token_tracker = MemoryTracker(initial_context=_sess.get("context_tokens", 0))
 
         # Memory-bar push — shared factory (Shell use builds the identical
@@ -2309,9 +2370,10 @@ def _start_agent_run(data, via=None, hooks=None):
         active_agent_session_id = str(time.time())   # per-RUN guard
         _latest_run_id = active_agent_session_id
         current_session_id = active_agent_session_id
+        run_stop_event = active_agent_stop_event
 
         def run_agent():
-            stop_event = active_agent_stop_event
+            stop_event = run_stop_event
 
             # Clear stale todo/scratchpad and blank the top-right card immediately;
             # the watchers below repopulate it as soon as the agent writes its plan.
@@ -2497,6 +2559,8 @@ def _start_agent_run(data, via=None, hooks=None):
                     stop_event=stop_event,
                     prior_history=prior_history,   # None for a fresh chat
                     speed=speed,                   # ⚡ fast / ✨ quality (all platforms)
+                    **({'platform_context': platform_context, 'browser_profile': browser_profile,
+                        'profile_lease': profile_lease} if run_pkg == 'web' else {}),
                     **daisy,
                 )
                 # The page shows the phone in the iOS agent's box: no phone window
@@ -2610,9 +2674,17 @@ def _start_agent_run(data, via=None, hooks=None):
                     _run_recorders.pop(current_session_id, None)
                     recorder.stop(tail=2.0)
 
-        thread = threading.Thread(target=run_agent)
+        def run_agent_with_lease():
+            try:
+                run_agent()
+            finally:
+                if profile_lease is not None:
+                    profile_lease.release()
+
+        thread = threading.Thread(target=run_agent_with_lease)
         thread.daemon = True
         thread.start()
+        thread_started = True
         _run_thread = thread
 
         if via and webview_window:
@@ -2628,11 +2700,17 @@ def _start_agent_run(data, via=None, hooks=None):
 
         # Return the chat session id so a brand-new chat's id reaches the frontend,
         # and the run's id: its video finds its turn in the chat by it.
-        return jsonify({'status': 'started', 'session_id': chat_session_id, 'run_id': current_session_id})
+        return jsonify({'status': 'started', 'session_id': chat_session_id, 'run_id': current_session_id,
+                        'platform_context': platform_context})
 
+    except (SessionContextError, ProfileBusyError) as error:
+        return jsonify({'error': str(error), 'status': 'conflict' if error.status_code == 409 else 'invalid'}), error.status_code
     except Exception as e:
         debug_exception("start_agent API")
         return jsonify({'error': error_text(e)}), 500
+    finally:
+        if not thread_started and profile_lease is not None:
+            profile_lease.release()
 
 
 def start_run_from_telegram(task, provider, model, session_id=None, text_callback=None, cli_callback=None,
@@ -3024,6 +3102,14 @@ def run_shell_task(task, provider, model, api_key, run_pkg,
 
 @app.route('/api/start-shell', methods=['POST'])
 def start_shell():
+    """Reserve the shared UI run state before starting the existing Shell path."""
+    with _agent_start_lock:
+        if _run_thread is not None and _run_thread.is_alive():
+            return jsonify({'error': 'AutoCua is busy with another task'}), 409
+        return _start_shell_locked()
+
+
+def _start_shell_locked():
     """Agent mode → Shell use: send the task STRAIGHT to the coder agent.
 
     Slim next to /api/start-agent — no main agent, no todo/milestone watchers
@@ -4046,6 +4132,8 @@ def get_chat(chat_id):
         _exchange_videos(data.get('exchanges'))
         data['last_done_message_html'] = md_render(data.get('last_done_message', ''))
         return jsonify(data)
+    except SessionContextError as error:
+        return jsonify({'error': str(error), 'status': 'conflict'}), 409
     except Exception:
         debug_exception("get_chat")
         return jsonify({'error': 'Failed'}), 500

@@ -79,6 +79,16 @@ const TOOLS_DIALOG_OPEN = "a popup (a JavaScript alert, confirm or prompt) is op
 /// background.js: tells the agent side when a popup opens on a tab (params) or closes
 /// (null), so it shows the popup in place of the page without asking.
 let toolsOnDialog = null;
+/// background.js reports unsupported automatic effects to every scoped line in
+/// this dedicated profile, including tabs not yet adopted by the native scanner.
+let toolsOnScopeReview = null;
+
+function toolsRequireScopeReview(tabId, message) {
+  const owner = toolsOurs.get(tabId);
+  const scoped = !!(owner?.platformScope || owner?.platformScopeEnding);
+  if (owner?.platformScope) owner.platformScope.failure ||= message;
+  return (toolsOnScopeReview ? !!toolsOnScopeReview(tabId, message) : false) || scoped;
+}
 
 /// `work` (a promise of something done in the tab), unless a popup holds that tab or opens
 /// there first: then `onOpen()` answers instead, since `work` would wait for the popup.
@@ -248,7 +258,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     // browser.rs note_dialog: an alert, a confirm or a prompt is left for the model (the
     // page frozen behind it); a "Leave site?" is answered at once and told to the model.
     const kind = (params && params.type) || "dialog";
-    if (kind !== "beforeunload") {
+    if (kind !== "beforeunload" || toolsRequireScopeReview(tabId,
+      "Operator review required: the scoped page opened a beforeunload dialog. Automatic dialog approval is disabled.")) {
       toolsDialogs.set(tabId, params);
       for (const told of [...(toolsDialogWaiters.get(tabId) || [])]) told();
       if (toolsOnDialog) toolsOnDialog(tabId, params);
@@ -1224,6 +1235,10 @@ function toolsReopenText(why, url, reopened, again) {
 /// nothing once the agent is gone or the person took the browser back.
 function toolsReopen(tabId, why) {
   if (!toolsOurs.has(tabId) || toolsReplaced.has(tabId) || toolsLettingGo.has(toolsOurs.get(tabId)) || toolsStoppedByPerson) {
+    return Promise.resolve();
+  }
+  if (toolsRequireScopeReview(tabId,
+    "Operator review required: the scoped page stopped responding or crashed. Automatic tab replacement is disabled.")) {
     return Promise.resolve();
   }
   toolsReplaced.add(tabId);

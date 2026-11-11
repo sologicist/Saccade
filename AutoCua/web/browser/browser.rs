@@ -2392,6 +2392,10 @@ fn show_by_tabs_api(port: u16, window: &Value, url: &str, twins: usize, place: u
 // ---------------------------------------------------------------------------
 
 pub struct ScannerInner {
+    /// A selected platform is an execution policy, never page-provided context.
+    platform_scope: Option<crate::platform_scope::PlatformScope>,
+    scope_initialized: bool,
+    scope_observer_id: String,
     pub port: u16,
     pub out_dir: PathBuf,
     logo_page: PathBuf,
@@ -2515,6 +2519,9 @@ impl ScannerInner {
             .join("logo")
             .join("logo.html");
         ScannerInner {
+            platform_scope: None,
+            scope_initialized: false,
+            scope_observer_id: String::new(),
             port,
             // Scan output is run data, not source: it lives under the CWD's
             // debug/ — the folder the agent wipes at the start of every run —
@@ -2564,6 +2571,208 @@ impl ScannerInner {
             #[cfg(windows)]
             browser_pid: None,
         }
+    }
+
+    pub fn set_platform_scope(&mut self, scope: crate::platform_scope::PlatformScope) {
+        self.platform_scope = Some(scope);
+        self.scope_initialized = false;
+        self.scope_observer_id = format!("{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos());
+    }
+
+    pub fn platform_violation(&self) -> Option<String> {
+        self.platform_scope.as_ref().and_then(|scope| scope.violation().map(str::to_string))
+    }
+
+    pub fn platform_skill_name(&self) -> Option<String> {
+        self.platform_scope.as_ref().map(|scope| format!("{}.md", scope.platform_id))
+    }
+
+    pub fn end_platform_scope(&mut self) -> SResult<()> {
+        if self.platform_scope.is_none() || self.scope_observer_id.is_empty() || !self.bridged() {
+            return Ok(());
+        }
+        let observer = self.scope_observer_id.clone();
+        let reply = self.bridge_request(json!({"type": "platform_scope_end", "observer_id": observer}));
+        self.scope_initialized = false;
+        // Teardown is attempted once even after initialization failed midway.
+        // Native violation state remains sticky until the operator starts anew.
+        self.scope_observer_id.clear();
+        let reply = reply.map_err(|error| self.platform_failure(format!(
+            "Platform cleanup requires operator review: {}", Self::scope_transport_error(error))))?;
+        if reply.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || reply.get("observer_id").and_then(Value::as_str) != Some(observer.as_str())
+            || reply.get("ended").and_then(Value::as_bool) != Some(true)
+            || reply.get("browser_released").and_then(Value::as_bool) != Some(true)
+            || (reply.get("download_policy_restored").and_then(Value::as_bool) != Some(true)
+                && reply.get("retained_for_active_scope").and_then(Value::as_bool) != Some(true))
+            || reply.get("cleanup_failure").and_then(Value::as_str) != Some("") {
+            return Err(self.platform_failure("Platform cleanup is unverified; operator review is required before using this profile again."));
+        }
+        Ok(())
+    }
+
+    fn platform_failure(&mut self, message: impl Into<String>) -> ScanErr {
+        let message = message.into();
+        let message = self.platform_scope.as_mut().map(|scope| scope.fail(message.clone())).unwrap_or(message);
+        ScanErr::s(message)
+    }
+
+    fn scope_transport_error(error: ScanErr) -> String {
+        match error {
+            ScanErr::Scanner(message) => message,
+            ScanErr::Py(error) => error.to_string(),
+        }
+    }
+
+    fn scope_tabs(value: &Value) -> Option<Vec<Value>> {
+        value.as_array()?.iter().map(|tab| {
+            let id = match tab.get("id")? {
+                Value::String(id) if !id.is_empty() => id.clone(),
+                Value::Number(id) => id.to_string(),
+                _ => return None,
+            };
+            let url = tab.get("url")?.as_str()?;
+            let pending = match tab.get("pendingUrl") {
+                Some(value) => value.as_str()?,
+                None => "",
+            };
+            Some(json!({"id": id, "url": url, "pendingUrl": pending}))
+        }).collect()
+    }
+
+    /// Open or resume the scoped surface before any model observation. A resumed
+    /// run never guesses among several pages or navigates away from a login handoff.
+    pub fn initialize_platform_scope(&mut self, resumed: bool) -> SResult<()> {
+        if self.platform_scope.is_none() || self.scope_initialized {
+            return self.check_platform_scope();
+        }
+        if !self.bridged() {
+            return Err(self.platform_failure("Platform sessions require visible Chrome with AutoCuaBridge."));
+        }
+        let observer = self.scope_observer_id.clone();
+        let begun = self.bridge_request(json!({"type": "platform_scope_begin", "observer_id": observer}))
+            .map_err(|e| self.platform_failure(format!("Could not initialize platform observation: {}", Self::scope_transport_error(e))))?;
+        if begun.get("schema_version").and_then(Value::as_i64) != Some(1)
+            || begun.get("observer_id").and_then(Value::as_str) != Some(self.scope_observer_id.as_str()) {
+            return Err(self.platform_failure("The platform observer returned an invalid initialization contract."));
+        }
+        let initial = Self::scope_tabs(begun.get("tabs").unwrap_or(&Value::Null))
+            .ok_or_else(|| self.platform_failure("The platform observer returned invalid tab metadata."))?;
+        let extension_id = self.bridge.as_ref().and_then(|bridge| bridge.lock().ok()
+            .map(|bridge| bridge.extension_id().to_string()));
+        let mut scope = self.platform_scope.take().expect("checked above");
+        let mut authorized = Vec::new();
+        let initial_check: Result<(), String> = (|| {
+            for tab in &initial {
+                let id = tab["id"].as_str().unwrap_or("");
+                let url = tab["url"].as_str().unwrap_or("");
+                if matches!(url, "about:blank" | "chrome://newtab/" | "chrome://new-tab-page/") {
+                    scope.allow_initial_blank(id, url)?;
+                } else if extension_id.as_ref().is_some_and(|extension| {
+                    url == format!("chrome-extension://{extension}/wake.html")
+                }) {
+                    scope.allow_initial_bridge_wake(id, extension_id.as_deref().expect("matched"))?;
+                } else {
+                    scope.validate_url(url)?;
+                    authorized.push(id.to_string());
+                }
+                if let Some(pending) = tab["pendingUrl"].as_str().filter(|url| !url.is_empty()) {
+                    scope.validate_url(pending)?;
+                }
+            }
+            Ok(())
+        })();
+        self.platform_scope = Some(scope);
+        if let Err(message) = initial_check {
+            return Err(self.platform_failure(format!("Operator review required before starting: {message}")));
+        }
+        let target = if resumed {
+            if authorized.len() != 1 {
+                return Err(self.platform_failure("Operator review required: resume needs exactly one authorized page in this profile."));
+            }
+            authorized.remove(0)
+        } else {
+            self.create_tab_raw()?
+        };
+        self.tab_id = Some(target.clone());
+        self.protect_platform_tab(&target)?;
+        if !resumed {
+            let start_url = self.platform_scope.as_ref().expect("scoped").start_url.clone();
+            self.sent_to(&start_url);
+            self.bridge_call(json!({"type": "navigate", "url": start_url}))
+                .map_err(|e| self.platform_failure(format!("Platform navigation failed; operator review required: {}", Self::scope_transport_error(e))))?;
+        }
+        self.scope_initialized = true;
+        self.check_platform_scope()?;
+        self.show_tab(!resumed);
+        Ok(())
+    }
+
+    fn protect_platform_tab(&mut self, target: &str) -> SResult<()> {
+        if self.platform_scope.is_none() {
+            return Ok(());
+        }
+        let observer = self.scope_observer_id.clone();
+        let protected = self.bridge_request(json!({"type": "platform_scope_protect_tab", "observer_id": observer,
+            "tabId": Self::bridge_tab_id(target)}))
+            .map_err(|e| self.platform_failure(format!("Download protection could not be established: {}", Self::scope_transport_error(e))))?;
+        if protected.get("protected").and_then(Value::as_bool) != Some(true) {
+            return Err(self.platform_failure("Download denial has no verified protection receipt."));
+        }
+        Ok(())
+    }
+
+    /// Observe committed and pending URLs plus a bounded navigation-event queue.
+    /// Loss of observation is a sticky failure, never permission to continue.
+    pub fn check_platform_scope(&mut self) -> SResult<()> {
+        let Some(scope) = self.platform_scope.as_ref() else { return Ok(()) };
+        if let Some(message) = scope.violation() {
+            return Err(ScanErr::s(message));
+        }
+        if !self.scope_initialized {
+            return Err(self.platform_failure("The platform surface has not been initialized."));
+        }
+        let observer = self.scope_observer_id.clone();
+        let observed = self.bridge_request(json!({"type": "platform_scope_observe", "observer_id": observer}))
+            .map_err(|e| self.platform_failure(format!("Platform observation was lost; operator review required: {}", Self::scope_transport_error(e))))?;
+        if observed.get("schema_version").and_then(Value::as_i64) != Some(1)
+            || observed.get("observer_id").and_then(Value::as_str) != Some(self.scope_observer_id.as_str()) {
+            return Err(self.platform_failure("The platform observer changed or returned an unsupported contract."));
+        }
+        let failure = observed.get("failure").and_then(Value::as_str)
+            .ok_or_else(|| self.platform_failure("The platform observation failure status is unavailable."))?;
+        if !failure.is_empty() {
+            return Err(self.platform_failure(format!("Operator review required: {failure}")));
+        }
+        let tabs = Self::scope_tabs(observed.get("tabs").unwrap_or(&Value::Null))
+            .ok_or_else(|| self.platform_failure("Could not verify all platform tabs."))?;
+        let events = observed.get("events").and_then(Value::as_array)
+            .ok_or_else(|| self.platform_failure("Could not verify platform navigation events."))?;
+        let current = self.tab_id.clone();
+        let overflow = observed.get("overflow").and_then(Value::as_bool).unwrap_or(true);
+        self.platform_scope.as_mut().expect("scoped")
+            .observe_tabs(&tabs, current.as_deref(), events, overflow).map_err(ScanErr::s)
+    }
+
+    pub fn authorize_platform_action(&mut self, action: &Value) -> SResult<()> {
+        let Some(scope) = self.platform_scope.as_ref() else { return Ok(()) };
+        if let Err(message) = scope.validate_action(action) {
+            return Err(self.platform_failure(message));
+        }
+        self.check_platform_scope()?;
+        if action.get("type").and_then(Value::as_str) == Some("switch_tab") {
+            let index = action.get("id").and_then(|id| crate::controller::service::py_int_value(id).ok());
+            let target = index.and_then(|index| self.listed_tab(index))
+                .ok_or_else(|| self.platform_failure("The requested tab is not in the observed platform tab list."))?;
+            let url = self.tab_url_now(&target);
+            if let Err(message) = self.platform_scope.as_ref().expect("scoped").validate_url(&url) {
+                return Err(self.platform_failure(message));
+            }
+            self.protect_platform_tab(&target)?;
+        }
+        Ok(())
     }
 
     /// The agent just sent the tab it drives to `url` (new_tab, update_tab).
@@ -2639,6 +2848,28 @@ impl ScannerInner {
     /// A request that names no tab (tabs, new_tab, the cursor broadcasts, glow,
     /// release). Answered, or an error the tool reports as it reports any other.
     pub fn bridge_request(&mut self, req: Value) -> SResult<Value> {
+        // Defense in depth for native helpers and automatic tool paths. Only
+        // trusted observation/cosmetic requests and scoped navigation can use
+        // the existing bridge while a platform context is installed.
+        if let Some(scope) = self.platform_scope.as_ref() {
+            let kind = req.get("type").and_then(Value::as_str).unwrap_or("");
+            let allowed = match kind {
+                "navigate" => req.get("url").and_then(Value::as_str)
+                    .map(|url| scope.validate_url(url)).unwrap_or_else(|| Err("Platform navigation requires an explicit URL.".into())),
+                "new_tab" => match req.get("url") {
+                    Some(value) => value.as_str().map(|url| scope.validate_url(url))
+                        .unwrap_or_else(|| Err("Platform navigation requires an explicit URL.".into())),
+                    None => Ok(()), // internal blank-first bootstrap only
+                },
+                "scan" | "tabs" | "platform_scope_begin" | "platform_scope_observe" | "platform_scope_end"
+                | "platform_scope_protect_tab" | "wait_load" | "settle" | "cursor"
+                | "frame" | "glow" | "release" | "activate" => Ok(()),
+                _ => Err(crate::platform_scope::APPROVAL_UNAVAILABLE.to_string()),
+            };
+            if let Err(message) = allowed {
+                return Err(self.platform_failure(message));
+            }
+        }
         let Some(bridge) = self.bridge.clone() else {
             return Err(ScanErr::s("not in extension mode"));
         };
@@ -2682,6 +2913,7 @@ impl ScannerInner {
                     "title": text("title"),
                     "type": "page",
                     "active": t.get("active").cloned().unwrap_or(Value::Bool(false)),
+                    "pendingUrl": text("pendingUrl"),
                     "windowId": t.get("windowId").cloned().unwrap_or(Value::Null),
                     "index": t.get("index").cloned().unwrap_or(Value::Null),
                 }))
@@ -2707,17 +2939,30 @@ impl ScannerInner {
     fn create_tab_raw(&mut self) -> SResult<String> {
         if self.bridged() {
             let r = self.bridge_request(json!({"type": "new_tab"}))?;
-            return r
+            let id = r
                 .get("id")
                 .and_then(Value::as_i64)
                 .map(|i| i.to_string())
-                .ok_or_else(|| ScanErr::s("the extension did not return the new tab's id"));
+                .ok_or_else(|| ScanErr::s("the extension did not return the new tab's id"))?;
+            if let Some(scope) = self.platform_scope.as_mut() {
+                scope.allow_created_blank(&id).map_err(ScanErr::s)?;
+                self.protect_platform_tab(&id)?;
+            }
+            return Ok(id);
         }
         create_tab_impl(self.port)
     }
 
     /// A fresh tab on `url` in the background, by id (open_tab_impl, either mode).
     pub fn open_tab_raw(&mut self, url: &str) -> SResult<String> {
+        if let Some(scope) = self.platform_scope.as_ref() {
+            if let Err(message) = scope.validate_url(url) {
+                return Err(self.platform_failure(message));
+            }
+            let id = self.create_tab_raw()?;
+            self.bridge_call_on(&id, json!({"type": "navigate", "url": url}))?;
+            return Ok(id);
+        }
         if self.bridged() {
             let r = self.bridge_request(json!({"type": "new_tab", "url": url}))?;
             return r
@@ -2838,6 +3083,11 @@ impl ScannerInner {
     /// There is no process to start any more: scanning is a call on the
     /// session below, so "start" means only "have somewhere to point it".
     pub fn start(&mut self) -> SResult<()> {
+        if self.platform_scope.is_some() {
+            // Scoped sessions never silently revive, reopen or adopt a different
+            // surface after a lost observation. The operator starts a fresh run.
+            return self.check_platform_scope();
+        }
         // The browser itself is gone (crashed, killed, quit): bring it back
         // with this agent's tabs before anything else.
         if self.relaunch.is_some() && !port_open(self.port) {
@@ -2964,6 +3214,11 @@ impl ScannerInner {
     /// before the old one closes: closing a window's last tab first would close the
     /// window, and on Windows and Linux the last window takes the browser with it.
     fn recover_tab(&mut self, why: &str) -> SResult<()> {
+        if self.platform_scope.is_some() {
+            return Err(self.platform_failure(format!(
+                "The scoped tab {why}; automatic tab recovery requires operator review."
+            )));
+        }
         let url = self.current_tab_url();
         // Again: the same address, or a tab that is itself one opened again (its page
         // may have moved to another address since, by a redirect or its own script).
@@ -3018,6 +3273,9 @@ impl ScannerInner {
     /// holding the profile) and only reopen their own tab. The model is told
     /// on its next action's result.
     fn revive(&mut self) -> SResult<()> {
+        if self.platform_scope.is_some() {
+            return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
+        }
         let Some((headless, profile)) = self.relaunch.clone() else {
             return Ok(());
         };
@@ -3133,6 +3391,9 @@ impl ScannerInner {
     /// last listing had them. A tab Chrome brought back by itself (a launch that
     /// restores the last session) is taken as it is rather than opened twice.
     fn revive_bridged(&mut self) -> SResult<()> {
+        if self.platform_scope.is_some() {
+            return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
+        }
         let Some(bridge) = self.bridge.clone() else {
             return Ok(());
         };
@@ -3415,12 +3676,16 @@ impl ScannerInner {
     /// screenshot could each be from a different moment if anything went wrong
     /// between writing and reading them.
     pub fn scan_core(&mut self) -> SResult<String> {
+        self.check_platform_scope()?;
         // A scan that fails on something that can be put right is put right and taken
         // again, a few times at most: a failed scan ends the run (the agent loop), and a
         // page that freezes or crashes a second time gets a blank tab, which does neither.
         let mut tries = 0;
         loop {
             let scanned = self.scan_once();
+            // Do not return a tree or picture from a page that moved outside
+            // scope during the trusted scanner's own read.
+            self.check_platform_scope()?;
             let tid = self.tab_id.clone().unwrap_or_default();
             // Debug mode: the page stopped answering (Cdp::rpc's watch). A read that
             // came back anyway came back short.
@@ -5119,7 +5384,7 @@ impl BrowserScanner {
         }
     }
 
-    fn locked<T>(
+    pub(crate) fn locked<T>(
         &self,
         py: Python<'_>,
         f: impl FnOnce(&mut ScannerInner) -> SResult<T> + Send,
@@ -5420,5 +5685,28 @@ impl BrowserScanner {
     #[getter]
     fn out_dir(&self, py: Python<'_>) -> PyResult<String> {
         self.locked(py, |s| Ok(s.out_dir.display().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod platform_observation_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_live_tab_metadata_is_not_coerced_into_an_authorized_snapshot() {
+        for tabs in [
+            json!([{"id": 1, "url": "https://app.dext.com/", "pendingUrl": true}]),
+            json!([{"id": 1, "url": "https://app.dext.com/", "pendingUrl": null}]),
+            json!([{"id": 1, "url": 1}]),
+            json!([{"id": 1}]),
+            json!([{"id": null, "url": "https://app.dext.com/"}]),
+            json!({"id": 1, "url": "https://app.dext.com/"}),
+        ] {
+            assert!(ScannerInner::scope_tabs(&tabs).is_none(), "{tabs}");
+        }
+        let absent_pending = json!([{"id": 1, "url": "https://app.dext.com/"}]);
+        let decoded = ScannerInner::scope_tabs(&absent_pending).unwrap();
+        assert_eq!(decoded[0]["pendingUrl"], "");
+        assert_eq!(decoded[0]["id"], "1");
     }
 }

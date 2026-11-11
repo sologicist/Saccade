@@ -36,6 +36,7 @@ pub mod bridge;
 #[path = "browser/bridge_test.rs"]
 pub mod bridge_test;
 pub mod controller;
+pub mod platform_scope;
 // The page scanner. It used to build as a second binary of this package and
 // run as a subprocess; it is a plain module now, reading pages over the one
 // CDP session browser.rs owns.

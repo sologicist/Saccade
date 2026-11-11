@@ -460,6 +460,35 @@ def run_agent(mode, provider, model, task, os=None,
         return {"status": "success", "message": "desktop app closed"}
 
     kind, mobile_os = _parse_mode(mode, os)
+    if kind == "web" and any(task and str(task).strip() for task in (extra_tasks or [])):
+        raise ValueError("Parallel Web tasks sharing one Chrome profile are unavailable. Start one Web run per profile.")
+    platform_context = None
+    if agent_kwargs.get("platform_id") not in (None, "") and kind != "web":
+        raise ValueError("A platform can only be selected for Web use.")
+    if kind == "web":
+        from AutoCua.saccade.session_context import (
+            SessionContextError, resolve_platform_context, validate_session_settings,
+        )
+        if "platform_context" in agent_kwargs:
+            raise SessionContextError("Pass platform_id rather than an untrusted platform_context.")
+        platform_context = resolve_platform_context(agent_kwargs)
+        if platform_context:
+            profile = platform_context["browser_profile"]
+            if agent_kwargs.get("browser_profile", profile) != profile:
+                raise SessionContextError("Platform sessions require their dedicated Chrome profile.")
+            if agent_kwargs.get("browser_port") is not None or agent_kwargs.get("single_tab"):
+                raise SessionContextError("Platform sessions do not support browser side channels or parallel tabs.")
+            validate_session_settings(
+                platform_context, provider, model, agent_kwargs.get("speed", "quality"),
+                agent_kwargs.get("headless", False), profile,
+            )
+            agent_kwargs["browser_profile"] = profile
+        agent_kwargs.pop("platform_id", None)
+        agent_kwargs.pop("execution_mode", None)
+        agent_kwargs["platform_context"] = platform_context
+        if not platform_context and agent_kwargs.get("headless") and agent_kwargs.get("browser_profile") is None:
+            from AutoCua import DEFAULT_BROWSER_PROFILE
+            agent_kwargs["browser_profile"] = DEFAULT_BROWSER_PROFILE
 
     # Chrome is never downloaded (utils/chrome.py): a computer use or web use
     # run says once when it is missing; a web use run cannot work without it,
@@ -494,6 +523,8 @@ def run_agent(mode, provider, model, task, os=None,
         build = _android_app_build(app_build)
 
     extra = [str(t).strip() for t in (extra_tasks or []) if t and str(t).strip()]
+    if extra and platform_context is not None:
+        raise SessionContextError("Platform sessions support only one interactive task per Chrome profile.")
     if extra:
         if kind == "web":
             return run_parallel_web_agents(
@@ -613,6 +644,13 @@ def run_agent(mode, provider, model, task, os=None,
             preview = _free_ports(1)[0]
             environ[PREVIEW_ENV] = str(preview)
     agent_glow = None
+    profile_lease = None
+    if kind == "web":
+        from AutoCua.saccade.profile_lease import acquire_web_profile
+        if "profile_lease" in agent_kwargs:
+            raise ValueError("The launcher reserves its own Chrome profile lease.")
+        profile_lease = acquire_web_profile(agent_kwargs.get("browser_profile"))
+        kwargs["profile_lease"] = profile_lease
     try:
         if sim_window is not None and emulator is None:
             from AutoCua.utils.sim_view import show_phones
@@ -639,6 +677,8 @@ def run_agent(mode, provider, model, task, os=None,
             show_phones(sim_window, [{"name": f"Android {emulator.version} {emulator.kind}", "port": preview}])
         return agent.process_request(task)
     finally:
+        if profile_lease is not None:
+            profile_lease.release()
         if agent_glow is not None:
             try:
                 agent_glow.stop()
@@ -1097,6 +1137,11 @@ def run_parallel_web_agents(tasks, provider, model, save_conversation=False,
 
     Returns {"status", "message", "results": [{"task", "status", "message"}, ...]}.
     """
+    # Refuse before importing native code or touching Chrome. Existing callers
+    # must not partially launch a group whose children cannot own the profile.
+    if len(tasks) > 1:
+        raise ValueError("Parallel Web tasks sharing one Chrome profile are unavailable. Start one Web run per profile.")
+
     # Importing the package builds the Rust extension ONCE here in the parent,
     # so N children never race the compiler — they find a fresh .so.
     from AutoCua.web.agent import launch_chrome, Bridge, CHROME_PORT

@@ -1160,6 +1160,26 @@ body.left-bar-animating .chat-container-wrapper {
     to   { transform: translateY(-100%); }
 }
 
+.platform-session {
+    padding: 8px 14px 2px;
+    color: #4a4059;
+    font-size: 12px;
+}
+.platform-session[hidden] { display: none; }
+.platform-session-fields { display: flex; flex-wrap: wrap; gap: 12px; }
+.platform-session label { display: flex; align-items: center; gap: 7px; }
+.platform-session select {
+    color: inherit;
+    background: #fff;
+    border: 1px solid #c8c1d2;
+    border-radius: 7px;
+    padding: 5px 8px;
+    max-width: 220px;
+}
+.platform-session select:disabled { opacity: .65; }
+.platform-session-note { margin: 6px 0; font-size: 11px; color: #756b80; }
+.platform-session-note:empty { display: none; }
+
 /* ============================================================
    Web-loading state on a pill.
    When the pill enters .web-loading (CLI agent's web tool is fetching),

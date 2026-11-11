@@ -145,7 +145,13 @@
                 // same row again, a sent task) while this fetch was in flight —
                 // don't repaint their new view.
                 if (seq !== openSeq || window.currentSessionId !== id) return;
-                if (!data || data.error) return;
+                if (!data || data.error) {
+                    document.dispatchEvent(new CustomEvent('platformsession:error'));
+                    return;
+                }
+                document.dispatchEvent(new CustomEvent('platformsession:restore', {
+                    detail: { context: data.platform_context || null, bound: true, busy: running }
+                }));
                 // Full life of the chat: request/outcome pairs (exchanges.json).
                 var exchanges = Array.isArray(data.exchanges) ? data.exchanges : [];
                 // A SHELL chat renders its history in the CLI stage's own notes
@@ -217,7 +223,11 @@
                     document.dispatchEvent(new CustomEvent('agentmode:set', { detail: { mode: 'computer' } }));
                 }
             })
-            .catch(function () { /* non-fatal */ });
+            .catch(function () {
+                if (seq === openSeq && window.currentSessionId === id) {
+                    document.dispatchEvent(new CustomEvent('platformsession:error'));
+                }
+            });
     }
 
     function deleteChat(id, list) {
