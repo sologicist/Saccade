@@ -31,6 +31,10 @@ pub mod stage_bridge;
 // scanner and every tool reach the browser in extension mode.
 #[path = "browser/bridge.rs"]
 pub mod bridge;
+
+#[cfg(windows)]
+#[path = "browser/chrome_pipe.rs"]
+pub mod chrome_pipe;
 // The hand test for AutoCuaBridge (test.command): stages it, restarts the test
 // Chrome and serves the bridge that writes each Test press under debug/.
 #[path = "browser/bridge_test.rs"]

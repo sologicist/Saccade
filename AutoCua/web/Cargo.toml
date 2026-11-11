@@ -46,6 +46,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Chrome's unpacked extension id.
 ring = { version = "0.17", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 opt-level = 3
 lto = true

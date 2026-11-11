@@ -2605,10 +2605,30 @@ impl ScannerInner {
             || reply.get("observer_id").and_then(Value::as_str) != Some(observer.as_str())
             || reply.get("ended").and_then(Value::as_bool) != Some(true)
             || reply.get("browser_released").and_then(Value::as_bool) != Some(true)
-            || (reply.get("download_policy_restored").and_then(Value::as_bool) != Some(true)
-                && reply.get("retained_for_active_scope").and_then(Value::as_bool) != Some(true))
             || reply.get("cleanup_failure").and_then(Value::as_str) != Some("") {
             return Err(self.platform_failure("Platform cleanup is unverified; operator review is required before using this profile again."));
+        }
+        #[cfg(windows)]
+        {
+            let Some(bridge) = self.bridge.clone() else {
+                return Err(self.platform_failure(
+                    "The protected Chrome bridge is unavailable during cleanup."
+                ));
+            };
+
+            let restored = match bridge.lock() {
+                Ok(mut guard) => guard.finish_scoped_download_session(),
+                Err(_) => Err(ScanErr::s(
+                    "The protected Chrome bridge lock is unavailable."
+                )),
+            };
+
+            if let Err(error) = restored {
+                return Err(self.platform_failure(format!(
+                    "Native Chrome cleanup requires operator review: {}",
+                    Self::scope_transport_error(error)
+                )));
+            }
         }
         Ok(())
     }
@@ -2714,13 +2734,59 @@ impl ScannerInner {
         if self.platform_scope.is_none() {
             return Ok(());
         }
-        let observer = self.scope_observer_id.clone();
-        let protected = self.bridge_request(json!({"type": "platform_scope_protect_tab", "observer_id": observer,
-            "tabId": Self::bridge_tab_id(target)}))
-            .map_err(|e| self.platform_failure(format!("Download protection could not be established: {}", Self::scope_transport_error(e))))?;
-        if protected.get("protected").and_then(Value::as_bool) != Some(true) {
-            return Err(self.platform_failure("Download denial has no verified protection receipt."));
+
+        // Require browser-level download denial before allowing a scoped tab.
+        // An extension acknowledgment alone is not sufficient.
+        #[cfg(windows)]
+        {
+            let Some(bridge) = self.bridge.clone() else {
+                return Err(self.platform_failure(
+                    "The protected Chrome bridge is unavailable."
+                ));
+            };
+
+            let verified = match bridge.lock() {
+                Ok(mut guard) => guard.ensure_scoped_downloads_denied(),
+                Err(_) => Err(ScanErr::s(
+                    "The protected Chrome bridge lock is unavailable."
+                )),
+            };
+
+            if let Err(error) = verified {
+                return Err(self.platform_failure(format!(
+                    "Browser-level download protection could not be verified: {}",
+                    Self::scope_transport_error(error)
+                )));
+            }
         }
+
+        #[cfg(not(windows))]
+        {
+            return Err(self.platform_failure(
+                "Browser-level download protection is not implemented on this OS."
+            ));
+        }
+
+        // Native Rust has already verified browser-level download denial.
+        // The extension only confirms that this tab is being observed.
+        let observer = self.scope_observer_id.clone();
+
+        let observed = self.bridge_request(json!({
+            "type": "platform_scope_protect_tab",
+            "observer_id": observer,
+            "tabId": Self::bridge_tab_id(target)
+        }))
+        .map_err(|error| self.platform_failure(format!(
+            "Platform tab observation could not be established: {}",
+            Self::scope_transport_error(error)
+        )))?;
+
+        if observed.get("observed").and_then(Value::as_bool) != Some(true) {
+            return Err(self.platform_failure(
+                "Platform tab observation has no verified receipt."
+            ));
+        }
+
         Ok(())
     }
 
@@ -2734,6 +2800,32 @@ impl ScannerInner {
         if !self.scope_initialized {
             return Err(self.platform_failure("The platform surface has not been initialized."));
         }
+
+        // Reconfirm browser-level download denial before every scoped
+        // observation. A disconnected or restarted Chrome must fail closed.
+        #[cfg(windows)]
+        {
+            let Some(bridge) = self.bridge.clone() else {
+                return Err(self.platform_failure(
+                    "The protected Chrome bridge is unavailable."
+                ));
+            };
+
+            let verified = match bridge.lock() {
+                Ok(mut guard) => guard.ensure_scoped_downloads_denied(),
+                Err(_) => Err(ScanErr::s(
+                    "The protected Chrome bridge lock is unavailable."
+                )),
+            };
+
+            if let Err(error) = verified {
+                return Err(self.platform_failure(format!(
+                    "Protected Chrome connection was lost or download denial could not be verified: {}",
+                    Self::scope_transport_error(error)
+                )));
+            }
+        }
+
         let observer = self.scope_observer_id.clone();
         let observed = self.bridge_request(json!({"type": "platform_scope_observe", "observer_id": observer}))
             .map_err(|e| self.platform_failure(format!("Platform observation was lost; operator review required: {}", Self::scope_transport_error(e))))?;

@@ -185,6 +185,107 @@ pub fn launch_chrome(
     Ok(())
 }
 
+#[cfg(windows)]
+fn chrome_user_data_argument(canonical: &Path) -> SResult<String> {
+    let canonical_text = canonical
+        .to_str()
+        .ok_or_else(|| ScanErr::s("Chrome profile path is not valid Unicode"))?;
+
+    let normal = canonical_text
+        .strip_prefix(r"\\?\")
+        .ok_or_else(|| ScanErr::s(
+            "Expected a canonical Windows drive path for scoped Chrome"
+        ))?;
+
+    let bytes = normal.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+    {
+        return Err(ScanErr::s(
+            "Scoped Chrome requires a local Windows drive profile"
+        ));
+    }
+
+    let resolved = fs::canonicalize(normal)
+        .map_err(|e| ScanErr::s(format!(
+            "Could not verify Chrome profile identity: {e}"
+        )))?;
+
+    if resolved != canonical {
+        return Err(ScanErr::s(
+            "Chrome profile identity changed during path conversion"
+        ));
+    }
+
+    Ok(format!("--user-data-dir={normal}"))
+}
+
+#[cfg(windows)]
+pub fn launch_chrome_with_pipes(
+    profile: &Path,
+    pipes: &crate::chrome_pipe::ChromePipes,
+) -> SResult<u32> {
+    // Never attach this private debugging channel to personal Chrome.
+    if !profile.is_absolute() {
+        return Err(ScanErr::s(
+            "Scoped Chrome requires an absolute dedicated profile."
+        ));
+    }
+
+    fs::create_dir_all(profile).map_err(|error| {
+        ScanErr::s(format!("Could not prepare scoped Chrome profile: {error}"))
+    })?;
+
+    let actual_profile = fs::canonicalize(profile).map_err(|error| {
+        ScanErr::s(format!("Could not verify scoped Chrome profile: {error}"))
+    })?;
+
+    let personal_profile = default_user_data_dir();
+    if personal_profile.exists()
+        && fs::canonicalize(&personal_profile).ok().as_ref() == Some(&actual_profile)
+    {
+        return Err(ScanErr::s(
+            "A scoped session cannot use the personal Chrome profile."
+        ));
+    }
+
+    // Do not silently reuse an existing browser that lacks our CDP pipe.
+    if crate::browser::profile_locked_by_live_chrome(&actual_profile) {
+        return Err(ScanErr::s(
+            "The dedicated Chrome profile is already in use. Close it before retrying."
+        ));
+    }
+
+    let chrome = crate::browser::find_chrome()?;
+
+    let user_data_argument = chrome_user_data_argument(&actual_profile)?;
+
+    let arguments = vec![
+        user_data_argument,
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-features=SkiaGraphite".to_string(),
+        "--remote-debugging-pipe".to_string(),
+        "--enable-unsafe-extension-debugging".to_string(),
+        pipes.chrome_argument(),
+    ];
+
+    crate::chrome_pipe::spawn_chrome_with_explicit_pipes(
+        &chrome,
+        &arguments,
+        pipes,
+    )
+    .map_err(|error| {
+        ScanErr::s(format!(
+            "Could not launch scoped Chrome with private CDP pipes: {error}"
+        ))
+    })
+}
+
+
+
 /// Open the extension's wake-up page (wake.html) in the Chrome already running: a
 /// second Chrome started with a URL hands it to the running one and exits, which
 /// opens the page as a tab there. On macOS `open -g` does the same through
@@ -399,12 +500,29 @@ fn open_scoped_bridge(src: &Path, user_data_dir: &Path) -> io::Result<Bridge> {
     Bridge::open_with(src, &destination, false)
 }
 
-pub fn open_scoped_chrome(src: &Path, user_data_dir: PathBuf) -> SResult<Arc<Mutex<Bridge>>> {
+
+pub fn open_scoped_chrome(
+    src: &Path,
+    user_data_dir: PathBuf,
+) -> SResult<Arc<Mutex<Bridge>>> {
     let mut bridge = open_scoped_bridge(src, &user_data_dir)
-        .map_err(|error| ScanErr::s(format!("Could not open the dedicated platform bridge: {error}")))?;
-    bridge.take_chrome(Some(user_data_dir))?;
+        .map_err(|error| {
+            ScanErr::s(format!(
+                "Could not open the dedicated platform bridge: {error}"
+            ))
+        })?;
+
+    #[cfg(windows)]
+    bridge.start_scoped_protected_chrome(&user_data_dir)?;
+
+    #[cfg(not(windows))]
+    return Err(ScanErr::s(
+        "Protected platform Chrome sessions are not yet implemented on this OS."
+    ));
+
     Ok(Arc::new(Mutex::new(bridge)))
 }
+
 
 /// The websocket handshake with the extension, or nothing: refused without this
 /// launch's token in the path or from any origin but the extension's own, and a
@@ -458,6 +576,8 @@ pub struct Bridge {
     /// `relaunch` starts again when Chrome goes away mid-run; None when Chrome was not
     /// started from here.
     launched: Option<(Option<PathBuf>, bool, Vec<String>)>,
+    #[cfg(windows)]
+    scoped_download_transport: Option<crate::chrome_pipe::ChromePipeTransport>,
 }
 
 impl Drop for Bridge {
@@ -501,6 +621,8 @@ impl Bridge {
             inbox: VecDeque::new(),
             _run_lock,
             launched: None,
+            #[cfg(windows)]
+            scoped_download_transport: None,
         })
     }
 
@@ -535,6 +657,91 @@ impl Bridge {
             Err(_) => false,
         }
     }
+
+
+    /// Require a fresh browser-level acknowledgment before scoped work.
+    #[cfg(windows)]
+    pub fn ensure_scoped_downloads_denied(&mut self) -> SResult<()> {
+        let transport = self.scoped_download_transport.as_mut()
+            .ok_or_else(|| ScanErr::s(
+                "The scoped Chrome CDP connection is unavailable."
+            ))?;
+
+        transport.set_downloads_denied(true)
+            .map_err(|error| ScanErr::s(format!(
+                "Browser-level download denial is not verified: {error}"
+            )))
+    }
+
+    #[cfg(windows)]
+    pub fn finish_scoped_download_session(&mut self) -> SResult<()> {
+        let transport = self.scoped_download_transport.as_mut()
+            .ok_or_else(|| ScanErr::s(
+                "The protected Chrome CDP connection is unavailable."
+            ))?;
+
+        // Restore Chrome's normal download behavior only after
+        // the scoped browser observer has been released.
+        transport.set_downloads_denied(false)
+            .map_err(|error| ScanErr::s(format!(
+                "Chrome download policy restoration failed: {error}"
+            )))?;
+
+        // Close the private CDP channel after successful restoration.
+        self.scoped_download_transport = None;
+
+        Ok(())
+    }
+
+
+    #[cfg(windows)]
+    pub fn start_scoped_protected_chrome(
+        &mut self,
+        profile: &Path,
+    ) -> SResult<()> {
+        if self.scoped_download_transport.is_some() {
+            return Err(ScanErr::s(
+                "A protected Chrome session is already active."
+            ));
+        }
+
+        let pipes = crate::chrome_pipe::ChromePipes::new()
+            .map_err(|error| ScanErr::s(format!(
+                "Could not create private Chrome pipes: {error}"
+            )))?;
+
+        launch_chrome_with_pipes(profile, &pipes)?;
+
+        // Retain the parent pipe ends for the entire scoped session.
+        self.scoped_download_transport = Some(
+            crate::chrome_pipe::ChromePipeTransport::new(pipes)
+        );
+
+        self.ensure_scoped_downloads_denied()?;
+
+        let loaded_id = self.scoped_download_transport
+            .as_mut()
+            .expect("Protected transport was initialized")
+            .load_unpacked_extension(&self.staged)
+            .map_err(|error| ScanErr::s(format!(
+                "AutoCuaBridge could not be loaded: {error}"
+            )))?;
+
+        if loaded_id != self.extension_id {
+            return Err(ScanErr::s(
+                "Chrome loaded an unexpected extension identity."
+            ));
+        }
+
+        if !self.wait_connected(RELAUNCH_WAIT)? {
+            return Err(ScanErr::s(
+                "Protected Chrome started, but AutoCuaBridge did not connect."
+            ));
+        }
+
+        Ok(())
+    }
+
 
     /// Note how Chrome was started, for `relaunch`.
     pub fn note_launch(&mut self, user_data_dir: Option<PathBuf>, restore: bool, extra: Vec<String>) {
@@ -1012,6 +1219,37 @@ mod scoped_profile_tests {
         assert!(!handshake(first.origin.clone(), first.token.clone(), &second.origin, first.token()));
         assert!(!handshake(first.origin.clone(), first.token.clone(), &first.origin, second.token()));
         assert!(handshake(first.origin.clone(), first.token.clone(), &first.origin, first.token()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_chrome_uses_normal_win32_profile_path() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.cache/platform-session/chrome-path-test")
+            .join(format!("profile-{}-{unique}", std::process::id()));
+
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let canonical = std::fs::canonicalize(&directory).unwrap();
+        let argument = super::chrome_user_data_argument(&canonical)
+            .unwrap_or_else(|_| panic!("Chrome profile path conversion failed"));
+
+        let normal = argument
+            .strip_prefix("--user-data-dir=")
+            .expect("Missing Chrome profile argument");
+
+        assert!(!normal.starts_with(r"\\?\"));
+        assert_eq!(normal.as_bytes()[1], b':');
+        assert_eq!(std::fs::canonicalize(normal).unwrap(), canonical);
+
+        std::fs::remove_dir(&directory).unwrap();
     }
 }
 

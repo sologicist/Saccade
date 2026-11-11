@@ -172,23 +172,54 @@ test("generic lines receive no scoped policy, download cancellation or observati
   assert.deepEqual(f.cancellations, []);
 });
 
-test("download protection is exact, mandatory and lost when its debugger detaches", async () => {
-  const f = fixture(), line = f.line();
-  await f.observer.begin(line, "run-one");
-  await assert.rejects(f.observer.protect(line, "run-one", "1"), /exact tab id/i);
-  assert.deepEqual(plain(await f.observer.protect(line, "run-one", 1)), { protected: true });
-  assert.deepEqual(f.calls, [[1, "Page.setDownloadBehavior", { behavior: "deny" }]]);
-  await f.chrome.debugger.onDetach.emit({ tabId: 2 });
-  assert.equal(plain(await f.observer.observe(line, "run-one")).failure, "");
-  await f.chrome.debugger.onDetach.emit({ tabId: 1 });
-  assert.match(plain(await f.observer.observe(line, "run-one")).failure, /protection was detached/i);
 
-  const unavailable = fixture(), second = unavailable.line();
-  await unavailable.observer.begin(second, "run-two");
-  unavailable.failCdp(new Error("CDP denial unavailable"));
-  await assert.rejects(unavailable.observer.protect(second, "run-two", 1), /denial unavailable/);
-  assert.match(plain(await unavailable.observer.observe(second, "run-two")).failure, /denial could not be established/i);
+test("scoped tab observation requires exact identity and stops after debugger detachment", async () => {
+  const f = fixture();
+  const line = f.line();
+
+  await f.observer.begin(line, "run-one");
+
+  // Tab identity must remain exact.
+  await assert.rejects(
+    f.observer.protect(line, "run-one", "1"),
+    /exact tab id/i
+  );
+
+  assert.deepEqual(
+    plain(await f.observer.protect(line, "run-one", 1)),
+    { observed: true }
+  );
+
+  // The extension must not issue browser-level CDP commands.
+  assert.deepEqual(f.calls, []);
+
+  // Detaching an unrelated tab must not stop this observer.
+  await f.chrome.debugger.onDetach.emit({ tabId: 2 });
+
+  assert.equal(
+    plain(await f.observer.observe(line, "run-one")).failure,
+    ""
+  );
+
+  // Losing the watched tab's debugger requires operator review.
+  await f.chrome.debugger.onDetach.emit({ tabId: 1 });
+
+  const observation = plain(
+    await f.observer.observe(line, "run-one")
+  );
+
+  assert.match(
+    observation.failure,
+    /debugger was detached.*operator review/i
+  );
+
+  // The failure must remain sticky.
+  assert.equal(
+    plain(await f.observer.observe(line, "run-one")).failure,
+    observation.failure
+  );
 });
+
 
 test("missing observation capabilities and failed tab reads never fabricate an authorized snapshot", async () => {
   const missing = fixture(), line = missing.line();
@@ -295,57 +326,132 @@ test("scope teardown rejects stale identities without ending another observer", 
   await assert.rejects(f.observer.end(first, "run-one"), /operator review/i);
 });
 
-test("last scoped teardown restores default download behavior and stops cancellation", async () => {
-  const f = fixture(), line = f.line();
+
+
+test("last scoped teardown stops observation without changing native download policy", async () => {
+  const f = fixture();
+  const line = f.line();
+
   await f.observer.begin(line, "run-one");
   await f.observer.protect(line, "run-one", 1);
-  const ended = plain(await f.observer.end(line, "run-one"));
-  assert.deepEqual(ended, { schema_version: 1, observer_id: "run-one", ended: true,
-    download_policy_restored: true, retained_for_active_scope: false, cleanup_failure: "" });
-  assert.deepEqual(f.calls, [
-    [1, "Page.setDownloadBehavior", { behavior: "deny" }],
-    [1, "Page.setDownloadBehavior", { behavior: "default" }],
-  ]);
+
+  const ended = plain(
+    await f.observer.end(line, "run-one")
+  );
+
+  assert.deepEqual(ended, {
+    schema_version: 1,
+    observer_id: "run-one",
+    ended: true,
+    cleanup_failure: "",
+  });
+
+  // Native Rust owns the browser-level download policy.
+  // The extension must neither enable nor restore it.
+  assert.deepEqual(f.calls, []);
+
+  // After teardown, the extension must stop scoped cancellation.
   await f.chrome.downloads.onCreated.emit({ id: 17 });
-  await f.chrome.webNavigation.onBeforeNavigate.emit({ tabId: 1, url: "https://manual.example.test/" });
+
   assert.deepEqual(f.cancellations, []);
   assert.equal(line.platformScope, undefined);
+
+  // The ended observer cannot be used again.
+  await assert.rejects(
+    f.observer.observe(line, "run-one"),
+    /operator review/i
+  );
 });
 
-test("ending one line preserves another scope and defers profile restoration", async () => {
-  const f = fixture(), first = f.line(), second = f.line();
+
+
+test("ending one observer preserves another without changing native download policy", async () => {
+  const f = fixture();
+  const first = f.line();
+  const second = f.line();
+
   await f.observer.begin(first, "run-one");
   await f.observer.protect(first, "run-one", 1);
+
   await f.observer.begin(second, "run-two");
   await f.observer.protect(second, "run-two", 2);
-  const one = plain(await f.observer.end(first, "run-one"));
-  assert.equal(one.retained_for_active_scope, true);
-  assert.equal(one.download_policy_restored, false);
-  assert.equal(f.calls.length, 2);
+
+  // Ending the first observer must not stop the second.
+  const firstEnded = plain(
+    await f.observer.end(first, "run-one")
+  );
+
+  assert.deepEqual(firstEnded, {
+    schema_version: 1,
+    observer_id: "run-one",
+    ended: true,
+    cleanup_failure: "",
+  });
+
+  assert.equal(first.platformScope, undefined);
+  assert.equal(second.platformScope.id, "run-two");
+
+  // The remaining observer must continue detecting downloads.
   await f.chrome.downloads.onCreated.emit({ id: 18 });
+
   assert.deepEqual(f.cancellations, [18]);
-  assert.match(second.platformScope.failure, /download/i);
-  const two = plain(await f.observer.end(second, "run-two"));
-  assert.equal(two.download_policy_restored, true);
-  assert.deepEqual(f.calls.slice(2), [
-    [1, "Page.setDownloadBehavior", { behavior: "default" }],
-    [2, "Page.setDownloadBehavior", { behavior: "default" }],
-  ]);
+
+  const observation = plain(
+    await f.observer.observe(second, "run-two")
+  );
+
+  assert.match(observation.failure, /download/i);
+
+  const secondEnded = plain(
+    await f.observer.end(second, "run-two")
+  );
+
+  assert.equal(secondEnded.ended, true);
+  assert.equal(secondEnded.cleanup_failure, "");
+
+  // The extension must never modify the browser-level CDP policy.
+  assert.deepEqual(f.calls, []);
 });
 
-test("failed policy restoration is explicit but still ends download cancellation", async () => {
-  const f = fixture(), line = f.line();
+
+
+test("observer teardown succeeds after a tab read failure without modifying native download policy", async () => {
+  const f = fixture();
+  const line = f.line();
+
   await f.observer.begin(line, "run-one");
   await f.observer.protect(line, "run-one", 1);
-  f.failCdp(new Error("Synthetic restore failure"));
-  const ended = plain(await f.observer.end(line, "run-one"));
-  assert.equal(ended.ended, true);
-  assert.equal(ended.download_policy_restored, false);
-  assert.match(ended.cleanup_failure, /operator review/i);
+
+  // A failed Chrome tab read must not produce a valid observation.
+  f.failQuery(new Error("Synthetic tab observation failure"));
+
+  await assert.rejects(
+    f.observer.observe(line, "run-one"),
+    /Synthetic tab observation failure/
+  );
+
+  // The observer must still be removable after the failure.
+  const ended = plain(
+    await f.observer.end(line, "run-one")
+  );
+
+  assert.deepEqual(ended, {
+    schema_version: 1,
+    observer_id: "run-one",
+    ended: true,
+    cleanup_failure: "",
+  });
+
+  assert.equal(line.platformScope, undefined);
+
+  // Only native Rust may change the browser-level download policy.
+  assert.deepEqual(f.calls, []);
+
+  // Scoped download cancellation must stop after observer teardown.
   await f.chrome.downloads.onCreated.emit({ id: 19 });
   assert.deepEqual(f.cancellations, []);
-  assert.equal(line.platformScope, undefined);
 });
+
 
 test("automatic effects stay paused while the browser is being released", async () => {
   const f = automaticToolsFixture();
@@ -359,24 +465,35 @@ test("automatic effects stay paused while the browser is being released", async 
   assert.deepEqual(f.created, []);
 });
 
-test("a new scope cannot establish denial until earlier default restoration finishes", async () => {
-  const f = fixture(), first = f.line(), second = f.line();
+test("observer transitions serialize without changing native download policy", async () => {
+  const f = fixture();
+  const first = f.line();
+  const second = f.line();
+
   await f.observer.begin(first, "run-one");
   await f.observer.protect(first, "run-one", 1);
-  let release, started;
-  const restoring = new Promise((resolve) => { started = resolve; });
-  const finish = new Promise((resolve) => { release = resolve; });
-  f.setCdpHook(async (_tabId, _method, parameters) => {
-    if (parameters.behavior === "default") { started(); await finish; }
-  });
+
   const ended = f.observer.end(first, "run-one");
-  await restoring;
   const begun = f.observer.begin(second, "run-two");
-  await Promise.resolve();
-  assert.equal(second.platformScope, undefined);
-  release();
+
   await ended;
   await begun;
-  await f.observer.protect(second, "run-two", 2);
-  assert.deepEqual(f.calls.map((call) => call[2].behavior), ["deny", "default", "deny"]);
+
+  assert.equal(first.platformScope, undefined);
+  assert.equal(second.platformScope.id, "run-two");
+  assert.deepEqual(f.calls, []);
+});
+
+test("scoped downloads must not rely on a tab-level CDP policy", async () => {
+  const f = fixture();
+  const line = f.line();
+
+  await f.observer.begin(line, "run-one");
+  await f.observer.protect(line, "run-one", 1);
+
+  assert.equal(
+    f.calls.some(call => call[1] === "Page.setDownloadBehavior"),
+    false,
+    "Download protection must use browser-level CDP, not chrome.debugger"
+  );
 });

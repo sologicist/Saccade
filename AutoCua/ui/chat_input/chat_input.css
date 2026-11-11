@@ -647,6 +647,11 @@ body.left-bar-animating .chat-container-wrapper {
     z-index: 40;
 }
 
+/* Keep Web platform controls above the main grid. */
+.chat-container-wrapper:has(.platform-session:not([hidden])) {
+    z-index: 40;
+}
+
 /* The wrapper and its content column are layout only and never take a click,
    lifted or not; what is drawn in them takes its own. The agent strip and the
    welcome overlay set theirs above, and .output-stream-area is hidden. */
