@@ -50,6 +50,7 @@ pub mod tree {
 // The web tool registry and its LLM manager. The providers it calls are the
 // shared Python ones in AutoCua/llm_provider.
 pub mod tool_registry {
+    pub mod business;
     pub mod service;
 }
 

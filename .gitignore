@@ -143,6 +143,8 @@ screen_record.py
 
 # Local platform customer references must never be versioned.
 /platforms/*/data/
+/platforms/*/reports/
+/platforms/*/business.local.json
 
 # LEGACY chat location (pre-AutoCua_data) — kept ignored until every checkout has
 # migrated, so a contributor who pulls this change before launching the app can't

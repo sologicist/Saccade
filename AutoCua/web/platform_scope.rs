@@ -189,6 +189,18 @@ impl PlatformScope {
         }
     }
 
+    /// Separate native authorization; JSON flags can never manufacture a permit.
+    pub fn validate_business_action(&self, action: &Value, permit: &crate::tool_registry::business::BusinessPermit) -> Result<(), String> {
+        if self.violation().is_some() || self.platform_id != "dext" || self.execution_mode != "supervised"
+            || permit.platform != self.platform_id || permit.context_revision != self.config_revision
+            || !matches!(permit.effect.as_str(), "read" | "compute")
+            || !matches!(permit.name.as_str(), "dext.bank" | "dext.scribe")
+            || permit.action != *action || action.get("type").and_then(Value::as_str) != Some("call_function") {
+            return Err(APPROVAL_UNAVAILABLE.to_string());
+        }
+        Ok(())
+    }
+
     /// Untouched startup blank tabs may remain in Chrome, but are never valid
     /// action targets. New blank tabs, changed tabs, and browser-internal pages
     /// do not gain an exemption from this bootstrap-only registration.

@@ -691,6 +691,28 @@ fn pair_results(
     Ok(())
 }
 
+/// The existing model-turn execution path, shared by the loop and its native
+/// contracts. Routing and replay pairing must never diverge for business calls.
+fn route_model_actions(py: Python<'_>, controller: &crate::controller::view::ControllerView,
+    actions: &[Value], calls: &[Value], tr: &Bound<'_, PyList>, notes: &[Value], rejects: &[Value]) -> PyResult<Value> {
+    let result = controller.route_action(py, &Value::Array(actions.to_vec()))?;
+    pair_results(tr, calls, notes, rejects, &result)?;
+    Ok(result)
+}
+
+fn business_result_texts(result: &Value) -> Vec<String> {
+    let results = result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![result.clone()]);
+    results.iter().filter(|value| value.get("tool").and_then(Value::as_str) == Some("call_function"))
+        .map(|value| format!("\nFunction result (synthetic):\n```json\n{}\n```\n", view::dumps_pretty(value))).collect()
+}
+
+fn business_review_required(result: &Value) -> bool {
+    let results = result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![result.clone()]);
+    results.iter().any(|value| value.get("tool").and_then(Value::as_str) == Some("call_function")
+        && value.get("status").and_then(Value::as_str) != Some("stopped")
+        && value.get("operator_review_required").and_then(Value::as_bool) == Some(true))
+}
+
 fn whole_envelope(calls: &[Value], compacted: &Value) -> Vec<Value> {
     let envelope = view::dumps_pretty(compacted);
     let mut paired = vec![json!({
@@ -808,6 +830,8 @@ impl AgentService {
             return Err(PyValueError::new_err("Platform sessions do not support parallel tabs or custom debugging ports."));
         }
         let max_steps = scope.as_ref().map(|scope| scope.max_steps).unwrap_or(100);
+        // Scoped debug dumps can contain customer-derived browser/model data.
+        let save_conversation = save_conversation && scope.is_none();
         let context = (!context.is_none()).then(|| {
             let value: Value = pythonize::depythonize(&context).expect("validated JSON context");
             pythonize::pythonize(py, &value).map(|value| value.unbind())
@@ -973,6 +997,8 @@ impl AgentService {
             stop_event.as_ref().map(|e| e.clone_ref(py)),
         )
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+        controller.configure_business(py, context.as_ref().map(|value| value.bind(py)))?;
 
         // Load system prompt — __init__ already downgraded the speed, so the
         // prompt and the tool schema are guaranteed to agree here.
@@ -1203,6 +1229,7 @@ impl AgentService {
                     .set_platform_scope(scope);
             }
         }
+        self.controller.configure_business(py, self.platform_context.as_ref().map(|value| value.bind(py)))?;
         let task: String = task.str()?.extract()?;
         // A run's indexes (what the agent keeps from its scrapes, the `index`
         // tool) are numbered from 1 and stored in a folder of their own,
@@ -1739,6 +1766,17 @@ impl AgentService {
             other => vec![other],
         };
         let core = self.llm_manager.get();
+        // Freeze the trusted source revision before the model chooses a call.
+        // A changed bundle after this point must be rejected, never refreshed
+        // into permission to run the stale selection.
+        match self.controller.refresh_business(py) {
+            Ok(definition) => core.set_business_tool(py, definition)?,
+            Err(_) => {
+                *final_status = "waiting_operator".into();
+                *final_message = "Business catalogue verification failed; operator review required.".into();
+                return Ok(Flow::Break);
+            }
+        }
         // The screens the last scrape read covered go with this input, once,
         // after the page's own screenshot (run_script window.rs). Fast mode
         // sends no picture at all.
@@ -1834,11 +1872,13 @@ impl AgentService {
         } else {
             crate::tool_registry::service::main_tool_names()
         };
+        let mut names = names.clone();
+        if !in_scrape_mode && core.business_enabled() { names.insert("call_function".into()); }
         let (actions_val, calls, rejects, track_vec) =
             crate::tool_registry::service::tool_calls_to_steps(
                 raw_response.get("tool_calls").unwrap_or(&Value::Null),
                 track_params,
-                names,
+                &names,
             );
         let track: Map<String, Value> = track_vec
             .into_iter()
@@ -1893,7 +1933,7 @@ impl AgentService {
         // model enters this branch.
         let mut extra_results: Vec<Value> = Vec::new();
         let is_done = |a: &Value| a.get("type").and_then(Value::as_str) == Some("done");
-        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if self.llm_manager.get().async_tools()
+        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if (self.llm_manager.get().async_tools() || self.platform_context.is_some())
             && actions_val.len() + rejects.len() > 1
             && actions_val.iter().any(|a| is_done(a))
         {
@@ -2137,7 +2177,11 @@ impl AgentService {
 
         // Format the response with emojis for console output.
         let formatted_response = view::format_response_impl(&display_payload, true);
-        println!("{formatted_response}");
+        if self.platform_context.is_some() {
+            println!("Scoped model turn received; contents are available only in the active conversation.");
+        } else {
+            println!("{formatted_response}");
+        }
 
         // Send to frontend if callback exists (omit action from stream).
         // Deliberately UNGUARDED, like the Python original: an exception here
@@ -2212,13 +2256,18 @@ impl AgentService {
             }
 
             // Send action to controller.
-            let action_result: Value = self
-                .controller
-                .route_action(py, &Value::Array(actions_val.clone()))?;
+            let action_result = route_model_actions(py, &self.controller, &actions_val, &calls, tr, &note_results, &reject_results)?;
+            if let Some(callback) = &self.text_callback {
+                for text in business_result_texts(&action_result) { callback.call1(py, (text,))?; }
+            }
             if let Some(message) = self.platform_violation() {
-                pair_results(tr, &calls, &note_results, &reject_results, &action_result)?;
                 *final_status = "waiting_operator".into();
                 *final_message = message;
+                return Ok(Flow::Break);
+            }
+            if business_review_required(&action_result) {
+                *final_status = "waiting_operator".into();
+                *final_message = "Business function requires operator review; no automatic retry was performed.".into();
                 return Ok(Flow::Break);
             }
             // The pictures a scrape read took this step go with the next
@@ -2232,7 +2281,6 @@ impl AgentService {
             // partially run, so record what the controller returned.
             if action_result.get("status").and_then(Value::as_str) == Some("stopped") {
                 println!("\nAgent stopped by user (action interrupted).");
-                pair_results(tr, &calls, &note_results, &reject_results, &action_result)?;
                 *final_status = "incomplete".into();
                 *final_message = "Stopped by user".into();
                 return Ok(Flow::Break);
@@ -2246,7 +2294,6 @@ impl AgentService {
                     .unwrap_or_else(|| "Task completed".to_string());
                 println!("\nTask Complete: {summary}");
                 println!("Agent has finished all tasks. Exiting loop.");
-                pair_results(tr, &calls, &note_results, &reject_results, &action_result)?;
                 *final_status = "success".into();
                 *final_message = summary;
                 return Ok(Flow::Break);
@@ -2254,7 +2301,6 @@ impl AgentService {
 
             // Preserve this step's results as role:"tool" turns keyed to the
             // calls that produced them.
-            pair_results(tr, &calls, &note_results, &reject_results, &action_result)?;
 
             // A run_script scrape or `more` brought records: scrape mode from
             // the next step. `exit_scrape_mode` ran: back to the page, and the
@@ -2396,5 +2442,238 @@ impl AgentService {
 /// Python `str()` of a JSON value (module-local alias of view's helper).
 fn py_str_of_value(v: &Value) -> String {
     view::py_str_of(v)
+}
+
+#[cfg(test)]
+mod business_turn_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::ffi::CString;
+    use std::sync::Arc;
+
+    fn observation(url: &str) -> Value {
+        json!({"schema_version":1, "observer_id":"synthetic-observer", "failure":"", "overflow":false,
+            "downloads_denied":true, "tabs":[{"id":"1", "url":url, "pendingUrl":""}], "events":[]})
+    }
+
+    #[test]
+    fn fake_model_uses_native_registry_controller_pairing_and_real_python_worker() {
+        let _skills = crate::controller::skills::service::STATE_TEST.lock().unwrap();
+        Python::initialize();
+        Python::attach(|py| {
+            let locals = pyo3::types::PyDict::new(py);
+            let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+            locals.set_item("repository", repository.to_string_lossy().as_ref()).unwrap();
+            let setup = CString::new(r#"
+import sys, os, types, threading
+sys.path.insert(0, repository)
+if os.environ.get('SACCADE_TEST_PYTHON'):
+    sys.executable = os.environ['SACCADE_TEST_PYTHON']
+from tests.business_fixtures import BusinessFixture
+fixture = BusinessFixture()
+business_run = fixture.run()
+stop_event = threading.Event()
+context = fixture.context
+module_name = 'AutoCua.llm_provider.llm_manager'
+previous_module = sys.modules.get(module_name)
+fake_llm = types.ModuleType(module_name)
+fake_llm.resolve_model_info = lambda provider, model: {'api_name':'synthetic-offline', 'vision':True, 'display_name':'Synthetic'}
+full_loop = False
+forced_action = None
+mutate_after_decision = False
+class Provider:
+    def __init__(self, tools): self.tools, self.turn = tools, 0
+    def send_request(self, messages, model, screenshot):
+        global forced_action, mutate_after_decision
+        self.turn += 1
+        if forced_action is not None:
+            action, forced_action = forced_action, None
+            if mutate_after_decision:
+                helper = fixture.functions / 'runtime.py'
+                helper.write_bytes(helper.read_bytes() + b'\n')
+                mutate_after_decision = False
+            return {'choices':[{'message':{'content':'','tool_calls':[{'id':'forced-note','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic negative contract','next_goal':'Verify denial'}},{'id':'forced-call','name':'call_function','arguments':action}]}}], 'usage':{}}
+        if full_loop and self.turn > 1:
+            return {'choices':[{'message':{'content':'','tool_calls':[{'id':'note-2','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic result verified','next_goal':'Finish'}},{'id':'done-2','name':'done','arguments':{'value':'Synthetic computation completed'}}]}}], 'usage':{}}
+        return {'choices':[{'message':{'content':'', 'tool_calls':[{'id':'note-1','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic memory','next_goal':'Synthetic bank proof'}},{'id':'bank-1', 'name':'call_function', 'arguments':{'version':1,'name':'dext.bank','arguments':{'string':'SYNTHETIC BANK','client_id':'synthetic-alpha'}}}]}}], 'usage':{}}
+fake_llm.build_provider = lambda provider, model, info, tools, **kwargs: Provider(tools)
+sys.modules[module_name] = fake_llm
+"#).unwrap();
+            py.run(&setup, Some(&locals), None).unwrap();
+            let fixture = locals.get_item("fixture").unwrap().unwrap();
+            let root: String = fixture.getattr("root").unwrap().str().unwrap().extract().unwrap();
+            let mut scanner = crate::browser::ScannerInner::new(&PathBuf::from(&root).join("browser"), 0, None, false);
+            let context: Value = pythonize::depythonize(&locals.get_item("context").unwrap().unwrap()).unwrap();
+            scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&context).unwrap());
+            scanner.business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 24]));
+            let scanner = Arc::new(Mutex::new(scanner));
+            let stop = locals.get_item("stop_event").unwrap().unwrap().unbind();
+            let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root), None, false, scanner.clone(), Some(stop)).unwrap();
+            let run = locals.get_item("business_run").unwrap().unwrap();
+            controller.business_fixture(run.clone().unbind());
+            let manager = crate::tool_registry::service::LLMManager::build(py, "openai", "synthetic", None, false, "main", "quality", false).unwrap();
+            manager.set_business_tool(py, controller.refresh_business(py).unwrap()).unwrap();
+            assert!(manager.business_enabled());
+            assert!(!crate::tool_registry::service::main_tool_names().contains("call_function"));
+            let response = py.detach(|| manager.send_rust(&[json!({"role":"user","content":"Synthetic operator request"})], &[])).unwrap_or_else(|_| panic!("Synthetic provider failed"));
+            let raw = match response { crate::tool_registry::service::SendOutcome::Native(value) => value, _ => panic!("native response required") };
+            let mut names = crate::tool_registry::service::main_tool_names().clone();
+            names.insert("call_function".into());
+            let (actions, calls, rejects, _) = crate::tool_registry::service::tool_calls_to_steps(&raw["tool_calls"], &[], &names);
+            assert!(rejects.is_empty());
+            assert_eq!(actions[0]["type"], "reasoning");
+            let notes = vec![json!({"tool_call_id":"note-1","content":view::REASONING_RESULT})];
+            let (actions, calls): (Vec<_>, Vec<_>) = actions.into_iter().zip(calls).filter(|(a, _)| a["type"] != "reasoning").unzip();
+            let tr = PyList::empty(py);
+            tr.append(py.None()).unwrap();
+            let result = route_model_actions(py, &controller, &actions, &calls, &tr, &notes, &[]).unwrap();
+            assert_eq!(result["result"], json!({"compte":"40100000"}), "{result}");
+            assert!(business_result_texts(&result)[0].contains("40100000"));
+            let encoded: String = tr.get_item(0).unwrap().extract().unwrap();
+            let paired = view::decode_results(&encoded);
+            assert_eq!(paired[0]["tool_call_id"], "note-1");
+            assert_eq!(paired[1]["tool_call_id"], "bank-1");
+            assert_eq!(run.getattr("receipts").unwrap().len().unwrap(), 1);
+            let valid = actions[0].clone();
+            let mut invalid = valid.clone(); invalid["name"] = json!("dext._private");
+            let mixed_calls = vec![json!({"id":"denied"}), json!({"id":"not-run"})];
+            let result = route_model_actions(py, &controller, &[invalid, valid.clone()], &mixed_calls, &tr, &[], &[]).unwrap();
+            assert_eq!(result["results"].as_array().unwrap().len(), 2);
+            assert_eq!(result["results"][0]["status"], "error");
+            assert_eq!(result["results"][1]["status"], "not_run");
+            let result = controller.route_action(py, &json!([valid, {"type":"done","value":"unverified"}])).unwrap();
+            assert_eq!(result["results"][0]["code"], "done_must_be_alone");
+            for name in ["dext._private", "other.bank", "os.system"] {
+                let mut denied = valid.clone(); denied["name"] = json!(name);
+                let result = route_model_actions(py, &controller, &[denied], &calls, &tr, &[], &[]).unwrap();
+                assert_eq!(result["status"], "error");
+            }
+            let unverified = json!({"type":"call_function","version":1,"name":"dext.scribe",
+                "arguments":{"pdf":"fixture-one","client_id":"synthetic-alpha","sens":"achat"}});
+            let result = route_model_actions(py, &controller, &[unverified], &calls, &tr, &[], &[]).unwrap();
+            assert_eq!(result["code"], "verified_download_receipt_required");
+            assert_eq!(run.getattr("receipts").unwrap().len().unwrap(), 1);
+            // A change after the model chooses must not execute stale code.
+            py.run(&CString::new("helper = fixture.functions / 'runtime.py'; helper.write_bytes(helper.read_bytes() + b'\\n')").unwrap(), Some(&locals), None).unwrap();
+            let result = route_model_actions(py, &controller, &[valid.clone()], &calls, &tr, &[], &[]).unwrap();
+            assert_eq!(result["code"], "business_revision_changed");
+            assert_eq!(run.getattr("receipts").unwrap().len().unwrap(), 1);
+            controller.refresh_business(py).unwrap();
+            // The stop event is set by a Python thread while Rust holds its
+            // normal PyO3 call into the real bounded worker dispatcher.
+            py.run(&CString::new(r#"
+source = fixture.functions / 'functions.py'
+original_source = source.read_bytes()
+marker = fixture.root / 'worker-started.txt'
+source.write_bytes(original_source + ('\nfrom pathlib import Path\nimport time\nPath(' + repr(str(marker)) + ').write_text("synthetic ready")\ntime.sleep(30)\n').encode())
+def cancel_started_worker():
+    import time
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop_event.set()
+"#).unwrap(), Some(&locals), None).unwrap();
+            controller.refresh_business(py).unwrap();
+            py.run(&CString::new("timer = threading.Thread(target=cancel_started_worker); timer.start()").unwrap(), Some(&locals), None).unwrap();
+            let result = route_model_actions(py, &controller, &[valid.clone()], &calls, &tr, &[], &[]).unwrap();
+            assert_eq!(result["status"], "stopped");
+            assert_eq!(result["code"], "worker_cancelled");
+            py.run(&CString::new("timer.join(); assert marker.is_file(); stop_event.clear(); source.write_bytes(original_source)").unwrap(), Some(&locals), None).unwrap();
+            controller.refresh_business(py).unwrap();
+            // Redirects during a computation replace success with operator review.
+            scanner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![
+                observation("https://app.dext.com/login"), observation("https://app.dext.com/login"), observation("https://unauthorized.test/")]));
+            let result = route_model_actions(py, &controller, &[valid], &calls, &tr, &[], &[]).unwrap();
+            assert_eq!(result["status"], "error");
+            assert_eq!(result["operator_review_required"], true);
+            assert!(scanner.lock().unwrap().platform_violation().is_some());
+            assert_eq!(run.getattr("receipts").unwrap().len().unwrap(), 2);
+            // Exercise the real process_request loop too: the page/model,
+            // compression service and lease handle are synthetic boundaries.
+            // The actual native constructor's OS lease is covered separately.
+            py.run(&CString::new(r#"
+import AutoCua
+from AutoCua.saccade import session_context, business_run as business_module
+original_business_class = business_module.BusinessRun
+original_vision_check = session_context._registered_vision_model
+original_data_root = AutoCua.data_root
+original_web_override = os.environ.get('AutoCua_WEB_DIR')
+os.environ['AutoCua_WEB_DIR'] = str(fixture.root / 'native-web')
+AutoCua.data_root = lambda: fixture.root / 'local-data'
+session_context._registered_vision_model = lambda provider, model: True
+loop_runs = []
+def loop_business_factory(context):
+    assert context == fixture.context
+    result = fixture.run()
+    loop_runs.append(result)
+    return result
+business_module.BusinessRun = loop_business_factory
+full_loop = True
+chat_results = []
+fake_lease = types.SimpleNamespace(ensure_held=lambda:None, release=lambda:None)
+compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *args:None,
+    maybe_trigger=lambda *args:None, finish_run=lambda:None)
+"#).unwrap(), Some(&locals), None).unwrap();
+            let browser = BrowserScanner::create(&PathBuf::from(&root).join("browser"), 0, None, None, false);
+            browser.inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 128]));
+            let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root).join("full-loop"), None, false, browser.inner.clone(), None).unwrap();
+            let service = AgentService {
+                active_run: Mutex::new(()), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
+                context_provider: "openai".into(), context_model: "synthetic".into(), profile_name: Some("saccade-dext".into()),
+                profile_lease: locals.get_item("fake_lease").unwrap().unwrap().unbind(), owns_profile_lease: false,
+                max_steps: 4, speed: "quality".into(), headless: false, save_conversation: false, browser_port: 0,
+                system_prompt: "Synthetic supervised native-loop contract. Use notes first and done alone.".into(),
+                llm_manager: Py::new(py, crate::tool_registry::service::LLMManager::build(py, "openai", "synthetic", None, false, "main", "quality", false).unwrap()).unwrap(),
+                stop_event: None, scanner: Py::new(py, browser).unwrap(), controller,
+                compression: locals.get_item("compression").unwrap().unwrap().unbind(),
+                text_callback: Some(locals.get_item("chat_results").unwrap().unwrap().getattr("append").unwrap().unbind()),
+                tool_callback: None, token_callback: None, prior_history: None,
+                state: Mutex::new(RunState { assistant_messages: PyList::empty(py).into_any().unbind(),
+                    tool_responses: PyList::empty(py).into_any().unbind(), last_messages: py.None(),
+                    scrape_mode: false, scrape_start: None, scrape_shots: Vec::new() }),
+            };
+            let task = pyo3::types::PyString::new(py, "Classify only the operator-supplied synthetic bank label.").into_any();
+            let completion = service.process_request(py, task).unwrap();
+            let completion: Value = pythonize::depythonize(completion.bind(py)).unwrap();
+            assert_eq!(completion["status"], "success", "{completion}");
+            let state = service.state.lock().unwrap();
+            let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
+            assert_eq!(turns.len(), 2);
+            assert!(view::decode_results(&turns[0]).iter().any(|r| r["tool_call_id"] == "bank-1" && r["content"].as_str().unwrap_or_default().contains("40100000")));
+            assert!(locals.get_item("chat_results").unwrap().unwrap().str().unwrap().to_string().contains("40100000"));
+            drop(state);
+            for (name, arguments, expected_status, expected_receipts, change_source) in [
+                ("dext._private", json!({"string":"SYNTHETIC BANK","client_id":"synthetic-alpha"}), "waiting_operator", 0, false),
+                ("dext.bank", json!({"string":"OTHER BANK","client_id":"synthetic-other"}), "waiting_operator", 0, false),
+                ("dext.scribe", json!({"pdf":"fixture-one","client_id":"synthetic-alpha","sens":"achat"}), "waiting_operator", 0, false),
+                ("dext.bank", json!({"string":"SYNTHETIC BANK","client_id":"synthetic-alpha"}), "waiting_operator", 0, true),
+                ("dext.bank", json!({"string":"AMBIGUOUS","client_id":"synthetic-alpha"}), "waiting_operator", 1, false),
+            ] {
+                locals.set_item("forced_action", pythonize::pythonize(py, &json!({"version":1,"name":name,"arguments":arguments})).unwrap()).unwrap();
+                locals.set_item("mutate_after_decision", change_source).unwrap();
+                let task = pyo3::types::PyString::new(py, "Verify the synthetic business contract only.").into_any();
+                let result = service.process_request(py, task).unwrap();
+                let result: Value = pythonize::depythonize(result.bind(py)).unwrap();
+                assert_eq!(result["status"], expected_status, "{name}: {result}");
+                let runs = locals.get_item("loop_runs").unwrap().unwrap();
+                let latest = runs.get_item(runs.len().unwrap() - 1).unwrap();
+                assert_eq!(latest.getattr("receipts").unwrap().len().unwrap(), expected_receipts);
+                if arguments.get("string").and_then(Value::as_str) == Some("AMBIGUOUS") {
+                    let state = service.state.lock().unwrap();
+                    let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
+                    assert!(turns[0].contains("null"));
+                }
+            }
+            py.run(&CString::new(r#"
+assert len(loop_runs) == 6 and len(loop_runs[0].receipts) == 1
+business_module.BusinessRun = original_business_class
+session_context._registered_vision_model = original_vision_check
+AutoCua.data_root = original_data_root
+if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)
+else: os.environ['AutoCua_WEB_DIR'] = original_web_override
+"#).unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("fixture.close(); sys.modules.pop(module_name, None); sys.modules.update({module_name:previous_module} if previous_module is not None else {})").unwrap(), Some(&locals), None).unwrap();
+        });
+    }
 }
 

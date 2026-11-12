@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "platform_id": "dext",
+  "functions": [
+    {"name": "dext.bank", "module": "functions.py", "symbol": "bank", "effect": "compute", "capabilities": ["synthetic_reference"], "description": "Ask the trusted offline fake accounting provider to classify an explicitly supplied synthetic label using the entire current client reference. Returns only compte or null. A real provider would require separate external-disclosure approval and is unavailable here."},
+    {"name": "dext.scribe", "module": "functions.py", "symbol": "scribe", "effect": "compute", "capabilities": ["verified_offline_fixture"], "description": "Validate a structured synthetic invoice proposal. Live or unverified PDFs are blocked until causal download receipts exist. Never writes accounting data."}
+  ]
+}
