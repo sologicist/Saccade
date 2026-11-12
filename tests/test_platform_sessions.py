@@ -416,6 +416,41 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertEqual(self.service.active_agent_session_id, run_id)
         self.assertEqual(len(self.created), 1)
 
+    def test_dext_operator_route_is_authenticated_origin_bound_and_chat_bound(self):
+        response = self.post(platform_id="dext")
+        self.finish_run()
+        sid = response.json["session_id"]
+        url = f"/api/dext/control?session_id={sid}"
+        self.assertEqual(self.client.get(url, base_url=self.base_url).status_code, 403)
+        self.assertEqual(self.client.get("/api/dext/control?session_id=other", headers=self.headers, base_url=self.base_url).status_code, 409)
+        status = self.client.get(url, headers=self.headers, base_url=self.base_url)
+        self.assertEqual(status.status_code, 200, status.json)
+        self.assertEqual(status.headers['Cache-Control'], 'no-store')
+        self.assertIs(self.created[0].kwargs["dext_control"], self.service._dext_control)
+        body = {"event": "teach", "review_token": status.json["review_token"], "routes": ["workspace", "invoices", "record"]}
+        for origin in (None, "https://app.dext.com", "https://evil.test"):
+            headers = {**self.headers, **({"Origin": origin} if origin else {})}
+            self.assertEqual(self.client.post(url, json=body, headers=headers, base_url=self.base_url).status_code, 403)
+        headers = {**self.headers, "Origin": self.base_url}
+        wrong = self.client.post(url, json={**body, "review_token": "yes"}, headers=headers, base_url=self.base_url)
+        self.assertEqual(wrong.status_code, 409)
+        self.assertEqual(self.client.post(url, json=body, headers=headers, base_url=self.base_url).status_code, 200)
+        preview = self.client.get(url, headers=self.headers, base_url=self.base_url).json
+        proposal = preview["proposal"]
+        review = {"event": "review", "review_token": status.json["review_token"], "approve": True,
+                  **{key: proposal[key] for key in ("proposal_id", "base_revision", "candidate_revision")}}
+        self.assertEqual(self.client.post(url, json=review, headers=headers, base_url=self.base_url).status_code, 200)
+        active = self.client.get(url, headers=self.headers, base_url=self.base_url).json
+        self.assertNotEqual(active["active"]["current"], active["pinned_revision"])
+        self.assertEqual(self.client.post(url, json=review, headers=headers, base_url=self.base_url).status_code, 409)
+
+    def test_generic_chat_has_no_dext_operator_control(self):
+        response = self.post()
+        self.finish_run()
+        self.assertIsNone(self.created[0].kwargs["dext_control"])
+        url = "/api/dext/control?session_id=" + response.json["session_id"]
+        self.assertEqual(self.client.get(url, headers=self.headers, base_url=self.base_url).status_code, 409)
+
     def test_shell_start_cannot_steal_the_stop_channel_of_an_active_web_run(self):
         self.release.clear()
         first = self.post(platform_id="dext")

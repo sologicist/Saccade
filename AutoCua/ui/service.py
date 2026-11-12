@@ -1053,6 +1053,10 @@ active_agent_session_id = None
 # The thread of the run going on (start-agent or start-shell), so a task from
 # elsewhere (Telegram) can tell the app is busy.
 _run_thread = None
+# Only this UI-owned object receives operator decisions. Its review token, DOM
+# preview and dossier claims never enter model messages or conversation history.
+_dext_control = None
+_dext_control_lock = threading.RLock()
 # The newest run's id. Unlike active_agent_session_id, Stop and New chat leave
 # it alone: an older run's late video must never land on a newer run's turn.
 _latest_run_id = None
@@ -2252,6 +2256,41 @@ def _start_agent_run(data, via=None, hooks=None):
         return _start_agent_run_locked(data, via=via, hooks=hooks)
 
 
+@app.after_request
+def _private_dext_control_response(response):
+    from flask import request
+    if request.path == '/api/dext/control':
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/dext/control', methods=['GET', 'POST'])
+def dext_operator_control():
+    """Independent local operator channel under the app's existing auth guard."""
+    from flask import request
+    from AutoCua.saccade.business_contract import BusinessError
+    if request.method == 'POST' and request.headers.get('Origin', '').lower() not in _LOCAL_ORIGINS:
+        return jsonify({'error': 'operator_origin_required'}), 403
+    with _dext_control_lock:
+        control = _dext_control
+        if control is None or request.args.get('session_id') != control.session_id:
+            return jsonify({'error': 'dext_control_unavailable'}), 409
+        try:
+            if request.method == 'GET':
+                return jsonify(control.status())
+            if not request.is_json or request.content_length is None or request.content_length > 8192:
+                return jsonify({'error': 'invalid_operator_event'}), 400
+            # Use the strict business codec, including duplicate-key rejection.
+            from AutoCua.saccade.business_contract import loads
+            body = loads(request.get_data(), 8192)
+            busy = _run_thread is not None and _run_thread.is_alive()
+            return jsonify(control.operator_event(body, busy=busy))
+        except BusinessError as error:
+            return jsonify({'error': str(error)}), 409
+        except Exception:
+            return jsonify({'error': 'dext_control_verification_failed'}), 409
+
+
 def _start_agent_run_locked(data, via=None, hooks=None):
     """The run behind /api/start-agent, so a task from elsewhere (the Telegram
     bot) starts the same way and the page shows it as a sent message. data:
@@ -2261,10 +2300,11 @@ def _start_agent_run_locked(data, via=None, hooks=None):
     send it. hooks: {"text", "cli", "done"}, the caller's own callbacks beside
     the page's (the bot's banner, and its reply to the phone: done(outcome,
     chat session id)). Returns the route's response."""
-    global active_agent_stop_event, active_agent_session_id, _latest_run_id, _run_thread
+    global active_agent_stop_event, active_agent_session_id, _latest_run_id, _run_thread, _dext_control
 
     profile_lease = None
     thread_started = False
+    run_dext_control = None
     try:
         if not isinstance(data, dict):
             raise SessionContextError("The session request must be a JSON object.")
@@ -2371,6 +2411,17 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         _latest_run_id = active_agent_session_id
         current_session_id = active_agent_session_id
         run_stop_event = active_agent_stop_event
+        run_dext_control = None
+        with _dext_control_lock:
+            if _dext_control is not None:
+                _dext_control.close()
+            _dext_control = None
+            if platform_context and platform_context['platform_id'] == 'dext' and platform_context['execution_mode'] == 'supervised':
+                from AutoCua.saccade.dext_control import DextRunControl
+                from AutoCua.saccade.platform_registry import PROJECT_ROOT
+                run_dext_control = DextRunControl(platform_context, chat_session_id,
+                                                 project_root=PROJECT_ROOT, stop_event=run_stop_event)
+                _dext_control = run_dext_control
 
         def run_agent():
             stop_event = run_stop_event
@@ -2560,7 +2611,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     prior_history=prior_history,   # None for a fresh chat
                     speed=speed,                   # ⚡ fast / ✨ quality (all platforms)
                     **({'platform_context': platform_context, 'browser_profile': browser_profile,
-                        'profile_lease': profile_lease} if run_pkg == 'web' else {}),
+                        'profile_lease': profile_lease,
+                        'dext_control': run_dext_control} if run_pkg == 'web' else {}),
                     **daisy,
                 )
                 # The page shows the phone in the iOS agent's box: no phone window
@@ -2594,6 +2646,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
             finally:
                 data_extraction.chat_id = None
                 stop_event.set()
+                if run_dext_control is not None:
+                    run_dext_control.close()
                 agent_glow.stop()   # desktop back to normal, whatever happened
 
                 # ── Persist this run via the conversation service ───────────
@@ -2711,6 +2765,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
     finally:
         if not thread_started and profile_lease is not None:
             profile_lease.release()
+        if not thread_started and run_dext_control is not None:
+            run_dext_control.close()
 
 
 def start_run_from_telegram(task, provider, model, session_id=None, text_callback=None, cli_callback=None,
@@ -3730,6 +3786,9 @@ def stop_agent():
     Its memory is still saved: save_run runs before that guard in run_agent's
     finally."""
     global active_agent_stop_event, active_agent_session_id
+    with _dext_control_lock:
+        if _dext_control is not None:
+            _dext_control.close()
     if active_agent_stop_event:
         active_agent_stop_event.set()
         _stop_run_recording(active_agent_session_id, tail=1.0)
@@ -3757,6 +3816,9 @@ def new_chat():
     reset UI. The run's memory is still persisted: save_run executes before the
     session-id push guard in run_agent's finally."""
     global active_agent_stop_event, active_agent_session_id
+    with _dext_control_lock:
+        if _dext_control is not None:
+            _dext_control.close()
     _stop_run_recording(active_agent_session_id)
     active_agent_session_id = None
     if active_agent_stop_event:

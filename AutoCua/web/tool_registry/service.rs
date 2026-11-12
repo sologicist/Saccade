@@ -557,6 +557,7 @@ pub fn main_action_defaults() -> &'static Value {
             "skills": {"type": "load", "id": 0},
             "done": {"value": ""},
             "call_function": {"version": 1, "name": "", "arguments": {}},
+            "dext_navigation": {"version": 1, "route": "", "target_id": 0},
         })
     })
 }
@@ -824,6 +825,12 @@ pub fn tool_calls_to_steps(
             || args.get("arguments").and_then(Value::as_object).is_none()) {
             rejects.push(json!({"id": call_id, "name": name, "arguments": {},
                 "error": "invalid_business_request: version, name and arguments must match the version 1 contract exactly."}));
+            continue;
+        }
+        if name == "dext_navigation" && (args.len() != 3 || args.get("version").and_then(Value::as_u64) != Some(1)
+            || args.get("target_id").and_then(Value::as_u64).is_none_or(|id| id == 0)
+            || !matches!(args.get("route").and_then(Value::as_str), Some("invoices" | "bank" | "workspace" | "record" | "review"))) {
+            rejects.push(json!({"id":call_id, "name":name, "arguments":{}, "error":"invalid_navigation_request"}));
             continue;
         }
         // A MISSING action field is a schema violation, not an omitted
@@ -1386,7 +1393,8 @@ impl LLMManager {
         };
         if self.business_providers.lock().unwrap().as_ref().is_some_and(|(old, _, _)| old == &definition) { return Ok(()) }
         let mut registry = if self.claude { main_tools_claude().clone() } else { main_tools_quality().clone() };
-        registry.push(definition.clone());
+        if let Some(definitions) = definition.as_array() { registry.extend(definitions.iter().cloned()); }
+        else { registry.push(definition.clone()); }
         let make = |registry: &[Value]| -> PyResult<Py<PyAny>> {
             let tools = match self.provider.as_str() {
                 "openai" => tools_openai_strict(registry), "anthropic" => tools_anthropic(registry),
@@ -1411,6 +1419,11 @@ impl LLMManager {
     }
 
     pub fn business_enabled(&self) -> bool { self.business_providers.lock().unwrap().is_some() }
+
+    pub fn navigation_enabled(&self) -> bool {
+        self.business_providers.lock().unwrap().as_ref().is_some_and(|(definition, _, _)|
+            definition.as_array().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "dext_navigation")))
+    }
 
     pub fn async_tools(&self) -> bool {
         self.primary_model_info.get("async_tools").and_then(Value::as_bool).unwrap_or(false)
@@ -1654,5 +1667,30 @@ mod business_schema_tests {
         assert_eq!(actions[0]["arguments"]["string"], "SYNTHETIC BANK");
         let (_, _, rejected, _) = tool_calls_to_steps(&calls, &[], main_tool_names());
         assert_eq!(rejected.len(), 2);
+    }
+
+    #[test]
+    fn navigation_is_per_run_strict_and_uses_existing_provider_formats() {
+        let tool = json!({"name":"dext_navigation", "description":"Preview only", "parameters":{
+            "type":"object","properties":{"version":{"type":"integer","enum":[1]},"route":{"type":"string"},"target_id":{"type":"integer"}},
+            "required":["version","route","target_id"],"additionalProperties":false}});
+        let tools = vec![tool];
+        assert_eq!(tools_openai(&tools)[0]["function"]["name"], "dext_navigation");
+        assert_eq!(tools_openai_strict(&tools)[0]["function"]["strict"], true);
+        assert_eq!(tools_anthropic(&tools)[0]["input_schema"]["additionalProperties"], false);
+        assert_eq!(tools_gemini(&tools)[0]["name"], "dext_navigation");
+        assert_eq!(tools_perplexity(&tools)[0]["name"], "dext_navigation");
+        for names in [main_tool_names(), main_tool_names_fast(), main_tool_names_claude(), scrape_mode_names()] {
+            assert!(!names.contains("dext_navigation"));
+        }
+        let mut names = main_tool_names().clone(); names.insert("dext_navigation".into());
+        let calls = json!([
+            {"id":"preview","name":"dext_navigation","arguments":{"version":1,"route":"invoices","target_id":1}},
+            {"id":"forged","name":"dext_navigation","arguments":{"version":1,"route":"invoices","target_id":1,"approved":true}},
+            {"id":"script","name":"dext_navigation","arguments":{"version":1,"route":"run_script","target_id":1}}
+        ]);
+        let (actions, kept, rejected, _) = tool_calls_to_steps(&calls, &[], &names);
+        assert_eq!(actions.len(), 1); assert_eq!(kept[0]["id"], "preview"); assert_eq!(rejected.len(), 2);
+        assert_eq!(tool_calls_to_steps(&calls, &[], main_tool_names()).2.len(), 3);
     }
 }

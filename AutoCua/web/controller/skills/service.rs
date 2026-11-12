@@ -401,6 +401,12 @@ pub fn domain_block() -> String {
     domain_block_for(None)
 }
 
+/// Runtime overlays follow the same native URL selection, including an empty
+/// shipped procedure. A selected platform alone never matches a foreign site.
+pub fn domain_is_active(name: &str) -> bool {
+    DOMAIN.lock().is_ok_and(|domain| domain.iter().any(|d| d.on_site && d.name == name))
+}
+
 /// Scoped sessions retain native URL matching while exposing only the selected
 /// platform's procedure. A recognized URL does not activate another platform.
 pub fn domain_block_for(selected: Option<&str>) -> String {

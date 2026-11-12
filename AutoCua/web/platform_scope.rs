@@ -178,6 +178,10 @@ impl PlatformScope {
         match kind {
             "done" | "wait" | "todo_list" | "update_todo" | "scratchpad" | "skills" => Ok(()),
             "new_tab" | "update_tab" => {
+                // An exact hostname does not classify a GET/navigation as safe.
+                // Dext bootstrap uses its fixed installed start URL directly;
+                // model-selected URLs require the future verified adapter.
+                if self.platform_id == "dext" { return Err(APPROVAL_UNAVAILABLE.to_string()); }
                 let url = action.get("value").and_then(Value::as_str)
                     .ok_or_else(|| scope_error("Platform navigation requires an explicit HTTPS URL."))?;
                 self.validate_url(url)
@@ -419,7 +423,7 @@ mod tests {
                 assert!(scope.validate_action(&json!({"type": kind})).is_ok(), "{kind}");
             }
             for kind in ["new_tab", "update_tab"] {
-                assert!(scope.validate_action(&json!({"type": kind, "value": "https://app.dext.com/"})).is_ok());
+                assert!(scope.validate_action(&json!({"type": kind, "value": "https://app.dext.com/"})).is_err());
                 assert!(scope.validate_action(&json!({"type": kind, "value": "https://app.dext.com.evil.test/"})).is_err());
                 assert!(scope.validate_action(&json!({"type": kind})).is_err());
             }

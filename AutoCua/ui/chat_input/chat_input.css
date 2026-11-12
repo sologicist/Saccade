@@ -1185,6 +1185,15 @@ body.left-bar-animating .chat-container-wrapper {
 .platform-session-note { margin: 6px 0; font-size: 11px; color: #756b80; }
 .platform-session-note:empty { display: none; }
 
+/* Review remains usable while the composer is running. Keep long hashes and
+   candidate diffs inside a bounded scrolling region, rendered as plain text. */
+.dext-review { max-height: min(50vh, 420px); overflow: auto; }
+.dext-review summary { cursor: pointer; padding: 7px 0; }
+.dext-review pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dext-review code { overflow-wrap: anywhere; }
+.dext-review fieldset { margin: 8px 0; border: 1px solid #c8c1d2; border-radius: 7px; }
+.dext-review button { margin: 4px; padding: 5px 8px; }
+
 /* ============================================================
    Web-loading state on a pill.
    When the pill enters .web-loading (CLI agent's web tool is fetching),

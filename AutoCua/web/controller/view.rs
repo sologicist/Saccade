@@ -42,6 +42,7 @@ const ON_THE_PAGE: [&str; 6] = ["click", "hold_click", "input", "vault", "keyboa
 /// Routes one step's actions against the live browser.
 pub struct ControllerView {
     business: Mutex<Option<crate::tool_registry::business::BusinessGate>>,
+    dext_control: Mutex<Option<Py<PyAny>>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -79,6 +80,7 @@ impl ControllerView {
         };
         Ok(ControllerView {
             business: Mutex::new(None),
+            dext_control: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -106,7 +108,54 @@ impl ControllerView {
     }
 
     pub fn refresh_business(&self, py: Python<'_>) -> PyResult<Option<Value>> {
-        self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()
+        let definition = self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()?;
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        if let Some(control) = control { control.bind(py).call_method0("freeze_decision")?; }
+        if let (Some(definition), true) = (definition.as_ref(), self.dext_control.lock().unwrap().is_some()) {
+            let tool: Value = pythonize::depythonize(&py.import("AutoCua.saccade.dext_control")?.getattr("NAVIGATION_TOOL")?)?;
+            return Ok(Some(json!([definition, tool])));
+        }
+        Ok(definition)
+    }
+
+    pub fn configure_dext_control(&self, py: Python<'_>, control: Option<&Bound<'_, PyAny>>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let checked = match control {
+            Some(control) if !control.is_none() => {
+                let context = context.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("operator_channel_required"))?;
+                Some(py.import("AutoCua.saccade.dext_control")?.getattr("validate_control")?
+                    .call1((control, context))?.unbind())
+            },
+            _ => None,
+        };
+        *self.dext_control.lock().unwrap() = checked;
+        Ok(())
+    }
+
+    pub fn procedure_overlay(&self, py: Python<'_>) -> PyResult<String> {
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        match control { Some(control) => control.bind(py).call_method0("overlay")?.extract(), None => Ok(String::new()) }
+    }
+
+    fn request_dext_navigation(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let Some(control) = control else {
+            return Ok(json!({"status":"error", "tool":"dext_navigation", "code":"operator_channel_required", "operator_review_required":true}));
+        };
+        // This path never dispatches input. Native observation proves scope and
+        // download DENY, not unimplemented Dext target/frame/record semantics.
+        let stamp = match super::service::scan_op(py, &self.scanner, |s| s.dext_navigation_stamp()) {
+            Ok(stamp) => stamp,
+            Err(ActErr::Py(error)) => return Err(error),
+            Err(ActErr::Msg(_)) => return Ok(json!({"status":"error", "tool":"dext_navigation", "code":"unverified_navigation_observation", "operator_review_required":true})),
+        };
+        let elements = self.state.lock().unwrap().elements.clone();
+        let result = control.bind(py).call_method1("observe_native", (pythonize::pythonize(py, &elements)?, pythonize::pythonize(py, &stamp)?))
+            .and_then(|_| control.bind(py).call_method1("propose_navigation", (pythonize::pythonize(py, action)?,)))
+            .and_then(|_| control.bind(py).call_method0("wait_navigation_review"));
+        match result {
+            Ok(value) => pythonize::depythonize(&value).map_err(Into::into),
+            Err(_) => Ok(json!({"status":"error", "tool":"dext_navigation", "code":"navigation_preview_unavailable", "operator_review_required":true})),
+        }
     }
 
     #[cfg(test)]
@@ -223,7 +272,7 @@ impl ControllerView {
             _ => Vec::new(),
         };
 
-        if actions.len() > 1 && actions.iter().any(|a| a["type"] == "call_function") && actions.iter().any(|a| a["type"] == "done") {
+        if actions.len() > 1 && actions.iter().any(|a| a["type"] == "call_function" || a["type"] == "dext_navigation") && actions.iter().any(|a| a["type"] == "done") {
             return Ok(json!({"status":"error", "action":"multiple", "results": actions.iter().map(|a|
                 json!({"status":"not_run", "tool":a["type"], "code":"done_must_be_alone"})).collect::<Vec<_>>()}));
         }
@@ -353,6 +402,10 @@ impl ControllerView {
     /// or prompt): the page is frozen behind it until the model answers it, which
     /// the next input shows as `<dialog>`.
     fn one(&self, py: Python<'_>, action: &Value) -> PyResult<(Value, bool)> {
+        if action.get("type").and_then(Value::as_str) == Some("dext_navigation") {
+            if self.stopped(py)? { return Ok((json!({"status":"stopped", "tool":"dext_navigation"}), false)); }
+            return Ok((self.request_dext_navigation(py, action)?, false));
+        }
         if action.get("type").and_then(Value::as_str) == Some("call_function") {
             if self.stopped(py)? {
                 return Ok((json!({"status":"stopped", "tool":"call_function"}), false));

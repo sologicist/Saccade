@@ -46,6 +46,8 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/business_run.py",
             "AutoCua/saccade/business_process.py",
             "AutoCua/saccade/business_worker.py",
+            "AutoCua/saccade/procedure_store.py",
+            "AutoCua/saccade/dext_control.py",
             "AutoCua/saccade/business_functions/__init__.py",
             "AutoCua/saccade/business_functions/platforms/__init__.py",
             "AutoCua/saccade/business_functions/platforms/dext/__init__.py",
@@ -78,6 +80,9 @@ class BuiltWheelContracts(unittest.TestCase):
                     self.assertNotIn("reports", parts)
                     self.assertNotEqual(parts[-1], "agent.md")
                 self.assertNotIn("AutoCua_data", parts)
+                self.assertNotIn("legacy_reference", parts)
+                self.assertNotIn("Saccade-PR5-handoff", parts)
+                self.assertNotIn("navigation", parts if "data" in parts else ())
 
     def test_extracted_wheel_loads_without_the_source_checkout(self):
         with tempfile.TemporaryDirectory(prefix="saccade-wheel-install-") as temporary:
@@ -109,6 +114,12 @@ assert platform.procedure_path == installed / "AutoCua/default_skills/web/domain
 platform.procedure_path.read_text(encoding="utf-8")
 assert platform.allowed_hosts == ("app.dext.com",)
 assert "dext" in [item.id for item in list_platforms()]
+from AutoCua.saccade.dext_control import DextRunControl
+from AutoCua.saccade.session_context import build_platform_context
+control = DextRunControl(build_platform_context("dext"), "wheel-synthetic")
+assert control.overlay() == ""
+assert control.status()["capabilities"]["live_scribe"] == "verified_download_receipt_required"
+control.close()
 from AutoCua.saccade.business_catalogue import catalogue
 catalog = catalogue("dext")
 assert set(catalog["functions"]) == {"dext.bank", "dext.scribe"}

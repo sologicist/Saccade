@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 
 from .business_catalogue import PACKAGE_ROOT, catalogue, client_registration, model_tool
-from .business_contract import BusinessError, digest, dumps, loads, reject, validate
+from .business_contract import BusinessError, digest, dumps, loads, read_safe, reject, validate
 from .session_context import _validate_context
 
 
@@ -39,7 +39,21 @@ class BusinessRun:
         clients, registration = client_registration(self.data_root)
         if tuple(clients) != self._clients:
             reject("business_client_scope_changed")
-        current["revision"] = digest([current["revision"], registration, self.context, self.offline_receipts])
+        references = {}
+        for client, policy in clients.items():
+            # The live boundary is still closed. Never pre-read a real corpus
+            # merely because an operator registered its local client ID.
+            if not policy["synthetic"]:
+                continue
+            for name in ("comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"):
+                path = self.data_root / client / name
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    references[name] = digest(["reference-absent"])
+                else:
+                    references[name] = digest(["reference-present", digest(read_safe(self.data_root, path, 2 * 1024 * 1024))])
+        current["revision"] = digest([current["revision"], registration, references, self.context, self.offline_receipts])
         return current, clients
 
     def refresh(self):
@@ -113,14 +127,14 @@ class BusinessRun:
             if reply["status"] != "success":
                 reject(reply["error"] if type(reply["error"]) is str and reply["error"] in WORKER_ERRORS else "worker_failed")
             references = reply["references"]
-            if type(references) is not dict or not references or set(references) - {"comptable_banque.md", "comptable_achats.md", "comptable_ventes.md", "comptable.md"} or any(type(v) is not str or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in references.values()):
+            if type(references) is not dict or not references or set(references) - {"comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"} or any(type(v) is not str or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in references.values()):
                 reject("invalid_worker_response")
             validate(reply["result"], current["functions"][ticket["name"]]["output_schema"])
             self.receipts.append({"call_id": token, "run_id": self.run_id, "revision": ticket["revision"],
                                   "client_digest": digest(ticket["arguments"]["client_id"]),
                                   "references": reply["references"]})
             result = {"status": "success", "tool": "call_function", "result": reply["result"]}
-            if ticket["name"] == "dext.bank" and reply["result"]["compte"] is None or ticket["name"] == "dext.scribe" and reply["result"]["type"] != "devis" and not reply["result"]["ecriture"]:
+            if ticket["name"] == "dext.bank" and reply["result"]["compte"] is None or ticket["name"] == "dext.scribe" and (reply["result"]["type"] != "facture" or not reply["result"]["ecriture"]):
                 result["operator_review_required"] = True
             return result
         except OSError:

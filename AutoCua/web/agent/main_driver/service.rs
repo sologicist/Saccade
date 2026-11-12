@@ -173,12 +173,16 @@ fn scraped_index_block() -> String {
 /// The <skills> and <domain_knowledge> blocks of <persistent_memory>
 /// (controller/skills): the domain knowledge follows the current tab's url
 /// first. Each is empty when it has nothing.
-fn skills_blocks(py: Python<'_>, scanner: &crate::browser::BrowserScanner) -> (String, String) {
+fn skills_blocks(py: Python<'_>, scanner: &crate::browser::BrowserScanner, controller: &crate::controller::view::ControllerView) -> PyResult<(String, String)> {
     let url = scanner.current_url(py).unwrap_or_default();
     crate::controller::skills::service::follow_url(&url);
     let selected = scanner.inner.lock().ok().and_then(|inner| inner.platform_skill_name());
-    (crate::controller::skills::service::block(),
-     crate::controller::skills::service::domain_block_for(selected.as_deref()))
+    let mut domain = crate::controller::skills::service::domain_block_for(selected.as_deref());
+    if selected.as_deref() == Some("dext.md") && crate::controller::skills::service::domain_is_active("dext.md") {
+        let overlay = controller.procedure_overlay(py)?;
+        if !overlay.is_empty() { domain.push_str(&format!("\n{overlay}")); }
+    }
+    Ok((crate::controller::skills::service::block(), domain))
 }
 
 /// The <vault> block of <persistent_memory> (controller/vault): the key names
@@ -708,7 +712,7 @@ fn business_result_texts(result: &Value) -> Vec<String> {
 
 fn business_review_required(result: &Value) -> bool {
     let results = result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![result.clone()]);
-    results.iter().any(|value| value.get("tool").and_then(Value::as_str) == Some("call_function")
+    results.iter().any(|value| matches!(value.get("tool").and_then(Value::as_str), Some("call_function" | "dext_navigation"))
         && value.get("status").and_then(Value::as_str) != Some("stopped")
         && value.get("operator_review_required").and_then(Value::as_bool) == Some(true))
 }
@@ -784,7 +788,7 @@ impl AgentService {
         tool_callback=None, token_callback=None, api_key=None, stop_event=None,
         prior_history=None, speed=None, headless=false, browser_port=None,
         session_id=None, single_tab=false, browser_profile=None, platform_context=None,
-        profile_lease=None, **_extra))]
+        profile_lease=None, dext_control=None, **_extra))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -809,6 +813,7 @@ impl AgentService {
         browser_profile: Option<String>,
         platform_context: Option<Bound<'_, PyAny>>,
         profile_lease: Option<Bound<'_, PyAny>>,
+        dext_control: Option<Bound<'_, PyAny>>,
         _extra: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let _ = cli_callback;
@@ -999,6 +1004,7 @@ impl AgentService {
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         controller.configure_business(py, context.as_ref().map(|value| value.bind(py)))?;
+        controller.configure_dext_control(py, dext_control.as_ref(), context.as_ref().map(|value| value.bind(py)))?;
 
         // Load system prompt — __init__ already downgraded the speed, so the
         // prompt and the tool schema are guaranteed to agree here.
@@ -1493,7 +1499,14 @@ impl AgentService {
             // -- Live context, rebuilt fresh EVERY step ------------------------
             let todo_list = self.read_todo_from_file();
             let scratchpad_content = self.read_scratchpad_from_file();
-            let (skills, domain) = skills_blocks(py, self.scanner.get());
+            let (skills, domain) = match skills_blocks(py, self.scanner.get(), &self.controller) {
+                Ok(blocks) => blocks,
+                Err(_) => {
+                    final_status = "waiting_operator".into();
+                    final_message = "Pinned procedure verification failed; operator review required.".into();
+                    break;
+                }
+            };
             // Scrape mode offers no `vault`, so it lists nothing there.
             let vault = if scrape_mode { String::new() } else { vault_block(py, self.scanner.get()) };
             let state_block = [
@@ -1874,6 +1887,7 @@ impl AgentService {
         };
         let mut names = names.clone();
         if !in_scrape_mode && core.business_enabled() { names.insert("call_function".into()); }
+        if !in_scrape_mode && core.navigation_enabled() { names.insert("dext_navigation".into()); }
         let (actions_val, calls, rejects, track_vec) =
             crate::tool_registry::service::tool_calls_to_steps(
                 raw_response.get("tool_calls").unwrap_or(&Value::Null),
@@ -2267,7 +2281,7 @@ impl AgentService {
             }
             if business_review_required(&action_result) {
                 *final_status = "waiting_operator".into();
-                *final_message = "Business function requires operator review; no automatic retry was performed.".into();
+                *final_message = "Dext request requires operator review; no automatic retry was performed.".into();
                 return Ok(Flow::Break);
             }
             // The pictures a scrape read took this step go with the next
@@ -2480,6 +2494,7 @@ fake_llm = types.ModuleType(module_name)
 fake_llm.resolve_model_info = lambda provider, model: {'api_name':'synthetic-offline', 'vision':True, 'display_name':'Synthetic'}
 full_loop = False
 forced_action = None
+forced_tool_name = 'call_function'
 mutate_after_decision = False
 class Provider:
     def __init__(self, tools): self.tools, self.turn = tools, 0
@@ -2492,7 +2507,7 @@ class Provider:
                 helper = fixture.functions / 'runtime.py'
                 helper.write_bytes(helper.read_bytes() + b'\n')
                 mutate_after_decision = False
-            return {'choices':[{'message':{'content':'','tool_calls':[{'id':'forced-note','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic negative contract','next_goal':'Verify denial'}},{'id':'forced-call','name':'call_function','arguments':action}]}}], 'usage':{}}
+            return {'choices':[{'message':{'content':'','tool_calls':[{'id':'forced-note','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic negative contract','next_goal':'Verify denial'}},{'id':'forced-call','name':forced_tool_name,'arguments':action}]}}], 'usage':{}}
         if full_loop and self.turn > 1:
             return {'choices':[{'message':{'content':'','tool_calls':[{'id':'note-2','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic result verified','next_goal':'Finish'}},{'id':'done-2','name':'done','arguments':{'value':'Synthetic computation completed'}}]}}], 'usage':{}}
         return {'choices':[{'message':{'content':'', 'tool_calls':[{'id':'note-1','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic memory','next_goal':'Synthetic bank proof'}},{'id':'bank-1', 'name':'call_function', 'arguments':{'version':1,'name':'dext.bank','arguments':{'string':'SYNTHETIC BANK','client_id':'synthetic-alpha'}}}]}}], 'usage':{}}
@@ -2599,6 +2614,10 @@ original_vision_check = session_context._registered_vision_model
 original_data_root = AutoCua.data_root
 original_web_override = os.environ.get('AutoCua_WEB_DIR')
 os.environ['AutoCua_WEB_DIR'] = str(fixture.root / 'native-web')
+loop_domain = fixture.root / 'default_skills/web/domain_skill'
+loop_domain.mkdir(parents=True)
+(loop_domain / 'skills.json').write_text('{"app.dext.com":"dext.md"}', encoding='utf-8')
+(loop_domain / 'dext.md').write_text('', encoding='utf-8')
 AutoCua.data_root = lambda: fixture.root / 'local-data'
 session_context._registered_vision_model = lambda provider, model: True
 loop_runs = []
@@ -2664,8 +2683,54 @@ compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *arg
                     assert!(turns[0].contains("null"));
                 }
             }
+            // The same real loop parks for an independent Python UI event.
+            // Approval never invokes a gesture while Dext semantics are absent.
             py.run(&CString::new(r#"
-assert len(loop_runs) == 6 and len(loop_runs[0].receipts) == 1
+from AutoCua.saccade.dext_control import DextRunControl
+control = DextRunControl(fixture.context, 'native-synthetic-chat', project_root=fixture.root)
+control.operator_event({'review_token':control.review_token,'event':'teach','routes':['workspace','invoices','record','review']}, busy=True)
+proposal = control.proposal.copy()
+control.operator_event({'review_token':control.review_token,'event':'review','approve':True,
+    **{k:proposal[k] for k in ('proposal_id','base_revision','candidate_revision')}}, busy=True)
+assert control.overlay() == ''
+next_control = DextRunControl(fixture.context, 'next-native-synthetic-chat', project_root=fixture.root)
+assert 'approved_navigation_guidance' in next_control.overlay()
+operator_answers = []
+def independent_operator():
+    import time
+    deadline = time.monotonic() + 5
+    while next_control.pending is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if next_control.pending is not None:
+        p = next_control.pending.copy()
+        operator_answers.append(next_control.operator_event({'review_token':next_control.review_token,
+            'event':'navigation_review', 'proposal_id':p['proposal_id'], 'observation_id':p['observation_id'], 'approve':True}, busy=True))
+operator_thread = threading.Thread(target=independent_operator)
+forced_tool_name = 'dext_navigation'
+forced_action = {'version':1,'route':'invoices','target_id':1}
+operator_thread.start()
+"#).unwrap(), Some(&locals), None).unwrap();
+            let control = locals.get_item("next_control").unwrap().unwrap();
+            let context_py = pythonize::pythonize(py, &context).unwrap();
+            service.controller.configure_dext_control(py, Some(&control), Some(&context_py)).unwrap();
+            service.scanner.get().inner.lock().unwrap().mapping = json!({"1":{"name":"Synthetic invoices","role":"link","rect":[10,10,100,20]}}).as_object().unwrap().clone();
+            let task = pyo3::types::PyString::new(py, "Preview the synthetic invoices target; do not click.").into_any();
+            let outcome = service.process_request(py, task).unwrap();
+            let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+            assert_eq!(outcome["status"], "waiting_operator", "{outcome}");
+            assert!(service.llm_manager.get().navigation_enabled());
+            let state = service.state.lock().unwrap();
+            let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
+            assert!(view::decode_results(&turns[0]).iter().any(|r| r["tool_call_id"] == "forced-call" && r["content"].as_str().unwrap_or_default().contains("verified_dext_navigation_adapter_required")));
+            assert!(state.last_messages.bind(py).str().unwrap().to_string().contains("approved_navigation_guidance"));
+            drop(state);
+            py.run(&CString::new(r#"
+operator_thread.join(5)
+assert not operator_thread.is_alive() and operator_answers[0]['executed'] is False
+assert len(loop_runs[-1].receipts) == 0
+control.close()
+next_control.close()
+assert len(loop_runs) == 7 and len(loop_runs[0].receipts) == 1
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root

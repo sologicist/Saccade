@@ -43,6 +43,8 @@ class AccountingContext:
         self.references = {}
 
     def reference(self, client_id, name, *, optional=False):
+        if name not in ("comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"):
+            reject("unapproved_reference_file")
         if client_id not in self.clients:
             reject("unauthorized_client")
         if self.clients[client_id].get("synthetic") is not True:
@@ -91,7 +93,9 @@ class AccountingContext:
         if type(receipt.get("critical")) is not dict or set(receipt["critical"]) != {"type", "piece", "journal", "accounts"}:
             reject("verified_download_receipt_required")
         markdown = self.reference(client_id, "comptable_achats.md" if sens == "achat" else "comptable_ventes.md")
-        description = self.reference(client_id, "comptable.md", optional=True).strip()
+        # Exactly three client reference files exist. No generic description
+        # corpus is read or inferred; the supported result field remains null.
+        description = ""
         path = self.root / receipt["relative_path"]
         if path.suffix.lower() != ".pdf":
             reject("offline_fixture_identity_mismatch")

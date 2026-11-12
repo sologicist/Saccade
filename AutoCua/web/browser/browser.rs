@@ -2900,6 +2900,17 @@ impl ScannerInner {
         self.check_platform_scope()
     }
 
+    /// Scope-only metadata for a local UI preview; never an input permit.
+    pub fn dext_navigation_stamp(&mut self) -> SResult<Value> {
+        let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
+        if scope.platform_id != "dext" || scope.execution_mode != "supervised" || scope.browser_profile != "saccade-dext" {
+            return Err(ScanErr::s("unsupported_navigation_session"));
+        }
+        self.check_platform_scope()?;
+        Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
+            "profile": "saccade-dext", "config_revision": self.platform_scope.as_ref().expect("scoped").config_revision}))
+    }
+
     /// The agent just sent the tab it drives to `url` (new_tab, update_tab).
     pub fn sent_to(&mut self, url: &str) {
         if let Some(id) = self.tab_id.clone() {
