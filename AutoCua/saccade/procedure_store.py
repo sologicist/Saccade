@@ -174,22 +174,28 @@ class ProcedureStore:
         # for secrets, scripts, URLs, selectors or enlarged permissions.
         return "# Dext navigation guidance\n\n" + "\n".join(f"{n}. {ROUTES[route]}" for n, route in enumerate(routes, 1)) + "\n"
 
-    def propose(self, routes, run_id):
+    def propose(self, routes, run_id, *, teaching_source="route_selection", observation_digest=None):
+        if teaching_source not in ("route_selection", "operator_chat_correction"):
+            reject("invalid_teaching_source")
+        if observation_digest is not None:
+            identifier(observation_digest)
         content = self.render(routes)
         with self.lock():
             base = self.active()
             candidate = {"schema_version": 1, "source": "operator", "content": content,
                          "baseline_digest": self.baseline_digest, "routes": list(routes),
                          "base": base, "run_digest": digest(run_id), "utc": utc(),
+                         "teaching_source": teaching_source, "observation_digest": observation_digest,
                          "proposal_id": secrets.token_hex(32)}
             revision = digest(candidate)
             self._write("proposals/" + candidate["proposal_id"] + ".json", candidate, exclusive=True)
             old = self.snapshot(base["current"])["content"]
             return {"proposal_id": candidate["proposal_id"], "base_revision": base["current"],
+                    "observation_digest": observation_digest, "teaching_source": teaching_source,
                     "candidate_revision": revision, "base_generation": base["generation"],
                     "old": old, "new": content, "diff": "".join(difflib.unified_diff(
                         old.splitlines(True), content.splitlines(True), fromfile="approved", tofile="proposed")),
-                    "evidence": "Operator-selected generic route; no live target semantics verified.",
+                    "evidence": ("Operator chat correction compiled locally to generic guidance. " if teaching_source == "operator_chat_correction" else "Operator-selected generic route. ") + ("A redacted native scope observation is referenced; record semantics remain unverified." if observation_digest else "No native source observation available; live target semantics unverified."),
                     "rationale": "Explicit operator teaching; guidance grants no action permission."}
 
     def review(self, proposal_id, base_revision, candidate_revision, approve):

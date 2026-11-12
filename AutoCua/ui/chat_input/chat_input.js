@@ -68,6 +68,17 @@
             // (ios_session.js, android_session.js): nothing is sent till it is.
             if (chatInput.readOnly) return;
             const message = chatInput.value.trim();
+            if (!message) return;
+            // Explicit local teaching mode intercepts before a run is created,
+            // a chat task is persisted or any text reaches a model provider.
+            const correction = window.submitDextChatCorrection && window.submitDextChatCorrection(message);
+            if (correction) {
+                correction.then(() => { chatInput.value = ''; adjustHeight(); }).catch(error => {
+                    const status = document.getElementById('agentText');
+                    if (status) status.textContent = String(error.message || 'Correction could not be validated.');
+                });
+                return;
+            }
             // Live (provider, model) selection lives in script.js (Settings writes it).
             const sel = window.getModelSelection ? window.getModelSelection() : {};
             if (!message || !sel.provider || !sel.model) return;
@@ -407,6 +418,9 @@
         // (same as Enter), the glowing stop orb posts 'pcbtn:clicked' (it also plays
         // its own pop-vanish on click — we just morph back to idle).
         window.addEventListener('message', (e) => {
+            if (e.data !== 'sendbtn:clicked' && e.data !== 'pcbtn:clicked') return;
+            const sourceFrame = e.data === 'sendbtn:clicked' ? getSendFrame() : getStopFrame();
+            if (!sourceFrame || e.source !== sourceFrame.contentWindow || e.origin !== window.location.origin) return;
             if (e.data === 'sendbtn:clicked') {
                 startAgent();
                 return;

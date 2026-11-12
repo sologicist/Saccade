@@ -1,10 +1,14 @@
 import { useEffect, useState } from 'react';
 
-declare global { interface Window { currentSessionId?: string | null; } }
+declare global { interface Window {
+    currentSessionId?: string | null;
+    submitDextChatCorrection?: (text: string) => Promise<void> | null;
+} }
 
 interface ProcedureProposal {
     proposal_id: string; base_revision: string; candidate_revision: string;
     old: string; new: string; diff: string; evidence: string; rationale: string;
+    observation_digest?: string | null;
 }
 interface NavigationPreview {
     proposal_id: string; observation_id: string; target_id: number;
@@ -12,7 +16,7 @@ interface NavigationPreview {
     procedure_revision: string; policy_revision: string;
 }
 interface ControlStatus {
-    session_id: string; review_token: string; closed: boolean; pinned_revision: string;
+    session_id: string; run_id: string; review_token: string; closed: boolean; pinned_revision: string;
     active: { current: string; previous: string | null };
     previous_content: string | null;
     proposal: ProcedureProposal | null; navigation: NavigationPreview | null;
@@ -26,6 +30,28 @@ export function DextReview({ enabled }: { enabled: boolean }) {
     const [route, setRoute] = useState('workspace');
     const [client, setClient] = useState('');
     const [sending, setSending] = useState(false);
+    const [chatCorrection, setChatCorrection] = useState(false);
+    useEffect(() => { setChatCorrection(false); }, [status?.session_id, status?.run_id, enabled]);
+    useEffect(() => {
+        window.submitDextChatCorrection = text => {
+            if (!enabled || !chatCorrection) return null;
+            return (async () => {
+                if (!status || status.session_id !== window.currentSessionId || sending || status.proposal) throw new Error('Open the current Dext review before teaching.');
+                setSending(true);
+                try {
+                    const response = await fetch('/api/dext/control?session_id=' + encodeURIComponent(status.session_id), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ event: 'teach_correction', review_token: status.review_token, correction: text }),
+                    });
+                    const answer = await response.json();
+                    if (!response.ok) throw new Error(answer.error || 'Correction could not be validated.');
+                    setChatCorrection(false);
+                    setError('Correction proposed locally. Review the exact diff before publication.');
+                } finally { setSending(false); }
+            })();
+        };
+        return () => { delete window.submitDextChatCorrection; };
+    }, [enabled, chatCorrection, status, sending]);
     useEffect(() => {
         if (!enabled) { setStatus(null); return; }
         const controller = new AbortController();
@@ -79,6 +105,9 @@ export function DextReview({ enabled }: { enabled: boolean }) {
             </fieldset>}
             <fieldset disabled={sending}>
                 <legend>Teach a reusable route from an operator correction</legend>
+                <label><input type="checkbox" checked={chatCorrection} disabled={!!proposal}
+                    onChange={event => setChatCorrection(event.target.checked)} />Use next chat message as a local navigation correction</label>
+                <p>Local correction mode sends no model request and saves no raw correction. Example: “Open invoices then confirm the workspace then select the record.” Unsupported details are rejected; review the resulting generic diff separately.</p>
                 <p>Select generic steps only. Chat, page text and private record details are never saved as procedure instructions.</p>
                 <select aria-label="Generic route step" value={route} onChange={e => setRoute(e.target.value)}>
                     {status.routes.map(value => <option key={value}>{value}</option>)}
@@ -91,6 +120,7 @@ export function DextReview({ enabled }: { enabled: boolean }) {
             {proposal && <fieldset disabled={sending}>
                 <legend>Review this exact procedure candidate</legend>
                 <p>{proposal.evidence} {proposal.rationale}</p>
+                {proposal.observation_digest && <p>Scope evidence digest: <code>{proposal.observation_digest}</code>. Dext record identity is unverified.</p>}
                 <p>Base: <code>{proposal.base_revision}</code></p>
                 <p>Candidate: <code>{proposal.candidate_revision}</code></p>
                 <details><summary>Previous and proposed text</summary><pre>{proposal.old}</pre><pre>{proposal.new}</pre></details>

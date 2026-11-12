@@ -55,6 +55,7 @@ class DextRunControl:
         self._navigation_decided = threading.Event()
         self._navigation_result = None
         self._source_revision = None
+        self._last_observation_digest = None
 
     def freeze_decision(self):
         self.validate_native(self.context)
@@ -94,6 +95,9 @@ class DextRunControl:
             self.observation = {"id": secrets.token_hex(32), "stamp": dict(stamp),
                                 "elements": loads(dumps(elements, 524_288), 524_288),
                                 "expires": time.monotonic() + 60}
+            # Retain only a scope-evidence digest across handoff. Never save DOM
+            # text, target IDs, raw record fields or the correction in the SOP.
+            self._last_observation_digest = digest([self.run_id, self.observation["id"], stamp])
 
     def propose_navigation(self, action):
         with self.lock:
@@ -163,16 +167,23 @@ class DextRunControl:
         if type(body) is not dict or type(body.get("review_token")) is not str or not secrets.compare_digest(body["review_token"], self.review_token):
             reject("operator_channel_required")
         event = body.get("event")
-        fields = {"teach": {"routes"}, "review": {"proposal_id", "base_revision", "candidate_revision", "approve"},
+        fields = {"teach": {"routes"}, "teach_correction": {"correction"}, "review": {"proposal_id", "base_revision", "candidate_revision", "approve"},
                   "adopt": set(), "rollback": {"expected", "target"},
                   "bind": {"client_id", "observation_id"}, "navigation_review": {"proposal_id", "observation_id", "approve"}}
         if type(event) is not str or event not in fields or set(body) != fields[event] | {"review_token", "event"}:
             reject("invalid_operator_event")
         with self.lock:
-            if event == "teach":
+            if event in ("teach", "teach_correction"):
                 if self.proposal:
                     reject("procedure_review_pending")
-                self.proposal = self.store.propose(body["routes"], self.run_id)
+                if event == "teach_correction":
+                    from .navigation_correction import correction_routes
+                    routes = correction_routes(body["correction"])
+                else:
+                    routes = body["routes"]
+                self.proposal = self.store.propose(routes, self.run_id,
+                    teaching_source="operator_chat_correction" if event == "teach_correction" else "route_selection",
+                    observation_digest=self._last_observation_digest)
             elif event == "review":
                 if not self.proposal or any(body[k] != self.proposal[k] for k in ("proposal_id", "base_revision", "candidate_revision")):
                     reject("proposal_identity_mismatch")

@@ -46,6 +46,7 @@ jobs:
           node --test
           AutoCua/web/browser/AutoCuaBridge/platform_scope.test.cjs
           AutoCua/ui/platform_session/selection.test.mjs
+          AutoCua/ui/chat_input/correction.test.mjs
       - name: Install UI dependencies from lockfile
         working-directory: AutoCua/ui
         run: npm ci

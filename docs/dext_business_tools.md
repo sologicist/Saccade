@@ -140,14 +140,21 @@ For an offline synthetic pilot, the operator can create this local file:
 }
 ```
 
-Also create a nonempty, entirely invented
-`platforms/dext/data/synthetic-pilot/comptable_banque.md`. There is no production
+Also create nonempty, entirely invented `comptable_banque.md`,
+`comptable_achats.md` and `comptable_ventes.md` under
+`platforms/dext/data/synthetic-pilot/`. The complete three-file bundle is validated
+in the parent and worker before a business function executes. There is no production
 fallback client or baked-in tenant. The active client binding is fixed when the
 run is constructed; changing it requires a new run. Labels must match the
 operator's registered strings exactly. Synthetic unknown labels return null.
 Setting `synthetic` to false closes the privacy gate. Marking real data as
 synthetic would be an operator configuration error, not a privacy mechanism.
 Do not put actual labels, clients, documents or references in pilot configuration.
+
+For explicit local directory initialization, three-file validation and real-client
+metadata registration, see [dext_reference_onboarding.md](dext_reference_onboarding.md).
+Registration is not real-record authorization or disclosure consent. The CLI never
+imports archives or retags real data as synthetic.
 
 Every call rereads current references, detects changes during reading and records
 their digests in an in-memory receipt. Receipts contain a hashed client identity,

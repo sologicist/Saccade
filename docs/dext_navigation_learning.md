@@ -14,7 +14,7 @@ PDF or external model request was used during implementation.
 | Navigation request, independent UI decision and native handoff | TESTED SYNTHETICALLY through the real Rust agent loop |
 | Actual Dext menu/record gesture and postcondition | BLOCKED: verified Dext semantic/frame/record adapter absent |
 | Local procedure candidate, exact review, publication, pin and rollback | TESTED SYNTHETICALLY |
-| Natural-language correction automatically becoming executable instructions | BLOCKED; operator instead selects a closed generic route in the existing chat UI |
+| Local chat correction to a proposed generic procedure | TESTED SYNTHETICALLY; conservative French/English compiler, exact separate approval |
 | Operator local dossier claim | TESTED SYNTHETICALLY; explicitly unverified for business execution |
 | Verified real Dext dossier/record binding | BLOCKED: no stable observed identity adapter |
 | Existing offline synthetic bank and invoice worker | TESTED SYNTHETICALLY, including real subprocess/native entry |
@@ -73,9 +73,13 @@ fixed installed bootstrap URL is unaffected; generic Web behavior is unchanged.
 Open **Dext operator review** in the existing platform selector. It is a bounded
 scrolling panel that remains accessible while the composer is active. All DOM
 labels and diffs are React text nodes, never HTML instructions. The operator may
-translate a chat correction into a sequence of generic steps (`workspace`,
-`invoices`, `bank`, `record`, `review`). The system does not import raw chat,
-website, PDF, model or tool prose into reusable procedure content.
+enable local correction mode and type recognized French/English navigation
+sentences in the existing chat. The message is intercepted before model execution
+or general task persistence and compiled to generic steps (`workspace`, `invoices`,
+`bank`, `record`, `review`). Unknown details, private values, negations and effectful
+instructions are rejected, not silently discarded. Raw chat, website, PDF, model
+or tool prose never enters reusable procedure content. Predefined route selection
+remains available. The resulting candidate still needs separate exact approval.
 
 `/api/dext/control` uses the existing app's token and exact local Host/Origin
 guard. POST additionally requires an explicit exact local Origin, the current
@@ -92,7 +96,7 @@ active pointer only after independent exact approval. A stale candidate cannot
 overwrite another publication; an explicit refusal can discard a stale candidate
 without changing the active revision.
 
-The intentionally closed route grammar cannot contain private names, labels,
+The intentionally closed output grammar cannot contain private names, labels,
 invoice numbers, URLs, selectors, session element IDs, HTML/JavaScript, secrets,
 network instructions, permissions or arbitrary Markdown. It has at most eight
 steps and emits fixed generic Markdown. This is a safe first learning vocabulary,
@@ -182,9 +186,13 @@ optional private-data extraction script was not run; no user corpus was read.
    or safe postcondition. No selectors are invented. Local operator confirmation
    does not establish that clicking a control cannot submit or autosave remotely.
 2. **PDF provenance:** `chrome_pipe.rs::set_downloads_denied` verifies browser-level
-   DENY acknowledgments; its current transport consumes CDP frames while waiting
-   for responses. It does not implement a record-bound start/completion event
-   correlator or an isolated single-download exception. The extension's observer
+   DENY acknowledgments. The transport now preserves bounded ordered Browser
+   download events, including trailing frames in the same ACK read, with sticky
+   malformed/replay/overflow handling. GUID/frame and a URL digest stay in private
+   memory; filename/path text is not retained. Reads still occur while commands
+   are pending, not through a continuous approved-download operation. No Dext
+   record correlator, file verifier or isolated single-download exception exists.
+   Every observed attempt, even canceled, stops scoped work. The extension's observer
    cancels attempts and latches review; it does not issue provenance receipts.
    Relaxing the global policy would permit effects this PR cannot prove. No
    exception, receipt issuer or pretend successful lifecycle is added.
@@ -206,7 +214,7 @@ optional private-data extraction script was not run; no user corpus was read.
 ## Validation and operator pilot
 
 The exact commands, counts, exclusions and source manifest are in
-[pr5_review.md](pr5_review.md). CI discovers the new Python contracts through its
+[pr5_completion_review.md](pr5_completion_review.md). CI discovers the new Python contracts through its
 existing test command and retains native Windows tests, Linux compile check,
 JavaScript contracts, UI build/typecheck, wheel and sdist checks. No cloud keys or
 live Dext access are required. Python symlink tests may be skipped without the
@@ -236,7 +244,7 @@ An operator may explicitly initiate this limited manual pilot; it was not run:
 2. In a test workspace, ask for a navigation **preview**, not a click. Review its
    exact target locally. Reject once; approve another preview and verify the
    explicit adapter-required block. No actual gesture/transition is promised.
-3. Translate a chat correction into generic route steps in Dext operator review.
+3. Enable local chat correction mode and submit recognized generic navigation sentences.
    Inspect old/new text and digests, reject one candidate, then explicitly publish
    another. Confirm tracked `dext.md` is unchanged.
 4. Show that the current pin is unchanged; while idle explicitly adopt the new
@@ -252,3 +260,7 @@ and observed postconditions. Then implement causal bounded PDF lifecycle receipt
 and independent exact-payload provider consent under native effect permits. Only
 after those prerequisites should a separate write-effect PR add field preview/fill,
 intent journal, idempotence and independently approved save handling.
+
+The current local onboarding commands and separate operator-controlled real test
+plan are in [dext_reference_onboarding.md](dext_reference_onboarding.md) and
+[dext_manual_test_plan.md](dext_manual_test_plan.md). The private ZIP remains unopened.

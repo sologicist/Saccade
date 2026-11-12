@@ -48,6 +48,9 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/business_worker.py",
             "AutoCua/saccade/procedure_store.py",
             "AutoCua/saccade/dext_control.py",
+            "AutoCua/saccade/client_references.py",
+            "AutoCua/saccade/reference_management.py",
+            "AutoCua/saccade/navigation_correction.py",
             "AutoCua/saccade/business_functions/__init__.py",
             "AutoCua/saccade/business_functions/platforms/__init__.py",
             "AutoCua/saccade/business_functions/platforms/dext/__init__.py",
@@ -133,6 +136,8 @@ data = installed / "platforms/dext/data"
     "clients":{"wheel-synthetic":{"synthetic":True,"bank_labels":["SYNTHETIC WHEEL LABEL"],
     "bank_responses":{"SYNTHETIC WHEEL LABEL":{"compte":"40100000"}}}}}), encoding="utf-8")
 (data / "wheel-synthetic/comptable_banque.md").write_text("Entire synthetic wheel reference.", encoding="utf-8")
+for name in ("comptable_achats.md", "comptable_ventes.md"):
+    (data / "wheel-synthetic" / name).write_text("Entire synthetic wheel invoice reference.", encoding="utf-8")
 run = BusinessRun(build_platform_context("dext"))
 run.refresh()
 ticket = run.prepare({"type":"call_function","version":1,"name":"dext.bank",
@@ -164,7 +169,7 @@ class BuiltSourceContracts(unittest.TestCase):
         for resource in ("AutoCua/saccade/business_run.py", "AutoCua/saccade/business_worker.py",
                          "AutoCua/saccade/business_functions/platforms/dext/functions.py",
                          "AutoCua/saccade/business_functions/platforms/dext/policy.json",
-                         "AutoCua/web/tool_registry/business.rs", "AutoCua/web/Cargo.toml",
+                         "AutoCua/web/tool_registry/business.rs", "AutoCua/web/browser/download_events.rs", "AutoCua/web/Cargo.toml",
                          "platforms/dext/platform.json"):
             self.assertTrue(any(name.endswith("/" + resource) for name in names), resource)
         for name in names:

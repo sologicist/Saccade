@@ -10,6 +10,7 @@ from pathlib import Path
 from .business_catalogue import PACKAGE_ROOT, catalogue, client_registration, model_tool
 from .business_contract import BusinessError, digest, dumps, loads, read_safe, reject, validate
 from .session_context import _validate_context
+from .client_references import require_reference_bundle
 
 
 class BusinessRun:
@@ -118,6 +119,7 @@ class BusinessRun:
             model = os.environ.get("COMPTABLE_LLM_MODEL", "offline-synthetic-v1")
             if model != "offline-synthetic-v1":
                 reject("external_provider_consent_required")
+            require_reference_bundle(self.data_root, ticket["arguments"]["client_id"])
             request = {"version": 1, "ticket": ticket, "context": self.context,
                        "project_root": str(self.project_root), "offline_receipts": self.offline_receipts,
                        "model": model}
@@ -154,4 +156,5 @@ WORKER_ERRORS = {"business_revision_changed", "required_file_unavailable", "unsa
                  "invalid_invoice_direction", "invalid_invoice_entries", "invalid_invoice_journal",
                  "invalid_invoice_date", "invalid_invoice_currency", "incomplete_invoice_proposal",
                  "duplicate_json_key", "nonfinite_number", "invalid_json", "empty_reference", "file_changed_during_read",
-                 "json_integer_limit", "schema_depth"}
+                 "json_integer_limit", "schema_depth", "invalid_reference_content", "unsafe_reference_link",
+                 "unexpected_reference_file", "unapproved_reference_file"}

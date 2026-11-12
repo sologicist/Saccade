@@ -22,7 +22,7 @@ pub fn download_policy_request(id: u64, deny: bool) -> Vec<u8> {
 /// Browser events without an id are not command acknowledgments.
 pub fn check_policy_reply(frame: &[u8], expected_id: u64) -> Result<bool, String> {
     let reply: Value = serde_json::from_slice(frame)
-        .map_err(|e| format!("Invalid CDP response: {e}"))?;
+        .map_err(|_| "Invalid CDP response".to_string())?;
 
     let Some(id) = reply.get("id") else {
         return Ok(false);
@@ -31,8 +31,8 @@ pub fn check_policy_reply(frame: &[u8], expected_id: u64) -> Result<bool, String
     if id.as_u64() != Some(expected_id) {
         return Err("Unexpected CDP response identifier".into());
     }
-    if let Some(error) = reply.get("error") {
-        return Err(format!("Chrome rejected download protection: {error}"));
+    if reply.get("error").is_some() {
+        return Err("Chrome rejected download protection".into());
     }
     if !reply.get("result").is_some_and(Value::is_object) {
         return Err("Missing download protection acknowledgment".into());
@@ -235,6 +235,7 @@ pub struct ChromePipeTransport {
     response_read: std::fs::File,
     pending: Vec<u8>,
     next_id: u64,
+    download_events: crate::download_events::DownloadEvents,
 }
 
 #[cfg(windows)]
@@ -247,6 +248,7 @@ impl ChromePipeTransport {
             response_read,
             pending: Vec::new(),
             next_id: 0,
+            download_events: crate::download_events::DownloadEvents::default(),
         }
     }
 
@@ -271,12 +273,22 @@ impl ChromePipeTransport {
 
         loop {
             // A CDP pipe may contain events before the command's response.
+            let mut acknowledged = false;
             while let Some(end) = self.pending.iter().position(|byte| *byte == 0) {
                 let frame: Vec<u8> = self.pending.drain(..=end).collect();
-
+                let value: Value = serde_json::from_slice(&frame[..frame.len() - 1])
+                    .map_err(|_| "Invalid CDP response".to_string())?;
+                self.download_events.observe(&value);
                 if check_policy_reply(&frame[..frame.len() - 1], id)? {
-                    return Ok(());
+                    if acknowledged { return Err("Duplicate CDP acknowledgment".into()); }
+                    acknowledged = true;
                 }
+            }
+            // Inspect complete trailing frames from this read as well as events
+            // preceding the ACK. Evidence errors never stop DENY being sent.
+            if acknowledged {
+                if deny { self.download_events.require_no_activity().map_err(str::to_string)?; }
+                return Ok(());
             }
 
             if Instant::now() >= deadline {
@@ -489,16 +501,17 @@ impl ChromePipeTransport {
                 let frame: Vec<u8> = self.pending.drain(..=end).collect();
                 let reply: Value = serde_json::from_slice(
                     &frame[..frame.len() - 1]
-                ).map_err(|e| format!("Invalid CDP response: {e}"))?;
+                ).map_err(|_| "Invalid CDP response".to_string())?;
 
                 let Some(id) = reply.get("id") else {
-                    continue; // Ignore unsolicited browser events.
+                    self.download_events.observe(&reply);
+                    continue;
                 };
                 if id.as_u64() != Some(request_id) {
                     return Err("Unexpected CDP response identifier".into());
                 }
-                if let Some(error) = reply.get("error") {
-                    return Err(format!("Chrome refused extension loading: {error}"));
+                if reply.get("error").is_some() {
+                    return Err("Chrome refused extension loading".into());
                 }
 
                 let extension_id = reply.pointer("/result/id")
@@ -511,6 +524,7 @@ impl ChromePipeTransport {
                     return Err("Chrome returned an invalid extension ID".into());
                 }
 
+                self.download_events.require_no_activity().map_err(str::to_string)?;
                 return Ok(extension_id.to_owned());
             }
 
@@ -591,6 +605,8 @@ mod tests {
         assert!(check_policy_reply(
             br#"{"id":7,"error":{"message":"Denied"}}"#, 7
         ).is_err());
+        let error = check_policy_reply(br#"{"id":7,"error":{"message":"PRIVATE_SIGNED_URL"}}"#, 7).unwrap_err();
+        assert!(!error.contains("PRIVATE_SIGNED_URL"));
     }
 
 
@@ -681,20 +697,33 @@ mod tests {
             "result": {}
         });
 
-        output.write_all(response.to_string().as_bytes()).unwrap();
-        output.write_all(&[0]).unwrap();
+        let with_events = std::env::var("SACCADE_TEST_PIPE_EVENTS").as_deref() == Ok("1");
+        let mut frames = Vec::new();
+        if with_events {
+            frames.extend_from_slice(br#"{"method":"Browser.downloadWillBegin","params":{"guid":"synthetic-download","frameId":"synthetic-frame","url":"https://app.dext.com/synthetic.pdf"}}"#);
+            frames.push(0);
+        }
+        frames.extend_from_slice(response.to_string().as_bytes());
+        frames.push(0);
+        if with_events {
+            frames.extend_from_slice(br#"{"method":"Browser.downloadProgress","params":{"guid":"synthetic-download","totalBytes":0,"receivedBytes":0,"state":"canceled"}}"#);
+            frames.push(0);
+        }
+        output.write_all(&frames).unwrap();
         output.flush().unwrap();
     }
 
     #[cfg(windows)]
     #[test]
     fn explicitly_inherited_pipes_exchange_cdp_messages() {
+        for with_events in [false, true] {
         let pipes = ChromePipes::new().unwrap();
 
         std::env::set_var(
             "SACCADE_TEST_PIPE_HANDLES",
             pipes.chrome_argument(),
         );
+        std::env::set_var("SACCADE_TEST_PIPE_EVENTS", if with_events { "1" } else { "0" });
 
         let executable = std::env::current_exe().unwrap();
 
@@ -711,6 +740,7 @@ mod tests {
         );
 
         std::env::remove_var("SACCADE_TEST_PIPE_HANDLES");
+        std::env::remove_var("SACCADE_TEST_PIPE_EVENTS");
 
         let process_id = launched.expect(
             "Could not launch the isolated child process"
@@ -720,9 +750,14 @@ mod tests {
 
         let mut transport = ChromePipeTransport::new(pipes);
 
-        transport.set_downloads_denied(true).expect(
-            "Child process did not receive or acknowledge CDP"
-        );
+        let result = transport.set_downloads_denied(true);
+        if with_events {
+            assert_eq!(result, Err("scoped_download_attempt_observed".into()));
+            assert_eq!(transport.download_events.events().len(), 2);
+        } else {
+            result.expect("Child process did not receive or acknowledge CDP");
+        }
+        }
     }
 
 

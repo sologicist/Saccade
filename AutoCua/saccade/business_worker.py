@@ -28,6 +28,8 @@ def execute(request):
         snapshot, clients = run.snapshot()
         if snapshot["revision"] != ticket["revision"]:
             reject("business_revision_changed")
+        from .client_references import require_reference_bundle
+        require_reference_bundle(run.data_root, ticket["arguments"]["client_id"])
         from AutoCua.saccade.business_functions.platforms.dext.runtime import AccountingContext, _CURRENT
         context = AccountingContext(run.data_root, clients, model=request["model"], offline_receipts=run.offline_receipts)
         token = _CURRENT.set(context)

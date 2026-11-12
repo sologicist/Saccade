@@ -1,4 +1,10 @@
-# PR5 implementation review
+# PR5 initial implementation review (historical checkpoint)
+
+This records the initial PR5 checkpoint subsequently committed by the operator as
+`507ec10f9161d12192594310396f346cc425bd95`. The current completion/security review,
+updated results, file inventory and merge-readiness assessment are in
+[pr5_completion_review.md](pr5_completion_review.md). The original counts and
+limitations below describe that earlier checkpoint, not the current worktree.
 
 Date: 2026-11-12. Branch: `feat/dext-live-navigation-learning`.
 

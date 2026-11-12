@@ -444,6 +444,25 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertNotEqual(active["active"]["current"], active["pinned_revision"])
         self.assertEqual(self.client.post(url, json=review, headers=headers, base_url=self.base_url).status_code, 409)
 
+    def test_local_chat_correction_uses_review_channel_without_starting_a_model_run(self):
+        response = self.post(platform_id="dext")
+        self.finish_run()
+        sid = response.json["session_id"]
+        url = f"/api/dext/control?session_id={sid}"
+        status = self.client.get(url, headers=self.headers, base_url=self.base_url).json
+        headers = {**self.headers, "Origin": self.base_url}
+        raw = "Open invoices then confirm the workspace then select the record."
+        body = {"event": "teach_correction", "review_token": status["review_token"], "correction": raw}
+        result = self.client.post(url, json=body, headers=headers, base_url=self.base_url)
+        self.assertEqual(result.status_code, 200, result.json)
+        self.assertEqual(len(self.created), 1)
+        preview = self.client.get(url, headers=self.headers, base_url=self.base_url).json
+        self.assertEqual(preview["proposal"]["teaching_source"], "operator_chat_correction")
+        self.assertNotIn(raw, json.dumps(preview))
+        self.assertEqual(preview["active"], status["active"])
+        forged = self.client.post(url, json={**body, "approve": True}, headers=headers, base_url=self.base_url)
+        self.assertEqual(forged.status_code, 409)
+
     def test_generic_chat_has_no_dext_operator_control(self):
         response = self.post()
         self.finish_run()

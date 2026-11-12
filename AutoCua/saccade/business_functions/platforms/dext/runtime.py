@@ -10,6 +10,7 @@ import contextvars
 import re
 
 from AutoCua.saccade.business_contract import digest, dumps, loads, read_safe, reject
+from AutoCua.saccade.client_references import REFERENCE_FILES, read_reference
 
 _CURRENT = contextvars.ContextVar("dext_business_context")
 
@@ -43,7 +44,7 @@ class AccountingContext:
         self.references = {}
 
     def reference(self, client_id, name, *, optional=False):
-        if name not in ("comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"):
+        if name not in REFERENCE_FILES:
             reject("unapproved_reference_file")
         if client_id not in self.clients:
             reject("unauthorized_client")
@@ -58,15 +59,9 @@ class AccountingContext:
                 return ""
             except OSError:
                 reject("required_file_unavailable")
-        content = read_safe(self.root, path, 8192 if optional else 2 * 1024 * 1024)
-        self.references[name] = digest(["reference-present", digest(content)])
-        try:
-            text = content.decode("utf-8-sig")
-            if not optional and not text.strip():
-                reject("empty_reference")
-            return text
-        except UnicodeError:
-            reject("invalid_reference_encoding")
+        text, revision = read_reference(self.root, client_id, name)
+        self.references[name] = revision
+        return text
 
     def bank(self, label, client_id):
         if type(label) is not str or not label.strip() or len(label) > 1000:

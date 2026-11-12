@@ -2688,7 +2688,8 @@ compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *arg
             py.run(&CString::new(r#"
 from AutoCua.saccade.dext_control import DextRunControl
 control = DextRunControl(fixture.context, 'native-synthetic-chat', project_root=fixture.root)
-control.operator_event({'review_token':control.review_token,'event':'teach','routes':['workspace','invoices','record','review']}, busy=True)
+control.operator_event({'review_token':control.review_token,'event':'teach_correction',
+    'correction':'Confirm the workspace then open invoices then select the record then ask for operator review.'}, busy=True)
 proposal = control.proposal.copy()
 control.operator_event({'review_token':control.review_token,'event':'review','approve':True,
     **{k:proposal[k] for k in ('proposal_id','base_revision','candidate_revision')}}, busy=True)
