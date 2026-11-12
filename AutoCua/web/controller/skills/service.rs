@@ -51,6 +51,10 @@ struct Domain {
 static SKILLS: Mutex<Vec<Skill>> = Mutex::new(Vec::new());
 static DOMAIN: Mutex<Vec<Domain>> = Mutex::new(Vec::new());
 
+// Native-loop and domain contracts share the process-wide skill run state.
+#[cfg(test)]
+pub(crate) static STATE_TEST: Mutex<()> = Mutex::new(());
+
 #[derive(Debug)]
 struct SiteScope {
     key: String,
@@ -433,7 +437,6 @@ mod tests {
 
     // Only tests exercising the native run state need serialization. Pure
     // manifest and URL validation tests never touch the process-wide state.
-    static STATE_TEST: Mutex<()> = Mutex::new(());
 
     struct Fixture(PathBuf);
 

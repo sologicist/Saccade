@@ -556,6 +556,7 @@ pub fn main_action_defaults() -> &'static Value {
             "update_todo": {"value": ""},
             "skills": {"type": "load", "id": 0},
             "done": {"value": ""},
+            "call_function": {"version": 1, "name": "", "arguments": {}},
         })
     })
 }
@@ -818,6 +819,13 @@ pub fn tool_calls_to_steps(
             continue;
         }
         let defaults = defaults.unwrap();
+        if name == "call_function" && (args.len() != 3 || args.get("version").and_then(Value::as_u64) != Some(1)
+            || args.get("name").and_then(Value::as_str).is_none()
+            || args.get("arguments").and_then(Value::as_object).is_none()) {
+            rejects.push(json!({"id": call_id, "name": name, "arguments": {},
+                "error": "invalid_business_request: version, name and arguments must match the version 1 contract exactly."}));
+            continue;
+        }
         // A MISSING action field is a schema violation, not an omitted
         // optional — every param on every tool is `required`. Letting the
         // defaults fill it would silently promote a malformed turn into a
@@ -1004,6 +1012,7 @@ struct CoreState {
 /// Manager to route requests to the correct LLM provider.
 #[pyclass(frozen, name = "LLMManager")]
 pub struct LLMManager {
+    business_providers: Mutex<Option<(Value, Py<PyAny>, Py<PyAny>)>>,
     pub provider: String,
     pub model_short_name: String,
     pub runtime_api_key: Option<String>,
@@ -1124,6 +1133,7 @@ impl LLMManager {
         let scrape_impl = make(scrape_mode_tools(), max_tokens, &model_info)?;
 
         Ok(LLMManager {
+            business_providers: Mutex::new(None),
             provider,
             model_short_name: model.to_string(),
             runtime_api_key,
@@ -1210,7 +1220,7 @@ impl LLMManager {
                 (state.model.clone(), state.display_name.clone())
             };
             let t0 = Instant::now();
-            match send_py(self.step_provider(), &attempt_messages, &model, shots) {
+            match send_py(&self.step_provider(), &attempt_messages, &model, shots) {
                 Ok(response) => {
                     let elapsed = t0.elapsed().as_secs_f64();
                     let usage = normalize_usage(response.get("usage"));
@@ -1350,16 +1360,57 @@ impl LLMManager {
     }
 
     /// The provider holding this step's tool list.
-    fn step_provider(&self) -> &Py<PyAny> {
+    fn step_provider(&self) -> Py<PyAny> {
+        Python::attach(|py| {
         if self.scrape_step.load(Ordering::Relaxed) {
-            return &self.scrape_impl;
+            return self.scrape_impl.clone_ref(py);
+        }
+        if let Some((_, normal, dialog)) = self.business_providers.lock().unwrap().as_ref() {
+            return if self.dialog_step.load(Ordering::Relaxed) { dialog.clone_ref(py) } else { normal.clone_ref(py) };
         }
         if self.dialog_step.load(Ordering::Relaxed) {
-            &self.dialog_impl
+            self.dialog_impl.clone_ref(py)
         } else {
-            &self.provider_impl
+            self.provider_impl.clone_ref(py)
         }
+        })
     }
+
+    /// Per-run definitions use the same provider constructors and dialects as
+    /// native Web tools. Rebuild only when their model-visible schema changes.
+    pub fn set_business_tool(&self, py: Python<'_>, definition: Option<Value>) -> PyResult<()> {
+        let Some(definition) = definition else {
+            let previous = self.business_providers.lock().unwrap().take();
+            drop(previous);
+            return Ok(())
+        };
+        if self.business_providers.lock().unwrap().as_ref().is_some_and(|(old, _, _)| old == &definition) { return Ok(()) }
+        let mut registry = if self.claude { main_tools_claude().clone() } else { main_tools_quality().clone() };
+        registry.push(definition.clone());
+        let make = |registry: &[Value]| -> PyResult<Py<PyAny>> {
+            let tools = match self.provider.as_str() {
+                "openai" => tools_openai_strict(registry), "anthropic" => tools_anthropic(registry),
+                "google" => tools_gemini(registry), "perplexity" => tools_perplexity(registry),
+                _ => tools_openai(registry),
+            };
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("cli_agent", self.cli_agent)?;
+            kwargs.set_item("max_tokens", py.None())?;
+            kwargs.set_item("api_key", self.runtime_api_key.as_deref())?;
+            Ok(shared_llm(py)?.call_method("build_provider", (&self.provider, &self.model_short_name,
+                pythonize::pythonize(py, &self.primary_model_info)?, pythonize::pythonize(py, &tools)?), Some(&kwargs))?.unbind())
+        };
+        let normal = make(&registry)?;
+        registry.push(dialog_tool().clone());
+        // Provider constructors may release the GIL or invoke Python callbacks.
+        // Never hold the registry mutex across Python construction/destruction.
+        let dialog = make(&registry)?;
+        let previous = self.business_providers.lock().unwrap().replace((definition, normal, dialog));
+        drop(previous);
+        Ok(())
+    }
+
+    pub fn business_enabled(&self) -> bool { self.business_providers.lock().unwrap().is_some() }
 
     pub fn async_tools(&self) -> bool {
         self.primary_model_info.get("async_tools").and_then(Value::as_bool).unwrap_or(false)
@@ -1428,7 +1479,8 @@ impl LLMManager {
     fn _step_tool_names(&self, py: Python<'_>, scrape: bool, dialog: bool) -> PyResult<Vec<String>> {
         self.set_scrape_step(scrape);
         self.set_dialog_step(dialog);
-        let tools = self.step_provider().bind(py).getattr("tools")?;
+        let selected = self.step_provider();
+        let tools = selected.bind(py).getattr("tools")?;
         if tools.is_none() {
             return Ok(Vec::new());
         }
@@ -1566,4 +1618,41 @@ pub fn _main_tools_debug<'py>(py: Python<'py>, speed: Option<String>, strict: bo
     };
     let out = if strict { tools_openai_strict(registry) } else { registry.clone() };
     pythonize::pythonize(py, &Value::Array(out)).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod business_schema_tests {
+    use super::*;
+
+    #[test]
+    fn business_schema_uses_every_native_provider_dialect_without_global_exposure() {
+        let definition = json!({"name":"call_function", "description":"Synthetic contract",
+            "parameters":{"type":"object", "properties":{"version":{"type":"integer","enum":[1]},
+                "name":{"type":"string","enum":["dext.bank"]}, "arguments":{"type":"object","properties":{},"required":[],"additionalProperties":false}},
+                "required":["version","name","arguments"],"additionalProperties":false}});
+        let registry = vec![definition];
+        assert_eq!(tools_openai(&registry)[0]["function"]["name"], "call_function");
+        assert_eq!(tools_openai_strict(&registry)[0]["function"]["strict"], true);
+        assert_eq!(tools_anthropic(&registry)[0]["input_schema"]["additionalProperties"], false);
+        assert_eq!(tools_gemini(&registry)[0]["name"], "call_function");
+        assert_eq!(tools_perplexity(&registry)[0]["name"], "call_function");
+        for names in [main_tool_names(), main_tool_names_fast(), main_tool_names_claude(), scrape_mode_names()] {
+            assert!(!names.contains("call_function"));
+        }
+    }
+
+    #[test]
+    fn business_parser_preserves_call_identity_and_refuses_extra_authority() {
+        let mut names = main_tool_names().clone(); names.insert("call_function".into());
+        let calls = json!([
+            {"id":"valid", "name":"call_function", "arguments":{"version":1,"name":"dext.bank","arguments":{"client_id":"synthetic-alpha","string":"SYNTHETIC BANK"}}},
+            {"id":"forged", "name":"call_function", "arguments":{"version":1,"name":"dext.bank","arguments":{},"effect":"compute"}}
+        ]);
+        let (actions, kept, rejected, _) = tool_calls_to_steps(&calls, &[], &names);
+        assert_eq!(actions.len(), 1); assert_eq!(kept[0]["id"], "valid");
+        assert_eq!(rejected[0]["id"], "forged");
+        assert_eq!(actions[0]["arguments"]["string"], "SYNTHETIC BANK");
+        let (_, _, rejected, _) = tool_calls_to_steps(&calls, &[], main_tool_names());
+        assert_eq!(rejected.len(), 2);
+    }
 }

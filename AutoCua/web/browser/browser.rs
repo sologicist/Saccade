@@ -2392,6 +2392,8 @@ fn show_by_tabs_api(port: u16, window: &Value, url: &str, twins: usize, place: u
 // ---------------------------------------------------------------------------
 
 pub struct ScannerInner {
+    #[cfg(test)]
+    pub business_test_observations: Option<std::collections::VecDeque<Value>>,
     /// A selected platform is an execution policy, never page-provided context.
     platform_scope: Option<crate::platform_scope::PlatformScope>,
     scope_initialized: bool,
@@ -2519,6 +2521,8 @@ impl ScannerInner {
             .join("logo")
             .join("logo.html");
         ScannerInner {
+            #[cfg(test)]
+            business_test_observations: None,
             platform_scope: None,
             scope_initialized: false,
             scope_observer_id: String::new(),
@@ -2665,6 +2669,11 @@ impl ScannerInner {
     /// Open or resume the scoped surface before any model observation. A resumed
     /// run never guesses among several pages or navigates away from a login handoff.
     pub fn initialize_platform_scope(&mut self, resumed: bool) -> SResult<()> {
+        #[cfg(test)]
+        if self.business_test_observations.is_some() {
+            self.scope_initialized = true;
+            return self.check_platform_scope();
+        }
         if self.platform_scope.is_none() || self.scope_initialized {
             return self.check_platform_scope();
         }
@@ -2797,6 +2806,18 @@ impl ScannerInner {
         if let Some(message) = scope.violation() {
             return Err(ScanErr::s(message));
         }
+        // The test build replaces only the Chrome observation boundary. It
+        // still runs the same decoder, sticky scope policy and pre/post gates.
+        #[cfg(test)]
+        if let Some(observations) = self.business_test_observations.as_mut() {
+            let observed = observations.pop_front().ok_or_else(|| ScanErr::s("Synthetic observations exhausted."))?;
+            self.scope_observer_id = "synthetic-observer".into();
+            self.tab_id = Some("1".into());
+            if observed.get("downloads_denied") != Some(&json!(true)) {
+                return Err(self.platform_failure("Synthetic download denial was not acknowledged."));
+            }
+            return self.consume_platform_observation(observed);
+        }
         if !self.scope_initialized {
             return Err(self.platform_failure("The platform surface has not been initialized."));
         }
@@ -2829,6 +2850,10 @@ impl ScannerInner {
         let observer = self.scope_observer_id.clone();
         let observed = self.bridge_request(json!({"type": "platform_scope_observe", "observer_id": observer}))
             .map_err(|e| self.platform_failure(format!("Platform observation was lost; operator review required: {}", Self::scope_transport_error(e))))?;
+        self.consume_platform_observation(observed)
+    }
+
+    fn consume_platform_observation(&mut self, observed: Value) -> SResult<()> {
         if observed.get("schema_version").and_then(Value::as_i64) != Some(1)
             || observed.get("observer_id").and_then(Value::as_str) != Some(self.scope_observer_id.as_str()) {
             return Err(self.platform_failure("The platform observer changed or returned an unsupported contract."));
@@ -2865,6 +2890,14 @@ impl ScannerInner {
             self.protect_platform_tab(&target)?;
         }
         Ok(())
+    }
+
+    pub fn authorize_business_action(&mut self, action: &Value, permit: &crate::tool_registry::business::BusinessPermit) -> SResult<()> {
+        let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("Business functions require a protected platform session."))?;
+        if let Err(message) = scope.validate_business_action(action, permit) {
+            return Err(self.platform_failure(message));
+        }
+        self.check_platform_scope()
     }
 
     /// The agent just sent the tab it drives to `url` (new_tab, update_tab).
@@ -3769,6 +3802,15 @@ impl ScannerInner {
     /// between writing and reading them.
     pub fn scan_core(&mut self) -> SResult<String> {
         self.check_platform_scope()?;
+        #[cfg(test)]
+        if self.business_test_observations.is_some() {
+            self.url = "https://app.dext.com/login".into();
+            self.tree_text = "<main><h1>Synthetic Dext fixture</h1><p>No customer records</p></main>".into();
+            self.all_tabs = "[1] Synthetic Dext fixture: https://app.dext.com/login".into();
+            self.cursor_enabled = false;
+            self.check_platform_scope()?;
+            return Ok("Synthetic browser scan".into());
+        }
         // A scan that fails on something that can be put right is put right and taken
         // again, a few times at most: a failed scan ends the run (the agent loop), and a
         // page that freezes or crashes a second time gets a blank tab, which does neither.
@@ -5580,6 +5622,8 @@ impl BrowserScanner {
         }
 
         self.locked(py, move |s| {
+            #[cfg(test)]
+            if s.business_test_observations.is_some() { return Ok(()) }
             s.glow_tabs();
             s.last_scan_seconds = t0.elapsed().as_secs_f64();
             Ok(())

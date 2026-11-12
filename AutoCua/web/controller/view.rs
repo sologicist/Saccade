@@ -41,6 +41,7 @@ const ON_THE_PAGE: [&str; 6] = ["click", "hold_click", "input", "vault", "keyboa
 
 /// Routes one step's actions against the live browser.
 pub struct ControllerView {
+    business: Mutex<Option<crate::tool_registry::business::BusinessGate>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -77,6 +78,7 @@ impl ControllerView {
             None => web_dir.join("scratchpad"),
         };
         Ok(ControllerView {
+            business: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -88,6 +90,49 @@ impl ControllerView {
     }
 
     // ------------------------------------------------------------------ setup
+
+    pub fn configure_business(&self, py: Python<'_>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let gate = match context {
+            Some(context) => {
+                let value: Value = pythonize::depythonize(context)?;
+                if value["platform_id"] == "dext" && value["execution_mode"] == "supervised" {
+                    Some(crate::tool_registry::business::BusinessGate::new(py, context)?)
+                } else { None }
+            }
+            None => None,
+        };
+        *self.business.lock().unwrap() = gate;
+        Ok(())
+    }
+
+    pub fn refresh_business(&self, py: Python<'_>) -> PyResult<Option<Value>> {
+        self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()
+    }
+
+    #[cfg(test)]
+    pub fn business_fixture(&self, run: Py<PyAny>) {
+        *self.business.lock().unwrap() = Some(crate::tool_registry::business::BusinessGate::from_fixture(run));
+    }
+
+    fn call_business(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
+        let business = self.business.lock().unwrap();
+        let Some(gate) = business.as_ref() else { return Ok(crate::tool_registry::business::denied()) };
+        let permit = match gate.authorize(py, action) {
+            Ok(permit) => permit,
+            Err(error) => return Ok(crate::tool_registry::business::denied_error(py, &error)),
+        };
+        if let Err(error) = super::service::scan_op(py, &self.scanner, |scanner| scanner.authorize_business_action(action, &permit)) {
+            return match error {
+                ActErr::Py(error) => Err(error),
+                ActErr::Msg(_) => Ok(crate::tool_registry::business::denied()),
+            };
+        }
+        match gate.execute(py, permit, self.stop_event.as_ref()) {
+            Ok(value) => Ok(value),
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => Err(error),
+            Err(_) => Ok(crate::tool_registry::business::denied()),
+        }
+    }
 
     /// Hand over the ids from the scan the model was just shown. The app-name
     /// parameter is accepted for signature parity with the mac/ios controllers
@@ -178,6 +223,10 @@ impl ControllerView {
             _ => Vec::new(),
         };
 
+        if actions.len() > 1 && actions.iter().any(|a| a["type"] == "call_function") && actions.iter().any(|a| a["type"] == "done") {
+            return Ok(json!({"status":"error", "action":"multiple", "results": actions.iter().map(|a|
+                json!({"status":"not_run", "tool":a["type"], "code":"done_must_be_alone"})).collect::<Vec<_>>()}));
+        }
         if actions.len() == 1 {
             let (mut result, opened) = self.one(py, &actions[0])?;
             // A page frozen by the popup this action opened has nothing to settle.
@@ -210,11 +259,14 @@ impl ControllerView {
                 // broke the chain also tells the model why its later steps
                 // did not happen.
                 let failed_tool = results[failed - 1].get("tool").cloned().unwrap_or(Value::Null);
+                let reason = if results[failed - 1].get("operator_review_required").and_then(Value::as_bool) == Some(true) {
+                    "the review requirement for"
+                } else { "the failure of" };
                 results.push(json!({
                     "status": "not_run",
                     "tool": action.get("type").cloned().unwrap_or(Value::Null),
                     "message": format!(
-                        "not run - stopped by the failure of action {failed} \
+                        "not run - stopped by {reason} action {failed} \
                          ({}). The page may have \
                          changed, so re-read the latest element_tree before retrying.",
                         py_str_of(&failed_tool)
@@ -263,7 +315,8 @@ impl ControllerView {
             // one left behind. Running on past a failure acts on a page that
             // never arrived, with ids resolved against a scan that is now
             // wrong.
-            let ok = result.get("status").and_then(Value::as_str) == Some("success");
+            let ok = result.get("status").and_then(Value::as_str) == Some("success")
+                && !(tool == "call_function" && result.get("operator_review_required").and_then(Value::as_bool) == Some(true));
             results.push(result);
             if !ok {
                 failed_at = Some(n);
@@ -300,6 +353,16 @@ impl ControllerView {
     /// or prompt): the page is frozen behind it until the model answers it, which
     /// the next input shows as `<dialog>`.
     fn one(&self, py: Python<'_>, action: &Value) -> PyResult<(Value, bool)> {
+        if action.get("type").and_then(Value::as_str) == Some("call_function") {
+            if self.stopped(py)? {
+                return Ok((json!({"status":"stopped", "tool":"call_function"}), false));
+            }
+            if let Some(mut failure) = self.platform_check(py, None)? {
+                failure["tool"] = json!("call_function");
+                return Ok((failure, false));
+            }
+            return Ok((self.call_business(py, action)?, false));
+        }
         // All model tools, including unknown or bookkeeping calls, reach this
         // boundary before any browser side effect or completion result.
         if let Some(failure) = self.platform_check(py, Some(action))? {
@@ -652,7 +715,7 @@ mod platform_tests {
         Python::initialize();
         Python::attach(|py| {
             for kind in ["click", "hold_click", "input", "vault", "keyboard", "scroll", "dialog",
-                         "run_script", "more", "index", "navigate_tab", "close_tab", "download", "unknown"] {
+                         "run_script", "more", "index", "navigate_tab", "close_tab", "download", "call_function", "unknown"] {
                 let fixture = Fixture::new();
                 let result = fixture.view.route_action(py, &json!({"type": kind, "id": 1, "value": "synthetic"})).unwrap();
                 assert_eq!(result["status"], "error", "{kind}: {result}");
