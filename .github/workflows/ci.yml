@@ -72,8 +72,13 @@ jobs:
           python-version: '3.11'
       - name: Install repository-pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
-      - name: Rust unit tests (real Chrome test remains ignored)
+      - name: Rust unit tests (Windows)
+        if: runner.os == 'Windows'
         run: cargo test --locked --manifest-path AutoCua/web/Cargo.toml
+
+      - name: Rust compilation check (Linux)
+        if: runner.os == 'Linux'
+        run: cargo check --locked --all-targets --manifest-path AutoCua/web/Cargo.toml
       - name: Build PyO3 extension for native contracts
         if: runner.os == 'Windows'
         run: cargo build --locked --manifest-path AutoCua/web/Cargo.toml

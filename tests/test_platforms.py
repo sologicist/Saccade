@@ -98,7 +98,7 @@ class PlatformContracts(unittest.TestCase):
         self.assertEqual(platform.schema_version, 1)
         self.assertEqual(platform.allowed_hosts, ("app.dext.com",))
         self.assertEqual(platform.start_url, self.config["start_url"])
-        self.assertEqual(platform.procedure_path, self.domain_dir / "dext.md")
+        self.assertTrue(platform.procedure_path.samefile(self.domain_dir / "dext.md"))
         self.assertEqual(platform.procedure_path.read_text(encoding="utf-8"), "")
         self.assertFalse(hasattr(platform, "agent_md"))
         self.assertFalse((self.platform_dir / "agent.md").exists())
