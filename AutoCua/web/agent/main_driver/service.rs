@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError};
+use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
@@ -176,7 +176,9 @@ fn scraped_index_block() -> String {
 fn skills_blocks(py: Python<'_>, scanner: &crate::browser::BrowserScanner) -> (String, String) {
     let url = scanner.current_url(py).unwrap_or_default();
     crate::controller::skills::service::follow_url(&url);
-    (crate::controller::skills::service::block(), crate::controller::skills::service::domain_block())
+    let selected = scanner.inner.lock().ok().and_then(|inner| inner.platform_skill_name());
+    (crate::controller::skills::service::block(),
+     crate::controller::skills::service::domain_block_for(selected.as_deref()))
 }
 
 /// The <vault> block of <persistent_memory> (controller/vault): the key names
@@ -396,6 +398,14 @@ struct RunState {
 
 #[pyclass(frozen)]
 pub struct AgentService {
+    active_run: Mutex<()>,
+    platform_context: Option<Py<PyAny>>,
+    context_provider: String,
+    context_model: String,
+    profile_name: Option<String>,
+    profile_lease: Py<PyAny>,
+    owns_profile_lease: bool,
+    max_steps: i64,
     speed: String,
     headless: bool,
     save_conversation: bool,
@@ -413,7 +423,48 @@ pub struct AgentService {
     state: Mutex<RunState>,
 }
 
+/// Own only leases acquired here. UI/launcher leases remain their caller's
+/// responsibility, including constructor failures and interrupted runs.
+struct OwnedLeaseGuard<'py> {
+    lease: Bound<'py, PyAny>,
+    release: bool,
+}
+
+impl Drop for OwnedLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            let _ = self.lease.call_method0("release");
+        }
+    }
+}
+
+/// End scoped observation before releasing profile ownership on every exit,
+/// including Python exceptions that bypass the normal run cleanup tail.
+struct ScopedSurfaceGuard<'a, 'py> {
+    scanner: &'a BrowserScanner,
+    py: Python<'py>,
+}
+
+impl Drop for ScopedSurfaceGuard<'_, '_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.scanner.locked(self.py, |scanner| scanner.end_platform_scope()) {
+            eprintln!("Platform cleanup requires operator review: {error}");
+        }
+    }
+}
+
+impl Drop for AgentService {
+    fn drop(&mut self) {
+        if self.owns_profile_lease {
+            let _ = Python::try_attach(|py| { let _ = self.profile_lease.bind(py).call_method0("release"); });
+        }
+    }
+}
+
 impl AgentService {
+    fn platform_violation(&self) -> Option<String> {
+        self.scanner.get().inner.lock().ok().and_then(|scanner| scanner.platform_violation())
+    }
     fn stop_set(&self, py: Python<'_>) -> PyResult<bool> {
         match &self.stop_event {
             Some(ev) => ev.bind(py).call_method0("is_set")?.is_truthy(),
@@ -710,7 +761,8 @@ impl AgentService {
         text_callback=None, web_callback=None, shell_callback=None, cli_callback=None,
         tool_callback=None, token_callback=None, api_key=None, stop_event=None,
         prior_history=None, speed=None, headless=false, browser_port=None,
-        session_id=None, single_tab=false, browser_profile=None, **_extra))]
+        session_id=None, single_tab=false, browser_profile=None, platform_context=None,
+        profile_lease=None, **_extra))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -733,9 +785,46 @@ impl AgentService {
         session_id: Option<String>,
         single_tab: bool,
         browser_profile: Option<String>,
+        platform_context: Option<Bound<'_, PyAny>>,
+        profile_lease: Option<Bound<'_, PyAny>>,
         _extra: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let _ = cli_callback;
+        // Validate the selected platform against trusted installed metadata
+        // before creating an LLM manager, acquiring Chrome, or taking a scan.
+        let context_speed = speed.as_ref().filter(|s| !s.is_none())
+            .map(|s| s.str().and_then(|s| s.extract::<String>())).transpose()?
+            .unwrap_or_else(|| "quality".to_string());
+        let context_module = py.import("AutoCua.saccade.session_context")?;
+        let context = context_module.call_method1("validate_native_context", (
+            platform_context.as_ref().map(|v| v.clone().unbind()).unwrap_or_else(|| py.None()),
+            &provider, &model, &context_speed, headless, browser_profile.as_deref(),
+        ))?;
+        let scope = if context.is_none() { None } else {
+            let value: Value = pythonize::depythonize(&context)?;
+            Some(crate::platform_scope::PlatformScope::from_value(&value).map_err(PyValueError::new_err)?)
+        };
+        if scope.is_some() && (single_tab || session_id.is_some() || browser_port.is_some()) {
+            return Err(PyValueError::new_err("Platform sessions do not support parallel tabs or custom debugging ports."));
+        }
+        let max_steps = scope.as_ref().map(|scope| scope.max_steps).unwrap_or(100);
+        let context = (!context.is_none()).then(|| {
+            let value: Value = pythonize::depythonize(&context).expect("validated JSON context");
+            pythonize::pythonize(py, &value).map(|value| value.unbind())
+        }).transpose()?;
+        let lease_module = py.import("AutoCua.saccade.profile_lease")?;
+        // Headless Chrome uses the named default user-data-dir, whereas a
+        // visible unnamed run controls the person's existing Chrome profile.
+        let lease_profile = browser_profile.clone().or_else(|| headless.then(|| "default".to_string()));
+        let owns_profile_lease = profile_lease.as_ref().is_none_or(|lease| lease.is_none());
+        let lease = if owns_profile_lease {
+            lease_module.call_method1("acquire_web_profile", (lease_profile.as_deref(),))?
+        } else {
+            lease_module.call_method1("validate_web_profile_lease", (
+                profile_lease.as_ref().expect("present"), lease_profile.as_deref(),
+            ))?
+        };
+        let mut startup_lease = OwnedLeaseGuard { lease: lease.clone(), release: owns_profile_lease };
         let agent_dir = crate::agent_dir(py)?;
 
         // Parallel runs hand each agent a session id (scopes the shared
@@ -813,8 +902,17 @@ impl AgentService {
                 None => None,
             };
             let src = browser_dir.join("AutoCuaBridge");
+            let scoped_profile = scope.is_some();
             let bridge = py
-                .detach(move || crate::bridge::open_on_chrome(&src, user_data))
+                .detach(move || {
+                    if scoped_profile {
+                        let profile = user_data.ok_or_else(|| crate::browser::ScanErr::s(
+                            "A platform session requires its dedicated Chrome profile."))?;
+                        crate::bridge::open_scoped_chrome(&src, profile)
+                    } else {
+                        crate::bridge::open_on_chrome(&src, user_data)
+                    }
+                })
                 .map_err(PyErr::from)?;
             let scanner = BrowserScanner::create(&browser_dir, 0, frontend_callback, None, single_tab);
             if let Ok(mut inner) = scanner.inner.lock() {
@@ -845,6 +943,10 @@ impl AgentService {
             }
             scanner
         };
+        if let Some(scope) = scope {
+            scanner.get().inner.lock().map_err(|_| PyValueError::new_err("Scanner state is unavailable."))?
+                .set_platform_scope(scope);
+        }
 
         // Fast mode draws no cursor: the point of the mode is that every tool
         // fires the moment the previous one has landed, and the cursor's glide
@@ -998,7 +1100,15 @@ impl AgentService {
             Some(&comp_kwargs),
         )?;
 
-        Ok(AgentService {
+        let service = AgentService {
+            active_run: Mutex::new(()),
+            platform_context: context,
+            context_provider: provider.clone(),
+            context_model: model.clone(),
+            profile_name: browser_profile,
+            profile_lease: lease.unbind(),
+            owns_profile_lease,
+            max_steps,
             speed: speed_final,
             headless,
             save_conversation,
@@ -1021,7 +1131,9 @@ impl AgentService {
                 tool_responses: PyList::empty(py).into_any().unbind(),
                 last_messages: py.None(),
             }),
-        })
+        };
+        startup_lease.release = false;
+        Ok(service)
     }
 
     #[getter]
@@ -1072,6 +1184,25 @@ impl AgentService {
         py: Python<'py>,
         task: Bound<'py, PyAny>,
     ) -> PyResult<Py<PyDict>> {
+        let _active_run = self.active_run.try_lock().map_err(|_| {
+            PyValueError::new_err("Chrome profile is busy with another active run on this agent instance.")
+        })?;
+        self.profile_lease.bind(py).call_method0("ensure_held")?;
+        let _run_lease = OwnedLeaseGuard {
+            lease: self.profile_lease.bind(py).clone(), release: self.owns_profile_lease,
+        };
+        let _surface = ScopedSurfaceGuard { scanner: self.scanner.get(), py };
+        if let Some(context) = &self.platform_context {
+            let checked = py.import("AutoCua.saccade.session_context")?
+                .call_method1("validate_native_context", (context.bind(py), &self.context_provider,
+                    &self.context_model, &self.speed, self.headless, self.profile_name.as_deref()))?;
+            if self.platform_violation().is_none() {
+                let value: Value = pythonize::depythonize(&checked)?;
+                let scope = crate::platform_scope::PlatformScope::from_value(&value).map_err(PyValueError::new_err)?;
+                self.scanner.get().inner.lock().map_err(|_| PyValueError::new_err("Scanner state is unavailable."))?
+                    .set_platform_scope(scope);
+            }
+        }
         let task: String = task.str()?.extract()?;
         // A run's indexes (what the agent keeps from its scrapes, the `index`
         // tool) are numbered from 1 and stored in a folder of their own,
@@ -1178,8 +1309,19 @@ impl AgentService {
         println!("\nProcessing with {}", self.model_name());
         self.emit_flow(py, "run_start", None); // clear + take over the demo
 
+        let platform_ready = self.scanner.get().locked(py, |scanner| scanner.initialize_platform_scope(is_resumed));
+        if let Err(error) = &platform_ready {
+            final_status = "waiting_operator".into();
+            final_message = format!("Platform session requires operator review: {}", py_err_str(py, error));
+        }
+
         // Main agent loop
-        loop {
+        while platform_ready.is_ok() {
+            if let Some(message) = self.platform_violation() {
+                final_status = "waiting_operator".into();
+                final_message = message;
+                break;
+            }
             // Check for stop signal
             if self.stop_set(py)? {
                 println!("\nAgent stopped by user.");
@@ -1200,10 +1342,10 @@ impl AgentService {
             step_number += 1;
 
             // Max step limit - prevent infinite loops
-            if step_number > 100 {
-                println!("\nMax step limit reached (100). Exiting agent loop.");
+            if step_number > self.max_steps {
+                println!("\nMax step limit reached ({}). Exiting agent loop.", self.max_steps);
                 final_status = "incomplete".into();
-                final_message = "Reached the 100-step limit without finishing".into();
+                final_message = format!("Reached the {}-step limit without finishing", self.max_steps);
                 break;
             }
 
@@ -1274,7 +1416,7 @@ impl AgentService {
                     }
                     let msg = py_err_str(py, &e);
                     println!("Error processing request: {msg}");
-                    final_status = "error".into();
+                    final_status = if self.platform_violation().is_some() { "waiting_operator" } else { "error" }.into();
                     final_message = format!("could not read the page: {msg}");
                     break;
                 }
@@ -1522,6 +1664,10 @@ impl AgentService {
         }
 
         // Cleanup: close the scanner subprocess. Chrome deliberately stays up.
+        if let Err(error) = self.scanner.get().locked(py, |scanner| scanner.end_platform_scope()) {
+            final_status = "waiting_operator".into();
+            final_message = format!("Platform cleanup requires operator review: {}", py_err_str(py, &error));
+        }
         let _ = self.scanner.get().stop(py);
 
         if final_status == "error" {
@@ -1583,6 +1729,11 @@ impl AgentService {
 
         // Get raw response from LLM - pass annotated image. The HTTP round
         // trip runs without the GIL, like Python's requests did.
+        if let Err(error) = self.scanner.get().locked(py, |scanner| scanner.check_platform_scope()) {
+            *final_status = "waiting_operator".into();
+            *final_message = format!("Platform scope requires operator review: {}", py_err_str(py, &error));
+            return Ok(Flow::Break);
+        }
         let msgs: Vec<Value> = match pythonize::depythonize(messages.as_any())? {
             Value::Array(a) => a,
             other => vec![other],
@@ -1608,6 +1759,14 @@ impl AgentService {
             crate::tool_registry::service::SendOutcome::Native(v) => v,
             crate::tool_registry::service::SendOutcome::Text(s) => Value::String(s),
         };
+        // A page can redirect while the provider is responding. Discard this
+        // unexecuted turn before even drawing its reasoning into a browser tab.
+        // No assistant/tool turn was appended yet, so replay remains paired.
+        if let Err(error) = self.scanner.get().locked(py, |scanner| scanner.check_platform_scope()) {
+            *final_status = "waiting_operator".into();
+            *final_message = format!("Platform scope requires operator review: {}", py_err_str(py, &error));
+            return Ok(Flow::Break);
+        }
 
         // Memory bar: forward this call's exact token usage.
         if let Some(cb) = &self.token_callback {
@@ -2056,6 +2215,12 @@ impl AgentService {
             let action_result: Value = self
                 .controller
                 .route_action(py, &Value::Array(actions_val.clone()))?;
+            if let Some(message) = self.platform_violation() {
+                pair_results(tr, &calls, &note_results, &reject_results, &action_result)?;
+                *final_status = "waiting_operator".into();
+                *final_message = message;
+                return Ok(Flow::Break);
+            }
             // The pictures a scrape read took this step go with the next
             // input; a step without a read leaves none (run_script window.rs).
             let shots = crate::controller::run_script::service::window::take_shots();

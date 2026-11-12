@@ -394,11 +394,17 @@ pub fn block() -> String {
 /// <domain_knowledge>: the files of the current tab's site, each named with
 /// its site and given in full. Empty when the tab is on no known site.
 pub fn domain_block() -> String {
+    domain_block_for(None)
+}
+
+/// Scoped sessions retain native URL matching while exposing only the selected
+/// platform's procedure. A recognized URL does not activate another platform.
+pub fn domain_block_for(selected: Option<&str>) -> String {
     let Ok(domain) = DOMAIN.lock() else {
         return String::new();
     };
     let mut shown = Vec::new();
-    for d in domain.iter().filter(|d| d.on_site) {
+    for d in domain.iter().filter(|d| d.on_site && selected.is_none_or(|name| d.name == name)) {
         // Fail closed across all procedures applying to the current URL. A
         // file for another domain is neither read nor required for this block.
         let Some(content) = read_domain_file(&d.root, &d.canonical_root, &d.name, MAX_PROCEDURE_SIZE) else {
@@ -632,6 +638,28 @@ mod tests {
         new_run(&generic.0, &domain.0);
         assert!(domain_block().is_empty());
         assert!(!block().contains("Generic scraping procedure."));
+    }
+
+    #[test]
+    fn selected_platform_keeps_native_url_matching_without_other_domain_procedures() {
+        let _state = STATE_TEST.lock().unwrap();
+        let domain = Fixture::new();
+        let generic = Fixture::new();
+        domain.catalog();
+        domain.write("skills.json", r#"{
+            "app.dext.com":"dext.md",
+            "app.dext.com/shared":"google_sheets.md"
+        }"#);
+        new_run(&generic.0, &domain.0);
+        follow_url("https://app.dext.com/shared");
+        assert!(domain_block().contains("Google Sheets procedure."));
+        let selected = domain_block_for(Some("dext.md"));
+        assert!(selected.contains("Dext procedure"));
+        assert!(!selected.contains("Google Sheets procedure."));
+        domain.write("dext.md", "");
+        assert!(domain_block_for(Some("dext.md")).is_empty());
+        follow_url("https://app.dext.com.evil.test/shared");
+        assert!(domain_block_for(Some("dext.md")).is_empty());
     }
 
     #[test]

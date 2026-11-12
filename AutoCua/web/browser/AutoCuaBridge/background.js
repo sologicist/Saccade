@@ -13,7 +13,7 @@
 // opens or closes, {type: "reopened", from, to} when a frozen or crashed tab was opened
 // again, {type: "keepalive"}, and {id: "x<n>", type: "save", ...} from the Test button
 // (below), answered the same way.
-importScripts("element.js", "tools.js");
+importScripts("element.js", "tools.js", "platform_scope.js");
 
 elementTrackRequests();
 
@@ -24,6 +24,14 @@ elementTrackRequests();
 // children) is on the line within a second. The hand test writes one entry the old way
 // ({port, token}), which reads as a list of one.
 const lines = new Map(); // port -> {port, token, ws, pending, next, opened}
+const platformScopeObserver = createPlatformScopeObserver(chrome, () => lines.values(), toolsCdp);
+toolsOnScopeReview = (_tabId, message) => {
+  const scoped = [...lines.values()].filter((line) => line.platformScope || line.platformScopeEnding);
+  for (const line of scoped) {
+    if (line.platformScope) line.platformScope.failure ||= message;
+  }
+  return scoped.length > 0;
+};
 let lastToken = null;
 
 /// The line of the agent that drives a tab (tools.js toolsOurs), or null for a tab nobody
@@ -99,7 +107,17 @@ function dial(port, token) {
     // what a debugging-port client set up when its socket closes; the last agent to go
     // lets the whole browser go. The person's Cancel holds until a new token. A port
     // still listed is dialled again on the next pass.
-    if (line.opened) toolsLetGo(line, toolsLastLine(line)).catch(() => {});
+    line.platformScopeEnding = !!line.platformScope;
+    const cleanup = line.platformScope
+      ? platformScopeObserver.end(line, line.platformScope.id)
+      : Promise.resolve(null);
+    // Cleanup must precede debugger detachment. Its explicit end result is
+    // available to a live native run; a disconnected caller cannot receive it.
+    cleanup.finally(async () => {
+      try {
+        if (line.opened) await toolsLetGo(line, toolsLastLine(line));
+      } finally { delete line.platformScopeEnding; }
+    }).catch(() => {});
   };
 }
 
@@ -208,8 +226,37 @@ async function handle(msg, line) {
       case "tabs":
         result = await chrome.tabs.query({});
         break;
+      case "platform_scope_begin":
+        result = await platformScopeObserver.begin(line, msg.observer_id);
+        break;
+      case "platform_scope_protect_tab":
+        result = await platformScopeObserver.protect(line, msg.observer_id, msg.tabId);
+        break;
+      case "platform_scope_observe":
+        result = await platformScopeObserver.observe(line, msg.observer_id);
+        break;
+      case "platform_scope_end":
+        line.platformScopeEnding = true;
+        try {
+          result = await platformScopeObserver.end(line, msg.observer_id);
+          try {
+            await toolsLetGo(line, toolsLastLine(line));
+            result.browser_released = true;
+          } catch (_) {
+            result.browser_released = false;
+            result.cleanup_failure ||= "Scoped browser ownership could not be fully released; operator review is required.";
+          }
+        } finally { delete line.platformScopeEnding; }
+        break;
       default:
-        result = await toolsHandle(msg, line);
+        if (msg.type === "release" && line.platformScope) {
+          line.platformScopeEnding = true;
+          try {
+            const cleanup = await platformScopeObserver.end(line, line.platformScope.id);
+            result = await toolsHandle(msg, line);
+            if (cleanup.cleanup_failure) throw new Error(cleanup.cleanup_failure);
+          } finally { delete line.platformScopeEnding; }
+        } else result = await toolsHandle(msg, line);
         if (result === undefined) throw new Error(`unknown request: ${msg.type}`);
     }
     reply = { id: msg.id, result };

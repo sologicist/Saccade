@@ -105,6 +105,35 @@ impl ControllerView {
         }
     }
 
+    /// Keep policy failures in the normal one-result-per-call protocol. The
+    /// scanner latches scoped violations so the native loop stops for review.
+    fn platform_check(&self, py: Python<'_>, action: Option<&Value>) -> PyResult<Option<Value>> {
+        let action = action.cloned();
+        let tool = action.as_ref().and_then(|a| a.get("type")).cloned().unwrap_or(Value::Null);
+        let checked = super::service::scan_op(py, &self.scanner, move |scanner| {
+            match action {
+                Some(action) => scanner.authorize_platform_action(&action),
+                None => scanner.check_platform_scope(),
+            }
+        });
+        match checked {
+            Ok(()) => Ok(None),
+            Err(ActErr::Msg(message)) => Ok(Some(json!({
+                "status": "error", "tool": tool, "message": message,
+                "operator_review_required": true,
+            }))),
+            Err(ActErr::Py(error)) => Err(error),
+        }
+    }
+
+    fn check_after_settle(&self, py: Python<'_>, result: &mut Value) -> PyResult<()> {
+        if let Some(mut failure) = self.platform_check(py, None)? {
+            failure["tool"] = result.get("tool").cloned().unwrap_or(Value::Null);
+            *result = failure;
+        }
+        Ok(())
+    }
+
     /// After a page action that succeeded, wait until the page has taken it:
     /// the page's own pace, not the clock's (see settle_after_action).
     ///
@@ -150,11 +179,12 @@ impl ControllerView {
         };
 
         if actions.len() == 1 {
-            let (result, opened) = self.one(py, &actions[0])?;
+            let (mut result, opened) = self.one(py, &actions[0])?;
             // A page frozen by the popup this action opened has nothing to settle.
             if !opened {
                 self.settle_after(py, &result);
             }
+            self.check_after_settle(py, &mut result)?;
             return Ok(result);
         }
 
@@ -203,7 +233,7 @@ impl ControllerView {
                 }));
                 continue;
             }
-            let (result, opened) = self.one(py, action)?;
+            let (mut result, opened) = self.one(py, action)?;
             let ok_so_far = result.get("status").and_then(Value::as_str) == Some("success");
             let tool = result.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
             if ok_so_far && tool == "wait" {
@@ -228,6 +258,7 @@ impl ControllerView {
                 // or the scan — assumes the page has taken this one.
                 self.settle_after(py, &result);
             }
+            self.check_after_settle(py, &mut result)?;
             // A batch is a chain: each action assumes the page the previous
             // one left behind. Running on past a failure acts on a page that
             // never arrived, with ids resolved against a scan that is now
@@ -269,6 +300,11 @@ impl ControllerView {
     /// or prompt): the page is frozen behind it until the model answers it, which
     /// the next input shows as `<dialog>`.
     fn one(&self, py: Python<'_>, action: &Value) -> PyResult<(Value, bool)> {
+        // All model tools, including unknown or bookkeeping calls, reach this
+        // boundary before any browser side effect or completion result.
+        if let Some(failure) = self.platform_check(py, Some(action))? {
+            return Ok((failure, false));
+        }
         // What the page did before this action — while the model was
         // thinking, or during an earlier action of the batch, a page load
         // included — is not this action's doing, and must not hold the scan.
@@ -380,6 +416,7 @@ impl ControllerView {
         if kind != "done" {
             vault::service::hide_json(&mut result);
         }
+        self.check_after_settle(py, &mut result)?;
         Ok((result, opened))
     }
 
@@ -569,4 +606,108 @@ pub fn _route_action_debug<'py>(
     let actions_val: Value = pythonize::depythonize(&actions)?;
     let result = view.route_action(py, &actions_val)?;
     pythonize::pythonize(py, &result).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture {
+        root: PathBuf,
+        view: ControllerView,
+        scanner: Arc<Mutex<ScannerInner>>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!("saccade-controller-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&root).unwrap();
+            let mut inner = ScannerInner::new(&root.join("browser"), 0, Some(root.join("scans")), false);
+            inner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&json!({
+                "schema_version": 1, "platform_id": "dext", "execution_mode": "supervised",
+                "browser_profile": "saccade-dext", "start_url": "https://app.dext.com/login",
+                "allowed_hosts": ["app.dext.com"], "max_steps": 45, "config_revision": "a".repeat(64),
+            })).unwrap());
+            let scanner = Arc::new(Mutex::new(inner));
+            let view = ControllerView::new(&root, None, false, scanner.clone(), None).unwrap();
+            Self { root, view, scanner }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Fresh synthetic roots only; no browser or user data is involved.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn controller_blocks_effects_before_any_browser_dispatch() {
+        Python::initialize();
+        Python::attach(|py| {
+            for kind in ["click", "hold_click", "input", "vault", "keyboard", "scroll", "dialog",
+                         "run_script", "more", "index", "navigate_tab", "close_tab", "download", "unknown"] {
+                let fixture = Fixture::new();
+                let result = fixture.view.route_action(py, &json!({"type": kind, "id": 1, "value": "synthetic"})).unwrap();
+                assert_eq!(result["status"], "error", "{kind}: {result}");
+                assert_eq!(result["tool"], kind);
+                assert_eq!(result["operator_review_required"], true);
+                assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn denied_batch_keeps_one_result_per_call_and_never_reports_done() {
+        Python::initialize();
+        Python::attach(|py| {
+            let fixture = Fixture::new();
+            let result = fixture.view.route_action(py, &json!([
+                {"type": "run_script", "value": "location='https://outside.test/'"},
+                {"type": "wait", "value": "0"},
+                {"type": "done", "value": "claim success"},
+            ])).unwrap();
+            assert_eq!(result["status"], "error");
+            let results = result["results"].as_array().unwrap();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0]["status"], "error");
+            assert_eq!(results[1]["status"], "not_run");
+            assert_eq!(results[2]["status"], "not_run");
+            assert!(results.iter().all(|item| item.get("action") != Some(&json!("done"))));
+        });
+    }
+
+    #[test]
+    fn an_unverified_browser_cannot_complete_even_a_read_only_run() {
+        Python::initialize();
+        Python::attach(|py| {
+            let fixture = Fixture::new();
+            let result = fixture.view.route_action(py, &json!({"type": "done", "value": "unverified success"})).unwrap();
+            assert_eq!(result["status"], "error");
+            assert_eq!(result["operator_review_required"], true);
+            assert!(result["message"].as_str().unwrap().contains("not been initialized"));
+        });
+    }
+
+    #[test]
+    fn raw_browser_script_and_navigation_channels_cannot_bypass_scope() {
+        for request in [json!({"type": "run_script", "code": "synthetic"}),
+                        json!({"type": "close_tab", "tabId": 1}),
+                        json!({"type": "navigate", "url": "https://app.dext.com.evil.test/"}),
+                        json!({"type": "reload"})] {
+            let fixture = Fixture::new();
+            assert!(fixture.scanner.lock().unwrap().bridge_request(request).is_err());
+            assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+        }
+        let root = std::env::temp_dir();
+        let mut generic = ScannerInner::new(&root, 0, None, false);
+        assert!(generic.authorize_platform_action(&json!({"type": "run_script"})).is_ok());
+        assert!(generic.platform_violation().is_none());
+    }
 }
