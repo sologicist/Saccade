@@ -1,0 +1,86 @@
+# Platform-session contracts. No live Dext, Chrome profile, LLM API keys or secrets.
+name: Saccade CI
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: saccade-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python contracts
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Python unit and platform session contracts
+        run: python -m unittest discover -s tests -t . -q
+
+  javascript:
+    name: JavaScript contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Platform observer and UI selection contracts
+        run: >-
+          node --test
+          AutoCua/web/browser/AutoCuaBridge/platform_scope.test.cjs
+          AutoCua/ui/platform_session/selection.test.mjs
+      - name: Install UI dependencies from lockfile
+        working-directory: AutoCua/ui
+        run: npm ci
+      - name: Typecheck UI source
+        working-directory: AutoCua/ui
+        run: npm run typecheck
+      - name: Verify shipping UI bundle matches source
+        working-directory: AutoCua/ui
+        run: |
+          npm run build
+          git diff --exit-code -- index.js
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install repository-pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Rust unit tests (real Chrome test remains ignored)
+        run: cargo test --locked --manifest-path AutoCua/web/Cargo.toml
+      - name: Build PyO3 extension for native contracts
+        if: runner.os == 'Windows'
+        run: cargo build --locked --manifest-path AutoCua/web/Cargo.toml
+      - name: Native Python / Rust integration contracts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dll = Resolve-Path 'AutoCua/web/target/debug/agent_native.dll'
+          $env:SACCADE_TEST_NATIVE = $dll.Path
+          python -m unittest tests.test_platform_session_native -v
