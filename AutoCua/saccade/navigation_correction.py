@@ -8,7 +8,7 @@ import unicodedata
 from .business_contract import reject
 
 _ARTICLE = r"(?:(?:the|a|an|le|la|les|un|une)\s+|l')?"
-_OPEN = r"(?:open|go to|click|click on|ouvrir|ouvre|aller a|va dans|va sur|clique sur|clique|cliquer sur)\s+"
+_OPEN = r"(?:open|go to|go through|click|click on|ouvrir|ouvre|aller a|aller dans|passer par|va dans|va sur|clique sur|clique|cliquer sur)\s+"
 _VERIFY = r"(?:verify|confirm|check|verifie|verifier|confirme|confirmer)\s+"
 _SELECT = r"(?:select|open|selectionne|selectionner|ouvre|ouvrir)\s+"
 _PATTERNS = (
@@ -21,6 +21,29 @@ _PATTERNS = (
     ("review", r"(?:ask for|stop for|request|demande|demander|arrete pour|arreter pour)\s+" + _ARTICLE + r"(?:operator review|human review|verification operateur|validation operateur|revue operateur)"),
 )
 
+_FRAMES = (
+    r"(?:no,? you are going the wrong way|no,? that's wrong|you made a mistake|tu t'es trompe|ce n'est pas le bon chemin)(?:[.!,:]+\s*|\s+|$)",
+    r"(?:non|no)[,!:]\s*",
+    r"(?:en fait,?\s+)?(?:la bonne methode est|le bon chemin est)\s+",
+    r"(?:you should|tu dois|il faut)\s+",
+    r"(?:to find purchase invoices|pour trouver les factures d'achat),\s*",
+)
+
+
+def correction_framing(text):
+    """Strip only explicitly supported harmless framing, preserving unknown text."""
+    if type(text) is not str or not 1 <= len(text) <= 2000 or any(ord(c) < 32 and c not in '\n\r\t' for c in text):
+        reject('invalid_navigation_correction')
+    value = ''.join(c for c in unicodedata.normalize('NFKD', text.casefold()) if not unicodedata.combining(c)).replace('’', "'").strip()
+    explicit = False
+    for _ in range(3):
+        match = next((match for pattern in _FRAMES if (match := re.match(pattern, value))), None)
+        if not match:
+            break
+        value = value[match.end():].strip()
+        explicit = True
+    return value, explicit
+
 
 def correction_routes(text):
     """Accept only recognized complete sentences; never discard unknown details.
@@ -31,14 +54,16 @@ def correction_routes(text):
     """
     if type(text) is not str or not 1 <= len(text) <= 2000 or any(ord(c) < 32 and c not in "\n\r\t" for c in text):
         reject("invalid_navigation_correction")
-    normalized = "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
-    normalized = normalized.replace("’", "'")
-    normalized = re.sub(r"\b(?:first|d'abord)\b\s*[:,]?\s*", "", normalized)
+    normalized, _ = correction_framing(text)
     parts = [part.strip() for part in re.split(r"[.;,→\n]+|->|\b(?:and then|then|puis|ensuite)\b", normalized) if part.strip()]
     if not 1 <= len(parts) <= 8:
         reject("unsupported_navigation_correction")
     routes = []
-    for part in parts:
+    for index, part in enumerate(parts):
+        part = re.sub(r"^(?:first|d'abord)\s*[:,]?\s*", '', part)
+        part = re.sub(r"\s+(?:first|d'abord)$", '', part)
+        if index and part.startswith('sur '):
+            part = part[4:]
         # A following label may share the preceding verb: "Purchases, then Inbox".
         if re.fullmatch(_ARTICLE + r"(?:inbox|boite de reception|purchases|achats)", part):
             part = "open " + part

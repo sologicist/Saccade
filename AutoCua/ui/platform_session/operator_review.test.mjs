@@ -55,8 +55,33 @@ test('broker failures and changing chats never fall through into an unrelated ru
 
 test('only an explicitly absent pending intervention allows normal composer routing', async () => {
     const ui = operatorTransport();
-    ui.options.fetch = async () => ({ ok: true, json: async () => null });
+    ui.options.fetch = async (url, init) => ({ ok: true, json: async () =>
+        url.includes('/correction?') ? (init ? { status: 'ordinary' } : { signature: 'context', token: 'one-use' }) : null });
     assert.equal(await submitOperatorChat('A new task', 'chat', ui.options), false);
+    assert.equal(ui.resumed.length, 0);
+});
+
+test('spontaneous corrections use context-bound host classification without starting another run', async () => {
+    const ui = operatorTransport();
+    const calls = [];
+    ui.options.fetch = async (url, init) => {
+        calls.push({ url, init });
+        return { ok: true, json: async () => !url.includes('/correction?') ? null : !init ?
+            { signature: 'context', token: 'one-use' } : { status: 'waiting_operator', pending: {
+                session_id: 'chat', state: 'pausing_operator', request: { request: 'Pause requested; correction not applied yet.' } } } };
+    };
+    assert.equal(await submitOperatorChat('First click Purchases, then Inbox.', 'chat', ui.options), true);
+    assert.equal(ui.resumed.length, 0);
+    assert.equal(ui.updates[0].state, 'pausing_operator');
+    assert.equal(calls.filter(call => call.init).length, 1);
+    assert.equal(JSON.parse(calls[2].init.body).claim.token, 'one-use');
+    assert.ok(calls.every(call => !call.url.includes('start-agent')));
+});
+
+test('an active pending procedure or authentication reply takes priority over spontaneous classification', async () => {
+    const ui = operatorTransport({ state: 'pausing_operator' });
+    assert.equal(await submitOperatorChat('A different route', 'chat', ui.options), true);
+    assert.equal(ui.calls.length, 1);
     assert.equal(ui.resumed.length, 0);
 });
 

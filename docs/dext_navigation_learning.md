@@ -1,5 +1,8 @@
 # Dext operator review and navigation learning (PR5)
 
+Current stable `learning.md`, projection recovery and unsolicited chat corrections:
+[Canonical learning and spontaneous corrections](pr5_canonical_learning.md).
+
 The current ordinary-chat workflow and validation are documented in
 [PR5 conversational assistance](pr5_conversational_operator.md). The technical
 review controls below remain available as optional advanced diagnostics. In

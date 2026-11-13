@@ -13,6 +13,27 @@ export function samePresentation(a: PendingOperator | null, b: PendingOperator):
         key => a[key as keyof PendingOperator] === b[key as keyof PendingOperator]);
 }
 
+async function considerCorrection(text: string, session: string, options: {
+    fetch: typeof fetch; currentSession: () => string | null | undefined;
+    update: (value: PendingOperator | null) => void; reply?: (payload: string) => void;
+}): Promise<boolean> {
+    const url = '/api/operator/correction?session_id=' + encodeURIComponent(session);
+    const context = await options.fetch(url);
+    if (!context.ok) throw new Error('Could not verify the previous navigation context. Please retry.');
+    const claim = await context.json();
+    if (options.currentSession() !== session) return true;
+    const response = await options.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, claim }) });
+    const value = await response.json();
+    if (!response.ok) throw new Error('The correction could not be safely matched to the current task. Please retry.');
+    if (options.currentSession() !== session) return true;
+    if (value.status === 'ordinary') return false;
+    if (value.message && value.status !== 'blocked') throw new Error(value.message);
+    options.update(value.pending || null);
+    if (typeof value.reply_html === 'string') options.reply?.(JSON.stringify(value));
+    return true;
+}
+
 /** Host-only reply transport. A failure or unshown question never starts a task. */
 export async function submitOperatorChat(text: string, session: string, options: {
     fetch: typeof fetch; currentSession: () => string | null | undefined;
@@ -25,14 +46,16 @@ export async function submitOperatorChat(text: string, session: string, options:
     if (!response.ok) throw new Error('Could not verify the pending assistant question. Please retry.');
     const pending: PendingOperator | null = await response.json();
     if (options.currentSession() !== session) return true;
-    if (pending === null) return false;
-    if (typeof pending !== 'object' || !pending || pending.session_id !== session || !['waiting_operator', 'resuming', 'completed', 'cancelled'].includes(pending.state)) {
+    if (pending === null) return considerCorrection(text, session, options);
+    if (typeof pending !== 'object' || !pending || pending.session_id !== session || !['waiting_operator', 'resuming', 'pausing_operator', 'completed', 'cancelled'].includes(pending.state)) {
         throw new Error('Could not verify the assistant state. Please retry.');
     }
-    if (['completed', 'cancelled'].includes(pending.state)) return false;
+    if (['completed', 'cancelled'].includes(pending.state)) return considerCorrection(text, session, options);
     if (pending.session_id !== session) throw new Error('The assistant question belongs to another conversation.');
-    if (pending.state === 'resuming') { options.update(pending); return true; }
-    if (!samePresentation(options.presented(), pending)) {
+    const cancelling = ['cancel', 'cancel task', 'stop', 'annuler', 'annule'].includes(text.trim().toLowerCase());
+    if (pending.state === 'resuming' && !cancelling) return considerCorrection(text, session, options);
+    if (pending.state === 'pausing_operator' && !cancelling) { options.update(pending); return true; }
+    if (!cancelling && !samePresentation(options.presented(), pending)) {
         options.update({ ...pending, chat_message: 'Please review the current question or proposed procedure below, then send your reply.' });
         return true;
     }

@@ -415,6 +415,7 @@ pub struct AgentService {
     headless: bool,
     save_conversation: bool,
     browser_port: u16,
+    correction_reopen: bool,
     system_prompt: String,
     llm_manager: Py<crate::tool_registry::service::LLMManager>,
     stop_event: Option<Py<PyAny>>,
@@ -807,7 +808,7 @@ impl AgentService {
         tool_callback=None, token_callback=None, api_key=None, stop_event=None,
         prior_history=None, speed=None, headless=false, browser_port=None,
         session_id=None, single_tab=false, browser_profile=None, platform_context=None,
-        profile_lease=None, dext_control=None, operator_session=None, **_extra))]
+        profile_lease=None, dext_control=None, operator_session=None, correction_reopen=false, **_extra))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -834,6 +835,7 @@ impl AgentService {
         profile_lease: Option<Bound<'_, PyAny>>,
         dext_control: Option<Bound<'_, PyAny>>,
         operator_session: Option<Bound<'_, PyAny>>,
+        correction_reopen: bool,
         _extra: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let _ = cli_callback;
@@ -855,6 +857,17 @@ impl AgentService {
             return Err(PyValueError::new_err("Platform sessions do not support parallel tabs or custom debugging ports."));
         }
         let max_steps = scope.as_ref().map(|scope| scope.max_steps).unwrap_or(100);
+        if correction_reopen && (scope.as_ref().is_none_or(|scope| scope.platform_id != "dext" || scope.execution_mode != "supervised")
+            || operator_session.as_ref().is_some_and(|session| !session.is_none()) || prior_history.as_ref().is_none_or(|history| history.is_none())) {
+            return Err(PyValueError::new_err("A reviewed correction restart requires a scoped Dext checkpoint and no retained browser."));
+        }
+        if correction_reopen {
+            let history: Value = pythonize::depythonize(prior_history.as_ref().expect("checked above"))?;
+            let paired = history.get("assistant_messages").and_then(Value::as_array)
+                .zip(history.get("tool_responses").and_then(Value::as_array))
+                .is_some_and(|(messages, results)| !messages.is_empty() && messages.len() == results.len());
+            if !paired { return Err(PyValueError::new_err("A correction restart requires a paired conversation checkpoint.")); }
+        }
         // Scoped debug dumps can contain customer-derived browser/model data.
         let save_conversation = save_conversation && scope.is_none();
         let context = (!context.is_none()).then(|| {
@@ -1196,6 +1209,7 @@ impl AgentService {
             headless,
             save_conversation,
             browser_port: browser_port_num,
+            correction_reopen,
             system_prompt,
             llm_manager,
             stop_event,
@@ -1394,7 +1408,9 @@ impl AgentService {
         println!("\nProcessing with {}", self.model_name());
         self.emit_flow(py, "run_start", None); // clear + take over the demo
 
-        let platform_ready = self.scanner.get().locked(py, |scanner| scanner.initialize_platform_scope(is_resumed));
+        // Only a separately confirmed correction after a terminal run may open
+        // a fresh scoped start page. Ordinary operator resumes never fall back.
+        let platform_ready = self.scanner.get().locked(py, |scanner| scanner.initialize_platform_scope(is_resumed && !self.correction_reopen));
         if let Err(error) = &platform_ready {
             final_status = "waiting_operator".into();
             final_message = format!("Platform session requires operator review: {}", py_err_str(py, error));
@@ -1758,6 +1774,11 @@ impl AgentService {
 
         // Suspend tab ownership while retaining the protected Chrome process.
         // The host broker retains this scanner and its exact profile lease.
+        if self.stop_event.as_ref().is_some_and(|event| event.bind(py).getattr("operator_pause").and_then(|value| value.extract::<bool>()).unwrap_or(false)) {
+            final_status = "waiting_operator".into();
+            final_message = json!({"category":"question", "reason":"missing_information",
+                "request":"Navigation is paused for your correction. I will reobserve before using the proposed route."}).to_string();
+        }
         if final_status == "waiting_operator" {
             self.scanner.get().inner.lock().map_err(|_| PyValueError::new_err("Browser handoff state unavailable."))?.operator_handoff = true;
         }
@@ -1796,6 +1817,11 @@ impl AgentService {
     fn close_operator_session(&self, py: Python<'_>) -> PyResult<()> {
         let _inactive = self.active_run.try_lock().map_err(|_| PyValueError::new_err("Cannot close an executing operator session."))?;
         self.scanner.get().locked(py, |scanner| scanner.close_operator_handoff())
+    }
+
+    #[getter]
+    fn operator_handoff_available(&self) -> bool {
+        self.scanner.get().inner.lock().is_ok_and(|scanner| scanner.operator_handoff && scanner.platform_violation().is_none())
     }
 }
 
@@ -2748,11 +2774,11 @@ compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *arg
             let browser = BrowserScanner::create(&PathBuf::from(&root).join("browser"), 0, None, None, false);
             browser.inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 128]));
             let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root).join("full-loop"), None, false, browser.inner.clone(), None).unwrap();
-            let service = AgentService {
+            let mut service = AgentService {
                 active_run: Arc::new(Mutex::new(())), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
                 context_provider: "openai".into(), context_model: "synthetic".into(), profile_name: Some("saccade-dext".into()),
                 profile_lease: locals.get_item("fake_lease").unwrap().unwrap().unbind(), owns_profile_lease: false,
-                max_steps: 4, speed: "quality".into(), headless: false, save_conversation: false, browser_port: 0,
+                max_steps: 4, speed: "quality".into(), headless: false, save_conversation: false, browser_port: 0, correction_reopen: false,
                 system_prompt: "Synthetic supervised native-loop contract. Use notes first and done alone.".into(),
                 llm_manager: Py::new(py, crate::tool_registry::service::LLMManager::build(py, "openai", "synthetic", None, false, "main", "quality", false).unwrap()).unwrap(),
                 stop_event: None, scanner: Py::new(py, browser).unwrap(), controller,
@@ -2878,6 +2904,14 @@ operator_thread.start()
             assert_eq!(result["results"][0]["status"], "not_run");
             assert_eq!(result["results"][1]["status"], "waiting_operator");
             py.run(&CString::new("assert provider_calls == before_ask + 1").unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("before_correction = provider_calls\nstop_event.operator_pause = True\nstop_event.set()").unwrap(), Some(&locals), None).unwrap();
+            service.stop_event = Some(locals.get_item("stop_event").unwrap().unwrap().unbind());
+            let paused = service.process_request(py, PyString::new(py, "Continue the original objective at a safe correction boundary.").into_any()).unwrap();
+            let paused: Value = pythonize::depythonize(paused.bind(py)).unwrap();
+            assert_eq!(paused["status"], "waiting_operator");
+            assert!(service.operator_handoff_available());
+            py.run(&CString::new("assert provider_calls == before_correction\nstop_event.operator_pause = False\nstop_event.clear()").unwrap(), Some(&locals), None).unwrap();
+            service.stop_event = None;
             for mode in ["notes", "wait"] {
                 locals.set_item("stall_mode", mode).unwrap();
                 py.run(&CString::new("before_stall = provider_calls").unwrap(), Some(&locals), None).unwrap();
@@ -2898,7 +2932,7 @@ assert not operator_thread.is_alive() and operator_answers[0]['executed'] is Fal
 assert len(loop_runs[-1].receipts) == 0
 control.close()
 next_control.close()
-assert len(loop_runs) == 11 and len(loop_runs[0].receipts) == 1
+assert len(loop_runs) == 12 and len(loop_runs[0].receipts) == 1
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root

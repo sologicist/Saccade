@@ -177,6 +177,24 @@ class NativePlatformEntryContracts(unittest.TestCase):
         self.assertEqual(result["llm_calls"], 1)
         self.assertTrue(result["profile_available"])
 
+    def test_correction_restart_requires_scoped_paired_history_before_startup(self):
+        for changes in ({}, {'prior_history': {'assistant_messages': ['step'], 'tool_responses': []}},
+                        {'context': False, 'prior_history': {'assistant_messages': ['step'], 'tool_responses': ['result']}}):
+            with self.subTest(changes=changes):
+                result = self.invoke(correction_reopen=True, **changes)
+                self.assertEqual(result['error'], 'ValueError')
+                self.assertEqual(result['llm_calls'], 0)
+                self.assertTrue(result['profile_available'])
+
+    def test_confirmed_correction_restart_does_not_bypass_profile_ownership(self):
+        history = {'assistant_messages': ['step'], 'tool_responses': ['result']}
+        held = self.invoke(correction_reopen=True, prior_history=history, hold=True)
+        self.assertEqual(held['error'], 'ProfileBusyError')
+        self.assertEqual(held['llm_calls'], 0)
+        valid = self.invoke(correction_reopen=True, prior_history=history)
+        self.assertEqual(valid['error'], 'DeliberateStartupFailure')
+        self.assertEqual(valid['llm_calls'], 1)
+
     def test_borrowed_lease_remains_owned_by_its_caller_after_startup_failure(self):
         result = self.invoke(borrow=True)
         self.assertEqual(result["error"], "DeliberateStartupFailure")

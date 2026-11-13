@@ -2293,6 +2293,91 @@ def dext_operator_control():
             return jsonify({'error': 'dext_control_verification_failed'}), 409
 
 
+def _navigation_correction_context(session):
+    from AutoCua.saccade.business_contract import digest
+    from AutoCua.saccade.operator_language import navigation_context
+    saved = conversation.get_session(session) if session else None
+    bound = saved.get('platform_context') if saved else None
+    eligible = bool(saved and (saved.get('run_pkg') == 'web' or saved.get('agent_mode') == 'web') and bound and bound['platform_id'] == 'dext' and bound['execution_mode'] == 'supervised')
+    record = operator_requests.run_context(session)
+    history = None
+    if eligible:
+        sid, history = conversation.start_or_resume(session, '', agent_mode='web')
+        if sid != session:
+            raise SessionContextError('The correction conversation is unavailable.')
+    active = bool(record and record['active'])
+    data = record['data'] if record else None
+    objective = (history or {}).get('task') or (data or {}).get('task', '')
+    paired = bool(history and history.get('assistant_messages') and len(history['assistant_messages']) == len(history.get('tool_responses') or []))
+    # A first active run has no saved checkpoint yet. The worker must create it
+    # before a queued correction becomes usable.
+    available = bool(eligible and record and (paired or active))
+    signature = digest([session, bound, record['run_id'] if record else None, active,
+        digest(objective.encode()), (saved or {}).get('updated_at'), len((saved or {}).get('exchanges') or [])])
+    return {'eligible': eligible, 'active': active, 'available': available, 'navigation': navigation_context(objective, history),
+            'run_id': record['run_id'] if record else None, 'data': data, 'signature': signature}
+
+
+@app.route('/api/operator/correction', methods=['GET', 'POST'])
+def spontaneous_navigation_correction():
+    """Classify against the actual bound run before ordinary Web dispatch."""
+    from flask import request
+    from AutoCua.saccade.business_contract import BusinessError, loads, reject
+    from AutoCua.saccade.operator_language import spontaneous_correction, normalized
+    from AutoCua.saccade.operator_requests import _SECRET
+    session = request.args.get('session_id', '')
+    try:
+        with _agent_start_lock:
+            context = _navigation_correction_context(session)
+            if request.method == 'GET':
+                result = jsonify(operator_requests.correction_claim(session, context['signature']))
+                result.headers['Cache-Control'] = 'no-store'
+                return result
+            if request.headers.get('Origin', '').lower() not in _LOCAL_ORIGINS:
+                return jsonify({'error': 'operator_origin_required'}), 403
+            if not request.is_json or request.content_length is None or request.content_length > 8192:
+                reject('invalid_navigation_correction')
+            body = loads(request.get_data(), 8192)
+            if type(body) is not dict or set(body) != {'text', 'claim'} or type(body['text']) is not str:
+                reject('invalid_navigation_correction')
+            pending = operator_requests.status(session)
+            if pending and (pending['state'] in ('waiting_operator', 'pausing_operator') or pending['state'] == 'resuming' and not context['active']):
+                return jsonify({'status': 'waiting_operator', 'pending': pending})
+            operator_requests.consume_correction_claim(session, body['claim'], context['signature'])
+            kind, routes = spontaneous_correction(body['text'], eligible=context['eligible'], navigation=context['navigation'])
+            if kind == 'ordinary':
+                if context['active']:
+                    return jsonify({'status': 'busy', 'message': 'The agent is still working. Send a navigation correction or stop the current task before starting another request.'})
+                return jsonify({'status': 'ordinary'})
+            if _SECRET.search(body['text']) or _SECRET.search(normalized(body['text'])):
+                reject('non_sensitive_answer_required')
+            if not context['available']:
+                reply = 'The previous run settings or checkpoint are unavailable. The correction is not applied; reopen and review the original supervised task.'
+                return jsonify({'status': 'blocked', 'message': reply, 'session_id': session,
+                                'answer': body['text'], 'reply_html': md_render(reply)})
+            if context['active'] and (not _run_thread or not _run_thread.is_alive() or context['run_id'] != active_agent_session_id or not active_agent_stop_event or active_agent_stop_event.is_set()):
+                reject('correction_handoff_unavailable')
+            operator_requests.propose_correction(session, context['run_id'], context['data'], routes,
+                active=context['active'], clarify=kind == 'clarify')
+            if context['active']:
+                active_agent_stop_event.operator_pause = True
+                active_agent_stop_event.set()
+            else:
+                operator_requests.complete_correction_pause(session, context['run_id'], available=True,
+                    control=operator_requests.control_for(session), reopen=True)
+            pending = operator_requests.status(session)
+            reply = pending.get('chat_message') or pending['request']['request']
+            if not context['active']:
+                conversation.save_operator_reply(session, body['text'], reply)
+            return jsonify({'status': 'waiting_operator', 'pending': pending, 'session_id': session,
+                            'answer': body['text'], 'reply_html': md_render(reply)})
+    except (BusinessError, SessionContextError) as error:
+        return jsonify({'error': str(error)}), 409
+    except Exception:
+        debug_exception('navigation correction')
+        return jsonify({'error': 'navigation_correction_verification_failed'}), 409
+
+
 @app.route('/api/operator', methods=['GET', 'POST'])
 def operator_intervention_route():
     from flask import request
@@ -2308,7 +2393,7 @@ def operator_intervention_route():
         if not request.is_json or request.content_length is None or request.content_length > 8192:
             return jsonify({'error': 'invalid_operator_response'}), 400
         with _agent_start_lock:
-            was_resuming = (operator_requests.status(session) or {}).get('state') == 'resuming'
+            was_resuming = (operator_requests.status(session) or {}).get('state') in ('resuming', 'pausing_operator')
             event = loads(request.get_data(), 8192)
             if type(event) is dict and event.get('action') == 'chat':
                 control = operator_requests.control_for(session)
@@ -2334,7 +2419,8 @@ def operator_intervention_route():
                         debug_exception('record operator cancellation')
                 return jsonify({'status': 'cancelled', 'session_id': session, 'answer': event.get('answer') or 'Cancel',
                                 'reply_html': md_render('Cancellation requested.' if was_resuming else 'The task was cancelled.')})
-            response = _start_agent_run_locked(data, operator_reply=event['answer'] if event.get('action') == 'chat' else None)
+            response = _start_agent_run_locked(data, operator_reply=event['answer'] if event.get('action') == 'chat' else None,
+                correction_reopen=operator_requests.correction_reopen(session))
             body, code = response if isinstance(response, tuple) else (response, 200)
             if code != 200:
                 operator_requests.retry(session)
@@ -2346,7 +2432,7 @@ def operator_intervention_route():
         return jsonify({'error': 'resume_verification_failed'}), 409
 
 
-def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
+def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, correction_reopen=False):
     """The run behind /api/start-agent, so a task from elsewhere (the Telegram
     bot) starts the same way and the page shows it as a sent message. data:
     the chat box's fields (provider, model, task, session_id, mode, os,
@@ -2461,7 +2547,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
             retained_browser = operator_requests.browser_for_resume(chat_session_id)
             if pending_operator and pending_operator['state'] == 'resuming' and (not isinstance(prior_history, dict) or not prior_history.get('assistant_messages') or len(prior_history['assistant_messages']) != len(prior_history.get('tool_responses') or [])):
                 raise SessionContextError('The saved operator checkpoint is unavailable or unpaired. Cancel and review the original task.')
-            if pending_operator and pending_operator['state'] == 'resuming' and not retained_browser:
+            if pending_operator and pending_operator['state'] == 'resuming' and not retained_browser and not correction_reopen:
                 raise SessionContextError('The suspended browser is unavailable. Cancel and review the task; a fresh Chrome cannot replace the operator session.')
             if retained_browser:
                 profile_lease = retained_browser[1]
@@ -2493,6 +2579,9 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
                     project_root=PROJECT_ROOT, stop_event=run_stop_event, conversational=True)
                 operator_requests.configure_teaching(chat_session_id, run_dext_control)
                 _dext_control = run_dext_control
+                fixed = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed', 'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
+                fixed['task'] = (prior_history or {}).get('task') or task
+                operator_requests.begin_run(chat_session_id, current_session_id, fixed)
 
         def run_agent():
             stop_event = run_stop_event
@@ -2684,6 +2773,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
                     **({'platform_context': platform_context, 'browser_profile': browser_profile,
                         'profile_lease': profile_lease,
                         'operator_session': retained_browser[0] if retained_browser else None,
+                        'correction_reopen': correction_reopen,
                         'dext_control': run_dext_control} if run_pkg == 'web' else {}),
                     **daisy,
                 )
@@ -2731,6 +2821,13 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
                 agent_glow.stop()   # desktop back to normal, whatever happened
 
                 with _agent_start_lock:
+                    queued_correction = run_pkg == 'web' and operator_requests.correction_queued(chat_session_id, current_session_id)
+                    if queued_correction:
+                        run_outcome = {'status': 'waiting_operator', 'message': json.dumps({
+                            'category': 'question', 'reason': 'missing_information',
+                            'request': 'Navigation is paused for your correction. I will verify the proposed path before saving it.'})}
+                        if agent is not None:
+                            operator_requests.retain_browser(chat_session_id, agent, profile_lease)
                     cleanup_failed = False
                     if run_pkg == 'web':
                         cancelled = (operator_requests.status(chat_session_id) or {}).get('state') == 'cancelled'
@@ -2802,8 +2899,12 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
                                 operator_requests.present_procedure(chat_session_id, run_dext_control)
                             if agent is not None:
                                 operator_requests.retain_browser(chat_session_id, agent, profile_lease)
+                            if queued_correction:
+                                operator_requests.complete_correction_pause(chat_session_id, current_session_id,
+                                    available=checkpoint_saved and bool(getattr(agent, 'operator_handoff_available', False)), control=run_dext_control)
                         else:
                             operator_requests.finish(chat_session_id, failed=run_outcome.get('status') not in ('success', 'incomplete'))
+                        operator_requests.end_run(chat_session_id, current_session_id)
 
                 if webview_window and current_session_id == active_agent_session_id:
                     try:
@@ -3916,26 +4017,28 @@ def stop_agent():
     Its memory is still saved: save_run runs before that guard in run_agent's
     finally."""
     global active_agent_stop_event, active_agent_session_id
-    with _dext_control_lock:
-        if _dext_control is not None:
-            _dext_control.close()
-    if active_agent_stop_event:
-        active_agent_stop_event.set()
-        _stop_run_recording(active_agent_session_id, tail=1.0)
-        active_agent_session_id = None
-        # Kill the Shell-use coder's whole process tree RIGHT NOW. Waiting for
-        # the run to unwind is too late: agent_wait terminates the coder itself
-        # within a second of seeing the stop event, and once that parent is dead
-        # the minions it spawned can no longer be resolved from its pid - they
-        # would keep running and keep burning API calls. Killing here, while the
-        # coder is still alive, takes the minions down with it.
-        try:
-            _kill_process_trees(list(_active_shell_pids))
-            _active_shell_pids.clear()
-        except Exception:
-            debug_exception("stop_agent tree kill")
-        return jsonify({'status': 'stopped'})
-    return jsonify({'status': 'no_agent_running'})
+    with _agent_start_lock:
+        operator_requests.cancel_queued_run(active_agent_session_id)
+        with _dext_control_lock:
+            if _dext_control is not None:
+                _dext_control.close()
+        if active_agent_stop_event:
+            active_agent_stop_event.set()
+            _stop_run_recording(active_agent_session_id, tail=1.0)
+            active_agent_session_id = None
+            # Kill the Shell-use coder's whole process tree RIGHT NOW. Waiting for
+            # the run to unwind is too late: agent_wait terminates the coder itself
+            # within a second of seeing the stop event, and once that parent is dead
+            # the minions it spawned can no longer be resolved from its pid - they
+            # would keep running and keep burning API calls. Killing here, while the
+            # coder is still alive, takes the minions down with it.
+            try:
+                _kill_process_trees(list(_active_shell_pids))
+                _active_shell_pids.clear()
+            except Exception:
+                debug_exception("stop_agent tree kill")
+            return jsonify({'status': 'stopped'})
+        return jsonify({'status': 'no_agent_running'})
 
 
 @app.route('/api/new-chat', methods=['POST'])
@@ -3946,13 +4049,15 @@ def new_chat():
     reset UI. The run's memory is still persisted: save_run executes before the
     session-id push guard in run_agent's finally."""
     global active_agent_stop_event, active_agent_session_id
-    with _dext_control_lock:
-        if _dext_control is not None:
-            _dext_control.close()
-    _stop_run_recording(active_agent_session_id)
-    active_agent_session_id = None
-    if active_agent_stop_event:
-        active_agent_stop_event.set()
+    with _agent_start_lock:
+        operator_requests.cancel_queued_run(active_agent_session_id)
+        with _dext_control_lock:
+            if _dext_control is not None:
+                _dext_control.close()
+        _stop_run_recording(active_agent_session_id)
+        active_agent_session_id = None
+        if active_agent_stop_event:
+            active_agent_stop_event.set()
     # Release the iPhone too. Switching modes kills the WDA session, but New
     # chat resets the mode picker with a SILENT set — deliberately no
     # agentmode:changed, so no side effects — and the phone disconnect was one

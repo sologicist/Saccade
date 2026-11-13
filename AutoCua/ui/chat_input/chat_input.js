@@ -279,6 +279,10 @@
         // ids, bring the run's bot in, lock the mode.
         function runStarted(data, run) {
             const runBot = run.runBot, chatGoesOn = run.chatGoesOn, agentMode = run.agentMode;
+            // Reopen Web input only after the run acknowledgment; subsequent
+            // messages are classified by the host before any task dispatch.
+            if (agentMode === 'web' && data.platform_context?.platform_id === 'dext'
+                && data.platform_context.execution_mode === 'supervised') chatInput.disabled = false;
             // Adopt the backend's session id (a brand-new chat is minted
             // server-side) so the run-end save + future sends target it.
             if (data.session_id) window.currentSessionId = data.session_id;

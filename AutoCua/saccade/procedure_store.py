@@ -67,7 +67,7 @@ class ProcedureStore:
             if not (self.root / "active.json").exists():
                 self._write("active.json", {"schema_version": 1, "current": revision,
                                            "previous": None, "generation": 0}, exclusive=True)
-            self.active()
+            self._active_locked()
 
     def _directories(self, path):
         current = self.project
@@ -165,6 +165,7 @@ class ProcedureStore:
     def markdown(self, revision):
         """Export legacy snapshots on demand; JSON remains the canonical source."""
         with self.lock():
+            self._active_locked()
             snapshot = self.snapshot(revision)
             path = self._export_markdown(revision, snapshot['content'])
             return read_safe(self.project, path, MAX_PROCEDURE).decode('utf-8')
@@ -186,7 +187,7 @@ class ProcedureStore:
                 reject("procedure_markdown_corrupt")
         return value
 
-    def active(self):
+    def _active_pointer(self):
         pointer = self._read("active.json")
         if type(pointer) is not dict or set(pointer) != {"schema_version", "current", "previous", "generation"} or type(pointer["schema_version"]) is not int or pointer["schema_version"] != 1 or type(pointer["generation"]) is not int or pointer["generation"] < 0:
             reject("procedure_corrupt")
@@ -194,6 +195,72 @@ class ProcedureStore:
         if pointer["previous"] is not None:
             self.snapshot(pointer["previous"])
         return pointer
+
+    def _sync_learning(self, pointer):
+        """Verify the stable projection; recover only a recorded publication gap.
+
+        The journal describes projection progress, never procedure authority.
+        Only active.json selects a revision. Unknown Markdown is never adopted
+        or overwritten, including text copied from another approved revision.
+        """
+        content = self.snapshot(pointer['current'])['content'].encode('utf-8')
+        path = self.root / 'learning.md'
+        existing = read_safe(self.project, path, MAX_PROCEDURE) if path.exists() or path.is_symlink() else None
+        journal = self.root / 'learning.projection.json'
+        if journal.exists() or journal.is_symlink():
+            state = self._read('learning.projection.json')
+            if type(state) is not dict or set(state) != {'schema_version', 'current', 'next'} or type(state['schema_version']) is not int or state['schema_version'] != 1:
+                reject('learning_projection_corrupt')
+            old = state['current']
+            target = state['next']
+            # Compare complete pointer contracts, not just revision strings.
+            for value in (old, target):
+                if value is not None:
+                    if type(value) is not dict or set(value) != {'schema_version', 'current', 'previous', 'generation'} or type(value['generation']) is not int or value['generation'] < 0 or type(value['schema_version']) is not int or value['schema_version'] != 1:
+                        reject('learning_projection_corrupt')
+                    self.snapshot(value['current'])
+                    if value['previous'] is not None:
+                        self.snapshot(value['previous'])
+            if old is None or target is not None and (target['previous'] != old['current'] or target['generation'] != old['generation'] + 1):
+                reject('learning_projection_corrupt')
+            if pointer == old:
+                if existing is not None and existing != content:
+                    reject('learning_markdown_modified')
+            elif target is not None and pointer == target:
+                previous = self.snapshot(old['current'])['content'].encode('utf-8')
+                if existing is not None and existing not in (previous, content):
+                    reject('learning_markdown_modified')
+            else:
+                reject('learning_projection_corrupt')
+        else:
+            # First installation or migration from JSON/revision-only PR5.
+            if existing is not None and existing != content:
+                reject('learning_markdown_modified')
+            state = None
+        if existing != content:
+            self._publish('learning.md', content)
+        if read_safe(self.project, path, MAX_PROCEDURE) != content:
+            reject('learning_markdown_modified')
+        settled = {'schema_version': 1, 'current': pointer, 'next': None}
+        if state != settled:
+            self._write('learning.projection.json', settled)
+
+    def _active_locked(self):
+        pointer = self._active_pointer()
+        self._sync_learning(pointer)
+        return pointer
+
+    def active(self):
+        with self.lock():
+            return self._active_locked()
+
+    def _activate(self, current, target):
+        self._sync_learning(current)
+        # Persist intent before the pointer swap. A crash before activation
+        # keeps the old procedure; after it, recovery projects only the target.
+        self._write('learning.projection.json', {'schema_version': 1, 'current': current, 'next': target})
+        self._write('active.json', target)
+        self._sync_learning(target)
 
     @staticmethod
     def render(routes):
@@ -225,7 +292,7 @@ class ProcedureStore:
             identifier(observation_digest)
         content = self.render(routes)
         with self.lock():
-            base = self.active()
+            base = self._active_locked()
             paths = None
             if incremental:
                 prior = self.snapshot(base['current'])
@@ -266,7 +333,7 @@ class ProcedureStore:
             decision = "decisions/" + proposal_id + ".json"
             if (self.root / decision).exists():
                 reject("proposal_already_reviewed")
-            current = self.active()
+            current = self._active_locked()
             if current != candidate["base"] and approve:
                 reject("stale_procedure_proposal")
             if candidate["content"] != self._candidate_content(candidate):
@@ -276,33 +343,34 @@ class ProcedureStore:
             self._write(decision, {"approved": approve, "candidate_revision": candidate_revision,
                                    "base": current, "utc": utc()}, exclusive=True)
             if approve:
-                self._write("active.json", {"schema_version": 1, "current": candidate_revision,
-                                            "previous": current["current"], "generation": current["generation"] + 1})
-            return self.active()
+                self._activate(current, {"schema_version": 1, "current": candidate_revision,
+                                         "previous": current["current"], "generation": current["generation"] + 1})
+            return self._active_locked()
 
     def rollback(self, expected, target, run_id):
         # A rollback is a new explicitly reviewed revision, not snapshot mutation.
         with self.lock():
-            current = self.active()
+            current = self._active_locked()
             if current["current"] != identifier(expected) or current["previous"] != identifier(target):
                 reject("stale_procedure_proposal")
             snapshot = self.snapshot(target)
             candidate = {**snapshot, "rollback_from": current, "utc": utc(), "run_digest": digest(run_id)}
             revision = self._snapshot(candidate)
-            self._write("active.json", {"schema_version": 1, "current": revision,
-                                        "previous": current["current"], "generation": current["generation"] + 1})
-            return self.active()
+            self._activate(current, {"schema_version": 1, "current": revision,
+                                     "previous": current["current"], "generation": current["generation"] + 1})
+            return self._active_locked()
 
     def pin(self, session_id, *, adopt=False):
         name = "pins/" + digest(session_id) + ".json"
         marker = "pins/" + digest(session_id) + ".bound"
         with self.lock():
+            active = self._active_locked()
             present, bound = (self.root / name).exists(), (self.root / marker).exists()
             if present != bound:
                 reject("procedure_corrupt")
             if not bound:
                 self._write(marker, {"baseline_digest": self.baseline_digest}, exclusive=True)
-                self._write(name, {"revision": self.active()["current"], "baseline_digest": self.baseline_digest}, exclusive=True)
+                self._write(name, {"revision": active["current"], "baseline_digest": self.baseline_digest}, exclusive=True)
             pin = self._read(name)
             if self._read(marker) != {"baseline_digest": self.baseline_digest}:
                 reject("procedure_corrupt")
@@ -310,6 +378,6 @@ class ProcedureStore:
                 reject("procedure_corrupt")
             self.snapshot(pin["revision"])
             if adopt:
-                pin = {"revision": self.active()["current"], "baseline_digest": self.baseline_digest}
+                pin = {"revision": active["current"], "baseline_digest": self.baseline_digest}
                 self._write(name, pin)
             return pin["revision"]

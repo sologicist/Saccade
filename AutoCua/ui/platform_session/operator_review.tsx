@@ -38,9 +38,9 @@ export function OperatorReview() {
         const timer = window.setInterval(() => { void refresh(); }, 1500);
         return () => { abort.abort(); window.clearInterval(timer); document.removeEventListener('operator:changed', refresh); delete window.submitOperatorChat; };
     }, []);
-    if (!pending || !['waiting_operator', 'resuming'].includes(pending.state)) return null;
+    if (!pending || !['waiting_operator', 'resuming', 'pausing_operator'].includes(pending.state)) return null;
     return <section className="operator-assistance" aria-label="Assistant assistance" style={{ pointerEvents: 'auto', padding: '8px 12px', maxHeight: '35vh', overflow: 'auto' }}>
-        <small role="status">{pending.state === 'resuming' ? 'Checking the browser before continuing...' : 'Paused - no model requests'}</small>
+        <small role="status">{pending.state === 'pausing_operator' ? 'Pause requested - correction not applied yet' : pending.state === 'resuming' ? 'Checking the browser before continuing...' : 'Paused - no model requests'}</small>
         {pending.chat_message && <p>{pending.chat_message}</p>}
         {pending.procedure_summary && <>
             <p>I can remember this operator-assisted procedure for future sessions. Should I save it?</p>

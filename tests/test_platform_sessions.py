@@ -262,6 +262,9 @@ class PlatformSessionAPI(SessionFixtures):
             import PIL  # noqa: F401
         except ImportError:
             self.skipTest("Flask and Pillow are required for actual UI route tests.")
+        # Keep the broker in the module-map snapshot: restoring the temporary
+        # webview stub must not evict it and create a second test-only singleton.
+        import AutoCua.saccade.operator_requests  # noqa: F401
         with patch.dict(sys.modules, {"webview": types.ModuleType("webview")}):
             self.service = importlib.import_module("AutoCua.ui.service")
         self.release = threading.Event()
@@ -273,6 +276,7 @@ class PlatformSessionAPI(SessionFixtures):
         self.fail_cleanup = False
         self.scan = None
         self.provider_calls = 0
+        self.handoff_available = True
         test = self
 
         class FakeWebAgent:
@@ -290,6 +294,9 @@ class PlatformSessionAPI(SessionFixtures):
                 test.started.set()
                 if not test.release.wait(10):
                     raise RuntimeError("Synthetic test release timed out.")
+                if getattr(self.kwargs['stop_event'], 'operator_pause', False):
+                    return {'status': 'waiting_operator', 'message': json.dumps({'category': 'question',
+                        'reason': 'missing_information', 'request': 'Navigation is paused for correction.'})}
                 control = self.kwargs.get('dext_control')
                 if test.scan is not None and control:
                     control.freeze_decision()
@@ -305,6 +312,10 @@ class PlatformSessionAPI(SessionFixtures):
                 if test.fail_cleanup:
                     raise RuntimeError('Synthetic ownership release is unverified.')
                 self.closed = True
+
+            @property
+            def operator_handoff_available(self):
+                return test.handoff_available
 
         original_import = importlib.import_module
 
@@ -623,6 +634,131 @@ class PlatformSessionAPI(SessionFixtures):
     def chat_event(self, sid, broker, text):
         return {**self.operator_event(sid, broker), 'action': 'chat', 'answer': text,
                 'non_sensitive': True, 'presentation_digest': broker.status(sid).get('presentation_digest')}
+
+    def correction(self, sid, text, claim=None):
+        url = '/api/operator/correction?session_id=' + sid
+        if claim is None:
+            response = self.client.get(url, headers=self.headers, base_url=self.base_url)
+            self.assertEqual(response.status_code, 200, response.json)
+            claim = response.json
+        return self.client.post(url, json={'text': text, 'claim': claim},
+            headers={**self.headers, 'Origin': self.base_url}, base_url=self.base_url)
+
+    def clean_correction(self, sid):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        self.addCleanup(lambda: broker.pending.pop(sid, None))
+        self.addCleanup(lambda: broker.close_browser(sid))
+
+    def test_spontaneous_french_correction_after_end_keeps_objective_and_requires_fresh_surface_confirmation(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        first = self.post(platform_id='dext', task='Find the purchase invoices in Dext.')
+        self.finish_run()
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        result = self.correction(sid, "Tu dois d'abord cliquer sur Achats, puis sur Boîte de réception.")
+        self.assertEqual(result.status_code, 200, result.json)
+        self.assertEqual(result.json['status'], 'waiting_operator')
+        self.assertIn('Purchases', result.json['pending']['request']['request'])
+        self.assertEqual(len(self.created), 1)
+        self.scan = {'2': {'name': 'Purchases', 'role': 'link', 'rect': [1, 1, 40, 20]}}
+        resumed = self.respond_operator(sid, self.chat_event(sid, broker, 'Continue'))
+        self.assertEqual(resumed.status_code, 200, resumed.json)
+        self.finish_run()
+        self.assertTrue(self.created[-1].kwargs['correction_reopen'])
+        self.assertIsNone(self.created[-1].kwargs['operator_session'])
+        self.assertIn('Find the purchase invoices', self.created[-1].task)
+        self.assertIsNotNone(self.created[-1].kwargs['prior_history'])
+        self.assertEqual(self.provider_calls, 1)
+
+    def test_active_correction_waits_for_safe_handoff_and_preserves_browser_without_second_run(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        self.release.clear()
+        first = self.post(platform_id='dext', task='Find purchase invoices in Dext.')
+        self.assertTrue(self.started.wait(5))
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        agent = self.created[0]
+        result = self.correction(sid, 'No, you are going the wrong way. Open Purchases first, then Inbox.')
+        self.assertEqual(result.status_code, 200, result.json)
+        self.assertEqual(result.json['pending']['state'], 'pausing_operator')
+        self.assertEqual(len(self.created), 1)
+        self.assertFalse(broker.owns_lease(sid, agent.kwargs['profile_lease']))
+        self.assertTrue(self.service.active_agent_stop_event.operator_pause)
+        self.finish_run()
+        pending = broker.status(sid)
+        self.assertEqual(pending['state'], 'waiting_operator')
+        self.assertIn('same browser', pending['request']['request'])
+        self.assertTrue(broker.owns_lease(sid, agent.kwargs['profile_lease']))
+        self.assertFalse(agent.closed)
+        self.assertEqual(self.provider_calls, 0)
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, 'Continue')).status_code, 200)
+        self.finish_run()
+        self.assertIs(self.created[-1].kwargs['operator_session'], agent)
+        self.assertFalse(self.created[-1].kwargs['correction_reopen'])
+        self.assertIn('Find purchase invoices', self.created[-1].task)
+
+    def test_failed_correction_handoff_does_not_claim_application_or_allow_resume(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        self.release.clear()
+        first = self.post(platform_id='dext', task='Open the invoices in Dext.')
+        self.assertTrue(self.started.wait(5))
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        self.handoff_available = False
+        self.assertEqual(self.correction(sid, 'Le bon chemin est Achats → Boîte de réception.').status_code, 200)
+        self.finish_run()
+        self.assertIn('not applied', broker.status(sid)['request']['request'])
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, 'Continue')).status_code, 409)
+        self.assertEqual(len(self.created), 1)
+
+    def test_spontaneous_correction_can_pause_an_already_resumed_run(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        sid, previous, broker = self.pause_browser()
+        self.release.clear()
+        self.started.clear()
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, 'Continue')).status_code, 200)
+        self.assertTrue(self.started.wait(5))
+        self.assertEqual(broker.status(sid)['state'], 'resuming')
+        response = self.correction(sid, 'No, you are going the wrong way. Open Purchases first, then Inbox.')
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json['pending']['state'], 'pausing_operator')
+        self.finish_run()
+        self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+        self.assertIs(self.created[-1].kwargs['profile_lease'], previous.kwargs['profile_lease'])
+        self.assertEqual(self.provider_calls, 1)
+
+    def test_correction_context_is_one_use_pending_answers_win_and_ordinary_messages_do_not_learn(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        first = self.post(platform_id='dext', task='Open invoices in Dext.')
+        self.finish_run()
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        for text in ('Summarize the current page.', "I'm connected."):
+            self.assertEqual(self.correction(sid, text).json['status'], 'ordinary')
+            self.assertNotIn(sid, broker._teaching)
+        url = '/api/operator/correction?session_id=' + sid
+        claim = self.client.get(url, headers=self.headers, base_url=self.base_url).json
+        self.assertEqual(self.correction(sid, 'Summarize the page.', claim).json['status'], 'ordinary')
+        self.assertEqual(self.correction(sid, 'First open Purchases, then Inbox.', claim).status_code, 409)
+        self.assertEqual(self.correction(sid, "Tu t'es trompé.").status_code, 200)
+        before = broker.status(sid)
+        self.assertIn('corrected navigation path', before['request']['request'])
+        self.assertEqual(self.correction(sid, 'Open Purchases then Inbox.').json['pending']['intervention_id'], before['intervention_id'])
+
+    def test_stop_during_correction_queue_cancels_and_cleans_up_after_worker(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        self.release.clear()
+        first = self.post(platform_id='dext', task='Find invoices in Dext.')
+        self.assertTrue(self.started.wait(5))
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        self.correction(sid, 'First open Purchases then Inbox.')
+        stopped = self.client.post('/api/stop-agent', headers=self.headers, base_url=self.base_url)
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(self.created[0].closed)
+        self.finish_run()
+        self.assertTrue(self.created[0].closed)
+        self.assertEqual(broker.status(sid)['state'], 'cancelled')
 
     def test_chat_french_authentication_negative_reply_and_same_browser_continuation(self):
         sid, previous, broker = self.pause_browser()

@@ -37,3 +37,37 @@ def navigation_question(text):
     value = normalized(text)
     return any(word in value.split() for word in ('navigation', 'route', 'path', 'reach', 'chemin', 'atteindre', 'acceder')) or bool(
         re.search(r'\b(how|comment)\b.*\b(open|ouvrir|ouvre|find|trouver|invoices|factures)\b', value))
+
+
+def navigation_context(task, history):
+    """Use the bound objective or actual recent native calls, not page prose."""
+    value = normalized(task)
+    if re.search(r'\b(open|find|navigate|reach|ouvrir|ouvre|trouver|cherche|acceder)\b', value) and re.search(r'\b(purchases|inbox|invoices|bank|achats|factures|banque|reception|dext)\b', value):
+        return True
+    import json
+    for row in (history or {}).get('assistant_messages', [])[-5:]:
+        try:
+            calls = json.loads(row).get('tool_calls', [])
+            if any(call.get('function', {}).get('name') in ('dext_navigation', 'navigate', 'new_tab') for call in calls):
+                return True
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return False
+
+
+def spontaneous_correction(text, *, eligible, navigation):
+    """Return a correction/clarification only within a verified Web conversation."""
+    from .navigation_correction import correction_framing, correction_routes
+    from .business_contract import BusinessError
+    if not eligible or reply_intent(text) != 'ambiguous':
+        return 'ordinary', None
+    _, explicit = correction_framing(text)
+    try:
+        routes = correction_routes(text)
+    except BusinessError:
+        routes = None
+    if routes and navigation:
+        return 'correction', routes
+    if explicit or routes:
+        return 'clarify', routes
+    return 'ordinary', None

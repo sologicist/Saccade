@@ -38,6 +38,98 @@ class OperatorRequests:
         self._teaching = {}
         self._reviews = {}
         self._controls = {}
+        self._run_contexts = {}
+        self._correction_claims = {}
+        self._queued_corrections = {}
+
+    def begin_run(self, session, run, data):
+        with self.lock:
+            self._run_contexts[session] = {'run_id': run, 'active': True, 'data': copy.deepcopy(data)}
+
+    def end_run(self, session, run):
+        with self.lock:
+            context = self._run_contexts.get(session)
+            if context and context['run_id'] == run:
+                context['active'] = False
+            if (self.pending.get(session) or {}).get('state') == 'cancelled':
+                self._queued_corrections.pop(session, None)
+
+    def cancel_queued_run(self, run):
+        with self.lock:
+            for session, queued in self._queued_corrections.items():
+                if queued['run_id'] == run:
+                    self.pending[session]['state'] = 'cancelled'
+
+    def run_context(self, session):
+        with self.lock:
+            return copy.deepcopy(self._run_contexts.get(session))
+
+    def correction_claim(self, session, signature):
+        with self.lock:
+            value = self._correction_claims.get(session)
+            if not value or value['signature'] != signature:
+                value = {'signature': signature, 'token': secrets.token_hex(32)}
+                self._correction_claims[session] = value
+            return dict(value)
+
+    def consume_correction_claim(self, session, claim, signature):
+        with self.lock:
+            expected = self._correction_claims.get(session)
+            if type(claim) is not dict or not expected or claim != expected or signature != expected['signature']:
+                reject('stale_navigation_correction')
+            del self._correction_claims[session]
+
+    def propose_correction(self, session, run, data, routes, *, active, clarify=False):
+        """Queue bounded guidance only; a running worker must acknowledge its pause."""
+        with self.lock:
+            if (self.pending.get(session) or {}).get('state') in ('waiting_operator', 'pausing_operator') or (not active and (self.pending.get(session) or {}).get('state') == 'resuming'):
+                reject('operator_intervention_pending')
+            request = {'category': 'question', 'reason': 'missing_information',
+                       'request': 'Which navigation path should replace the previous attempt? Describe the sections only.'}
+            self.suspend(session, run, data, request)
+            self._queued_corrections[session] = {'run_id': run, 'routes': routes, 'clarify': clarify}
+            if active:
+                self.pending[session]['state'] = 'pausing_operator'
+                self.pending[session]['chat_message'] = 'I have queued your correction and requested a pause. It is not applied yet; I am waiting for a safe browser checkpoint.'
+
+    def correction_queued(self, session, run):
+        with self.lock:
+            return (self._queued_corrections.get(session) or {}).get('run_id') == run
+
+    def complete_correction_pause(self, session, run, *, available, control=None, reopen=False):
+        from .navigation_correction import NavigationTeaching
+        from .procedure_store import ROUTE_LABELS
+        with self.lock:
+            queued = self._queued_corrections.pop(session, None)
+            if not queued or queued['run_id'] != run:
+                return
+            item = self.pending[session]
+            if not available:
+                item['data']['_checkpoint_unavailable'] = True
+                item['request'] = {'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                    'request': 'The correction is not applied. Browser ownership or the saved checkpoint could not be verified; cancel and review the original task.'}
+                return
+            if reopen:
+                item['correction_reopen'] = True
+            routes = queued['routes']
+            if routes and not queued['clarify']:
+                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline if control else None)
+                item['request'] = {'category': 'confirmation', 'reason': 'condition_confirmation',
+                    'request': 'Proposed route: ' + ' → '.join(ROUTE_LABELS[route] for route in routes) +
+                    '. I will verify it before saving. Reply Continue to ' + ('open a dedicated browser and reobserve' if reopen else 'reobserve in the same browser') + ' and continue the original task.'}
+            elif routes:
+                item['correction_intent_routes'] = routes
+                item['request'] = {'category': 'confirmation', 'reason': 'condition_confirmation',
+                    'request': 'Is this a correction to the previous navigation, rather than a new task? Reply Yes to verify the proposed route, or No to leave it unapplied.'}
+            else:
+                item['request'] = {'category': 'question', 'reason': 'missing_information',
+                    'request': 'What is the corrected navigation path? Describe sections such as Purchases, then Inbox; unknown details cannot be inferred.'}
+            item['chat_message'] = item['request']['request']
+
+    def correction_reopen(self, session):
+        with self.lock:
+            item = self.pending.get(session) or {}
+            return item.get('state') == 'resuming' and item.get('correction_reopen') is True
 
     def configure_teaching(self, session, control):
         with self.lock:
@@ -75,7 +167,7 @@ class OperatorRequests:
     def _event_item(self, session, event):
         item = self.pending.get(session)
         keys = {'run_id', 'intervention_id', 'revision', 'token', 'action', 'answer', 'non_sensitive'}
-        if not item or type(event) is not dict or set(event) != keys or (item['state'] != 'waiting_operator' and not (item['state'] == 'resuming' and event.get('action') == 'cancel')):
+        if not item or type(event) is not dict or set(event) != keys or (item['state'] != 'waiting_operator' and not (item['state'] in ('resuming', 'pausing_operator') and event.get('action') == 'cancel')):
             reject('stale_operator_response')
         if any(type(event[k]) is not str or not secrets.compare_digest(event[k], item[k]) for k in ('run_id', 'intervention_id', 'revision', 'token')):
             reject('stale_operator_response')
@@ -106,11 +198,11 @@ class OperatorRequests:
                 reject('invalid_operator_response')
             presentation = event['presentation_digest']
             base = {key: value for key, value in event.items() if key != 'presentation_digest'}
-            item = self._event_item(session, {**base, 'action': 'resume'})
             answer = base['answer']
+            intent = reply_intent(answer) if type(answer) is str else 'ambiguous'
+            item = self._event_item(session, {**base, 'action': 'cancel' if intent == 'cancel' else 'resume'})
             if type(answer) is not str or not 1 <= len(answer.strip()) <= 2000 or base['non_sensitive'] is not True or _SECRET.search(answer) or _SECRET.search(normalized(answer)) or any(ord(c) < 32 and c not in '\n\r\t' for c in answer):
                 reject('non_sensitive_answer_required')
-            intent = reply_intent(answer)
             if intent == 'cancel':
                 return 'cancel', self.consume(session, {**base, 'action': 'cancel', 'answer': ''})
             if item['data'].get('_checkpoint_unavailable'):
@@ -141,6 +233,15 @@ class OperatorRequests:
                 data['task'] += '\nProcedure ' + ('saved for future sessions. The current conversation retains its pinned version.' if approved else 'not saved.') + ' No external effect is authorized.'
                 return 'resume', data
             category = item['request']['category']
+            if item.get('correction_intent_routes'):
+                if intent == 'negative':
+                    item.pop('correction_intent_routes', None)
+                    item['request'] = {'category': 'confirmation', 'reason': 'condition_confirmation',
+                        'request': 'The correction was not applied. Reply Continue to resume the original task, or Cancel before sending a new request.'}
+                    self._rotate(item, item['request']['request'])
+                    return 'waiting', None
+                if intent == 'affirmative':
+                    self._teaching[session] = NavigationTeaching(item.pop('correction_intent_routes'), baseline=control.teaching_baseline if control else None)
             if intent in ('negative', 'reject', 'uncertain'):
                 self._rotate(item, 'Take your time. Tell me when the manual step is complete, or clarify what is still missing. You can also cancel the task.')
                 return 'waiting', None
@@ -232,7 +333,7 @@ class OperatorRequests:
         request = validate_request(request)
         with self.lock:
             previous = self.pending.get(session)
-            original = previous['data'] if previous and previous['state'] == 'resuming' else data
+            original = previous['data'] if previous and previous['state'] in ('resuming', 'pausing_operator') else data
             item = {'session_id': session, 'run_id': run, 'intervention_id': secrets.token_hex(24),
                     'revision': secrets.token_hex(32), 'token': secrets.token_urlsafe(32),
                     'state': 'waiting_operator', 'request': request, 'data': copy.deepcopy(original), 'error': None,

@@ -2,6 +2,10 @@
 
 Branch: `feat/dext-live-navigation-learning`. Date: 2026-11-13.
 
+The stable `learning.md` projection and spontaneous-correction extension are
+documented in [Canonical learning and spontaneous corrections](pr5_canonical_learning.md).
+That report supersedes the earlier snapshot-only projection description below.
+
 ## Implementation
 
 The existing ordinary chat composer now checks the trusted operator broker before
