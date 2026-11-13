@@ -90,7 +90,7 @@ export function DextReview({ enabled }: { enabled: boolean }) {
     const proposal = status?.proposal;
     const navigation = status?.navigation;
     return <details className="dext-review" aria-label="Dext operator review">
-        <summary>Dext operator review</summary>
+        <summary>Advanced Dext review and diagnostics</summary>
         <p>Navigation previews are available. Live gestures, PDF capture, external analysis and accounting entry remain blocked pending verified boundaries.</p>
         {!status && <p>Start or resume a supervised Dext chat to enable local procedure review.</p>}
         {status && <>

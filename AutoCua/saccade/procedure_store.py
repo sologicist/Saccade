@@ -13,12 +13,16 @@ from pathlib import Path
 from .business_contract import digest, dumps, loads, read_safe, reject
 
 ROUTES = {
+    "purchases": "Ask the operator to open Purchases manually, then reobserve and verify the section heading.",
+    "inbox": "Ask the operator to open Inbox manually, then reobserve and verify the section heading.",
     "invoices": "Ask the operator to identify the invoices navigation control.",
     "bank": "Ask the operator to identify the bank transactions navigation control.",
     "workspace": "Confirm the active workspace with the operator before proceeding.",
     "record": "Confirm the exact record with the operator; a URL is insufficient.",
     "review": "Stop for operator review if target identity or the transition is uncertain.",
 }
+ROUTE_LABELS = {'purchases': 'Purchases', 'inbox': 'Inbox', 'invoices': 'Invoices', 'bank': 'Bank transactions',
+                'workspace': 'Workspace check', 'record': 'Record check', 'review': 'Operator review'}
 MAX_PROCEDURE = 16_384
 _THREAD_LOCK = threading.RLock()
 
@@ -110,11 +114,13 @@ class ProcedureStore:
         return loads(read_safe(self.project, self.root / name, 65_536), 65_536)
 
     def _write(self, name, value, *, exclusive=False):
+        return self._publish(name, dumps(value, 65_536).encode(), exclusive=exclusive)
+
+    def _publish(self, name, content, *, exclusive=False):
         path = self.root / name
         self._directories(path.parent)
         if path.exists() or path.is_symlink():
             read_safe(self.project, path, 65_536)
-        content = dumps(value, 65_536).encode()
         # Temporary files are inert; never adopted by startup or globbing.
         temporary = path.parent / ("pending-" + secrets.token_hex(24))
         with temporary.open("xb") as stream:
@@ -142,7 +148,26 @@ class ProcedureStore:
                 reject("procedure_corrupt")
         else:
             self._write(path, snapshot, exclusive=True)
+        self._export_markdown(revision, snapshot["content"])
         return revision
+
+    def _export_markdown(self, revision, content):
+        name = "snapshots/" + identifier(revision) + ".md"
+        path = self.root / name
+        encoded = content.encode('utf-8')
+        if path.exists() or path.is_symlink():
+            if read_safe(self.project, path, MAX_PROCEDURE) != encoded:
+                reject("procedure_markdown_corrupt")
+        else:
+            self._publish(name, encoded, exclusive=True)
+        return path
+
+    def markdown(self, revision):
+        """Export legacy snapshots on demand; JSON remains the canonical source."""
+        with self.lock():
+            snapshot = self.snapshot(revision)
+            path = self._export_markdown(revision, snapshot['content'])
+            return read_safe(self.project, path, MAX_PROCEDURE).decode('utf-8')
 
     def snapshot(self, revision):
         if digest(read_safe(self.project, self.baseline_path, MAX_PROCEDURE).decode("utf-8")) != self.baseline_digest:
@@ -151,10 +176,14 @@ class ProcedureStore:
         if type(value) is not dict or digest(value) != revision or value.get("baseline_digest") != self.baseline_digest:
             reject("procedure_corrupt")
         if value.get("source") == "operator":
-            if value.get("content") != self.render(value.get("routes")):
+            if value.get("content") != self._candidate_content(value):
                 reject("procedure_corrupt")
         elif value.get("source") != "baseline" or value.get("content") != self.baseline:
             reject("procedure_corrupt")
+        markdown = self.root / ("snapshots/" + revision + ".md")
+        if markdown.exists() or markdown.is_symlink():
+            if read_safe(self.project, markdown, MAX_PROCEDURE) != value['content'].encode('utf-8'):
+                reject("procedure_markdown_corrupt")
         return value
 
     def active(self):
@@ -174,7 +203,22 @@ class ProcedureStore:
         # for secrets, scripts, URLs, selectors or enlarged permissions.
         return "# Dext navigation guidance\n\n" + "\n".join(f"{n}. {ROUTES[route]}" for n, route in enumerate(routes, 1)) + "\n"
 
-    def propose(self, routes, run_id, *, teaching_source="route_selection", observation_digest=None):
+    @classmethod
+    def _candidate_content(cls, candidate):
+        paths = candidate.get('paths')
+        if paths is None:
+            return cls.render(candidate.get('routes'))
+        if type(paths) is not list or not 1 <= len(paths) <= 8:
+            reject('invalid_procedure_routes')
+        content = '# Dext navigation guidance\n\nOperator-assisted paths only; no action, disclosure or download authority.\n'
+        for index, path in enumerate(paths, 1):
+            cls.render(path)
+            content += f'\n## Operator-assisted path {index}\n\n' + '\n'.join(f'{n}. {ROUTES[route]}' for n, route in enumerate(path, 1)) + '\n'
+        if candidate.get('routes') != [route for path in paths for route in path] or len(content.encode()) > MAX_PROCEDURE:
+            reject('invalid_procedure_routes')
+        return content
+
+    def propose(self, routes, run_id, *, teaching_source="route_selection", observation_digest=None, incremental=False):
         if teaching_source not in ("route_selection", "operator_chat_correction"):
             reject("invalid_teaching_source")
         if observation_digest is not None:
@@ -182,15 +226,26 @@ class ProcedureStore:
         content = self.render(routes)
         with self.lock():
             base = self.active()
+            paths = None
+            if incremental:
+                prior = self.snapshot(base['current'])
+                paths = prior.get('paths', [prior['routes']] if prior['routes'] else [])
+                # Revise the path with the same entry section, preserve unrelated paths.
+                paths = [list(path) for path in paths if path[0] != routes[0]] + [list(routes)]
             candidate = {"schema_version": 1, "source": "operator", "content": content,
                          "baseline_digest": self.baseline_digest, "routes": list(routes),
                          "base": base, "run_digest": digest(run_id), "utc": utc(),
                          "teaching_source": teaching_source, "observation_digest": observation_digest,
                          "proposal_id": secrets.token_hex(32)}
+            if paths is not None:
+                candidate.update(paths=paths, routes=[route for path in paths for route in path])
+                candidate['content'] = self._candidate_content(candidate)
+                content = candidate['content']
             revision = digest(candidate)
             self._write("proposals/" + candidate["proposal_id"] + ".json", candidate, exclusive=True)
             old = self.snapshot(base["current"])["content"]
             return {"proposal_id": candidate["proposal_id"], "base_revision": base["current"],
+                    "summary": '\n'.join(' → '.join(ROUTE_LABELS[route] for route in path) for path in (paths or [routes])),
                     "observation_digest": observation_digest, "teaching_source": teaching_source,
                     "candidate_revision": revision, "base_generation": base["generation"],
                     "old": old, "new": content, "diff": "".join(difflib.unified_diff(
@@ -214,7 +269,7 @@ class ProcedureStore:
             current = self.active()
             if current != candidate["base"] and approve:
                 reject("stale_procedure_proposal")
-            if candidate["content"] != self.render(candidate["routes"]):
+            if candidate["content"] != self._candidate_content(candidate):
                 reject("procedure_corrupt")
             if approve:
                 self._snapshot(candidate)

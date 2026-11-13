@@ -271,6 +271,8 @@ class PlatformSessionAPI(SessionFixtures):
         self.outcomes = []
         self.fail_reattachment = False
         self.fail_cleanup = False
+        self.scan = None
+        self.provider_calls = 0
         test = self
 
         class FakeWebAgent:
@@ -284,9 +286,19 @@ class PlatformSessionAPI(SessionFixtures):
                 test.created.append(self)
 
             def process_request(self, task):
+                self.task = task
                 test.started.set()
                 if not test.release.wait(10):
                     raise RuntimeError("Synthetic test release timed out.")
+                control = self.kwargs.get('dext_control')
+                if test.scan is not None and control:
+                    control.freeze_decision()
+                    control.observe_native(test.scan, {'observer': 'synthetic-observer', 'tab': '1',
+                        'profile': 'saccade-dext', 'config_revision': control.context['config_revision']})
+                    intervention = control.learning_intervention()
+                    if intervention:
+                        return {'status': 'waiting_operator', 'message': json.dumps(intervention)}
+                test.provider_calls += 1
                 return test.outcomes.pop(0) if test.outcomes else {"status": "success", "message": "Synthetic completion"}
 
             def close_operator_session(self):
@@ -607,6 +619,97 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertIn('fresh Chrome cannot replace', result.json['error'])
         self.assertEqual(len(self.created), 1)
         self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+
+    def chat_event(self, sid, broker, text):
+        return {**self.operator_event(sid, broker), 'action': 'chat', 'answer': text,
+                'non_sensitive': True, 'presentation_digest': broker.status(sid).get('presentation_digest')}
+
+    def test_chat_french_authentication_negative_reply_and_same_browser_continuation(self):
+        sid, previous, broker = self.pause_browser()
+        saved = self.conversation.get_session(sid)['exchanges'][-1]['done_message']
+        self.assertIn('sign in privately', saved)
+        self.assertNotIn('authentication_required', saved)
+        event = self.chat_event(sid, broker, 'Non, pas encore')
+        answer = self.respond_operator(sid, event)
+        self.assertEqual(answer.status_code, 200, answer.json)
+        self.assertEqual(answer.json['status'], 'waiting_operator')
+        self.assertEqual(self.conversation.get_session(sid)['exchanges'][-1]['task'], 'Non, pas encore')
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.provider_calls, 1)
+        self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
+        self.assertEqual(self.respond_operator(sid, event).status_code, 409)
+        for _ in range(12): self.client.get('/api/operator?session_id=' + sid, headers=self.headers, base_url=self.base_url)
+        self.assertEqual(self.provider_calls, 1)
+        resumed = self.respond_operator(sid, self.chat_event(sid, broker, 'Je suis connecté'))
+        self.assertEqual(resumed.status_code, 200, resumed.json)
+        self.finish_run()
+        self.assertEqual(resumed.json['session_id'], sid)
+        self.assertIs(self.created[-1].kwargs['operator_session'], previous)
+        self.assertIs(self.created[-1].kwargs['profile_lease'], previous.kwargs['profile_lease'])
+        self.assertIn('Synthetic request', self.created[-1].task)
+        self.assertEqual(self.conversation.get_session(sid)['exchanges'][-1]['task'], 'Je suis connecté')
+
+    def test_chat_authentication_never_accepts_codes_and_cancel_preserves_cleanup(self):
+        sid, previous, broker = self.pause_browser()
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, '123456')).status_code, 409)
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, 'Cancel')).json['status'], 'cancelled')
+        self.assertTrue(previous.closed)
+        self.assertEqual(self.conversation.get_session(sid)['exchanges'][-1]['status'], 'cancelled')
+
+    def test_paused_dext_control_stays_bound_when_another_chat_is_used(self):
+        sid, previous, broker = self.pause_browser()
+        original_control = broker.control_for(sid)
+        self.assertIs(original_control, previous.kwargs['dext_control'])
+        other = self.post()
+        self.assertEqual(other.status_code, 200, other.json)
+        self.finish_run()
+        self.assertIsNone(self.service._dext_control)
+        self.assertIs(broker.control_for(sid), original_control)
+        self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
+
+    def test_chat_teaching_exact_approval_markdown_and_continuation_through_real_routes(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        from AutoCua.saccade.dext_control import DextRunControl
+        def elements(control=(), heading=()):
+            return {str(n): {'name': name, 'role': role, 'rect': [1, 1, 100, 20]}
+                    for n, (name, role) in enumerate([(x, 'link') for x in control] + [(x, 'heading') for x in heading], 1)}
+        self.scan = elements(['Purchases'])
+        self.outcomes.append({'status': 'waiting_operator', 'message': json.dumps({
+            'category': 'question', 'reason': 'missing_information', 'request': 'How do I reach the purchase invoices section?'})})
+        response = self.post(platform_id='dext')
+        self.finish_run()
+        sid = response.json['session_id']
+        self.addCleanup(lambda: broker.pending.pop(sid, None))
+        self.addCleanup(lambda: broker.close_browser(sid))
+        original = self.created[0]
+        pinned = original.kwargs['dext_control'].pin_revision
+        self.scan = elements(['Inbox'], ['Purchases'])
+        resumed = self.respond_operator(sid, self.chat_event(sid, broker, 'Ouvre les achats puis la boîte de réception.'))
+        self.assertEqual(resumed.status_code, 200, resumed.json)
+        self.finish_run()
+        self.assertEqual(broker.status(sid)['request']['category'], 'manual_action')
+        self.assertEqual(self.provider_calls, 1)
+        self.scan = elements([], ['Inbox'])
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, "C'est bon")).status_code, 200)
+        self.finish_run()
+        presented = broker.status(sid)
+        self.assertIn('Purchases', presented['procedure_summary'])
+        self.assertIn('Inbox', presented['procedure_summary'])
+        self.assertEqual(self.provider_calls, 1)
+        event = self.chat_event(sid, broker, 'Yes, save it.')
+        self.assertEqual(self.respond_operator(sid, event).status_code, 200)
+        self.finish_run()
+        self.assertEqual(self.provider_calls, 2)
+        self.assertEqual(self.created[-1].kwargs['dext_control'].pin_revision, pinned)
+        self.assertEqual(self.respond_operator(sid, event).status_code, 409)
+        future = DextRunControl(self.context(), 'future-chat', project_root=self.root)
+        self.addCleanup(future.close)
+        self.assertIn('Purchases', future.overlay())
+        self.assertIn('Inbox', future.overlay())
+        self.assertNotIn('Ouvre les achats', future.overlay())
+        self.assertTrue((future.store.root / 'snapshots' / (future.pin_revision + '.md')).is_file())
+        self.assertIs(self.created[-1].kwargs['profile_lease'], original.kwargs['profile_lease'])
 
     def test_generic_chat_has_no_dext_operator_control(self):
         response = self.post()

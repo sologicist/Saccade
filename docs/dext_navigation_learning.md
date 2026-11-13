@@ -1,5 +1,20 @@
 # Dext operator review and navigation learning (PR5)
 
+The current ordinary-chat workflow and validation are documented in
+[PR5 conversational assistance](pr5_conversational_operator.md). The technical
+review controls below remain available as optional advanced diagnostics. In
+ordinary supervised runs, unsupported navigation suspends immediately for manual
+assistance instead of waiting for the preview panel's decision.
+
+Approved snapshots now have immutable UTF-8 Markdown projections at
+`platforms/dext/data/navigation/snapshots/<revision>.md`. Hash-checked JSON remains
+canonical; a missing legacy projection is regenerated from that exact snapshot,
+and a mismatching projection fails closed. Publication writes the complete
+projection before activating a revision. The pinned native domain overlay reads
+the checked Markdown; the tracked `dext.md` baseline is unchanged. New conversational
+candidates merge or revise bounded paths while preserving unrelated approved
+paths. The current conversation never adopts a newly approved revision implicitly.
+
 ## Delivered boundary
 
 This change delivers local operator review, versioned generic navigation guidance,

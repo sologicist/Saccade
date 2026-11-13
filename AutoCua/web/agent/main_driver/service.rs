@@ -1088,6 +1088,7 @@ impl AgentService {
         if system_prompt.contains(OS_PLACEHOLDER) {
             system_prompt = system_prompt.replace(OS_PLACEHOLDER, current_os());
         }
+        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If Dext target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect.\n");
         if single_tab {
             // Overrides the base prompt's tab guidance without editing the
             // file: this agent has no tab tools and must never plan around
@@ -1839,6 +1840,19 @@ impl AgentService {
             *final_message = format!("Platform scope requires operator review: {}", py_err_str(py, &error));
             return Ok(Flow::Break);
         }
+        match self.controller.conversational_intervention(py) {
+            Ok(Some(request)) => {
+                *final_status = "waiting_operator".into();
+                *final_message = request.to_string();
+                return Ok(Flow::Break);
+            },
+            Err(_) => {
+                *final_status = "waiting_operator".into();
+                *final_message = blocked_intervention("Navigation evidence could not be verified. Please review the current section before continuing.");
+                return Ok(Flow::Break);
+            },
+            Ok(None) => {},
+        }
         let msgs: Vec<Value> = match pythonize::depythonize(messages.as_any())? {
             Value::Array(a) => a,
             other => vec![other],
@@ -2336,7 +2350,10 @@ impl AgentService {
             let rows = action_result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![action_result.clone()]);
             if rows.iter().any(|row| row["status"] == "error" || row["operator_review_required"] == true) {
                 *final_status = "waiting_operator".into();
-                *final_message = blocked_intervention("An action failed or requires independent review. Reconcile its effects before resuming; permissions remain unchanged.");
+                *final_message = if rows.iter().any(|row| row["tool"] == "dext_navigation") {
+                    json!({"category":"manual_action", "reason":"manual_intervention",
+                        "request":"Please open the requested section manually in the dedicated Chrome window, then tell me when it is done. Automatic Dext navigation needs verified control and frame semantics, which are not available yet."}).to_string()
+                } else { blocked_intervention("An action failed or requires independent review. Reconcile its effects before resuming; permissions remain unchanged.") };
                 return Ok(Flow::Break);
             }
             if rows.iter().all(|row| row["tool"] == "wait") {
@@ -2820,6 +2837,19 @@ operator_thread.start()
             assert!(view::decode_results(&turns[0]).iter().any(|r| r["tool_call_id"] == "forced-call" && r["content"].as_str().unwrap_or_default().contains("verified_dext_navigation_adapter_required")));
             assert!(state.last_messages.bind(py).str().unwrap().to_string().contains("approved_navigation_guidance"));
             drop(state);
+            // Native manual-learning checkpoints run before the provider, using
+            // the same scope-checked scanner and real Python control/store.
+            py.run(&CString::new("from AutoCua.saccade.navigation_correction import NavigationTeaching\nnext_control.conversational = True\nnext_control.attach_teaching(NavigationTeaching(['purchases']))\nbefore_learning = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            {
+                let mut scanner = service.scanner.get().inner.lock().unwrap();
+                scanner.mapping = json!({"2":{"name":"Purchases","role":"link","rect":[1,1,40,20]}}).as_object().unwrap().clone();
+                scanner.business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/"); 128]));
+            }
+            let outcome = service.process_request(py, PyString::new(py, "Find the synthetic purchase invoices.").into_any()).unwrap();
+            let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+            assert_eq!(outcome["status"], "waiting_operator");
+            assert!(outcome["message"].as_str().unwrap().contains("manually"));
+            py.run(&CString::new("assert provider_calls == before_learning\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
             service.controller.configure_dext_control(py, None, None).unwrap();
             py.run(&CString::new("before_ask = provider_calls; forced_tool_name = 'ask_operator'; forced_action = {'category':'question','reason':'missing_information','request':'Which synthetic option should be selected?'}").unwrap(), Some(&locals), None).unwrap();
             let task = pyo3::types::PyString::new(py, "Continue the original synthetic objective.").into_any();
@@ -2868,7 +2898,7 @@ assert not operator_thread.is_alive() and operator_answers[0]['executed'] is Fal
 assert len(loop_runs[-1].receipts) == 0
 control.close()
 next_control.close()
-assert len(loop_runs) == 10 and len(loop_runs[0].receipts) == 1
+assert len(loop_runs) == 11 and len(loop_runs[0].receipts) == 1
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root

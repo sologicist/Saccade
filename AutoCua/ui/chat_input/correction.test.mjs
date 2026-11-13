@@ -5,6 +5,59 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('./chat_input.js', import.meta.url), 'utf8');
 
+test('host clarifications use the existing user and assistant chat renderers without a run', () => {
+    const ui = composer(() => null);
+    const user = [], replies = [];
+    let archived = 0;
+    ui.window.currentSessionId = 'chat';
+    ui.window.chatScroll = { archiveLive: () => { archived++; }, setLive() {}, setLiveBot() {} };
+    ui.window.showUserMessage = text => user.push(text);
+    ui.window.showRunReply = (html, status) => replies.push({ html, status });
+    ui.window.operatorChatReply(JSON.stringify({ session_id: 'chat', answer: 'Non, pas encore', reply_html: '<p>Take your time.</p>' }));
+    assert.deepEqual(user, ['Non, pas encore']);
+    assert.equal(replies[0].status, 'waiting_operator');
+    assert.equal(archived, 1);
+    assert.equal(ui.fetches(), 0);
+    ui.window.operatorChatReply(JSON.stringify({ session_id: 'other', answer: 'Done', reply_html: '<p>Foreign.</p>' }));
+    assert.equal(archived, 1);
+});
+
+test('the real composer routes a paused French reply before model selection and teaching mode', async () => {
+    let replies = 0, corrections = 0, models = 0;
+    const ui = composer(() => { corrections++; return null; });
+    ui.window.currentSessionId = 'chat';
+    ui.window.getModelSelection = () => { models++; return {}; };
+    ui.window.submitOperatorChat = async (text, session) => {
+        replies++;
+        assert.equal(text, 'Je suis connecté');
+        assert.equal(session, 'chat');
+        return true;
+    };
+    ui.input.value = 'Je suis connecté';
+    ui.enter(); ui.enter();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(replies, 1);
+    assert.equal(corrections, 0);
+    assert.equal(models, 0);
+    assert.equal(ui.fetches(), 0);
+    assert.equal(ui.input.value, '');
+});
+
+test('a missing or failing reply channel cannot send a paused answer to a model', async () => {
+    const ui = composer(() => { throw Error('Must not reach correction mode'); });
+    ui.window.currentSessionId = 'chat';
+    ui.input.value = 'Done';
+    ui.enter();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ui.fetches(), 0);
+    assert.equal(ui.input.value, 'Done');
+    ui.window.submitOperatorChat = () => Promise.reject(Error('offline'));
+    ui.enter();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ui.fetches(), 0);
+    assert.equal(ui.input.value, 'Done');
+});
+
 function composer(handler) {
     const keys = new Map(), events = new Map();
     const input = { value: '', readOnly: false, style: {}, classList: { contains: () => false },

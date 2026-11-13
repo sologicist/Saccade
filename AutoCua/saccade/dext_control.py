@@ -32,7 +32,7 @@ class DextRunControl:
     is recorded as a claim, never upgraded into a verified live adapter.
     """
 
-    def __init__(self, context, session_id, *, project_root=None, stop_event=None):
+    def __init__(self, context, session_id, *, project_root=None, stop_event=None, conversational=False):
         from .platform_config import PROJECT_ROOT
         self.project = Path(project_root or PROJECT_ROOT)
         self.context = _validate_context(context, root=self.project)
@@ -56,6 +56,30 @@ class DextRunControl:
         self._navigation_result = None
         self._source_revision = None
         self._last_observation_digest = None
+        self.conversational = conversational
+        self.teaching = None
+        self.teaching_baseline = None
+
+    def attach_teaching(self, teaching):
+        from .navigation_correction import NavigationTeaching
+        if type(teaching) is not NavigationTeaching:
+            reject('invalid_navigation_teaching')
+        self.teaching = teaching
+
+    def learning_intervention(self):
+        """Read only by the native loop after a fresh, scope-checked observation."""
+        with self.lock:
+            if not self.teaching:
+                return None
+            self._observation(self.observation['id'] if self.observation else None)
+            request = self.teaching.intervention()
+            if request:
+                return request
+            if self.proposal is None:
+                self.proposal = self.store.propose(self.teaching.routes, self.run_id,
+                    teaching_source='operator_chat_correction', observation_digest=digest(self.teaching.evidence), incremental=True)
+            return {'category': 'confirmation', 'reason': 'condition_confirmation',
+                    'request': 'I have corroborated the manually demonstrated sections. May I remember the proposed operator-assisted navigation procedure for future sessions?'}
 
     def freeze_decision(self):
         self.validate_native(self.context)
@@ -76,7 +100,7 @@ class DextRunControl:
             return ""
         return ("<approved_navigation_guidance revision=\"" + self.pin_revision + "\">\n"
                 "Operator-approved guidance only. It grants no action, disclosure or download permission.\n"
-                + snapshot["content"] + "</approved_navigation_guidance>")
+                + self.store.markdown(self.pin_revision) + "</approved_navigation_guidance>")
 
     def observe_native(self, elements, stamp):
         with self.lock:
@@ -98,6 +122,11 @@ class DextRunControl:
             # Retain only a scope-evidence digest across handoff. Never save DOM
             # text, target IDs, raw record fields or the correction in the SOP.
             self._last_observation_digest = digest([self.run_id, self.observation["id"], stamp])
+            from .navigation_correction import landmarks
+            controls, headings = landmarks(elements)
+            self.teaching_baseline = (controls, headings, self._last_observation_digest, stamp['tab'])
+            if self.teaching:
+                self.teaching.observe(controls, headings, self._last_observation_digest, stamp['tab'])
 
     def propose_navigation(self, action):
         with self.lock:
@@ -135,6 +164,11 @@ class DextRunControl:
 
     def wait_navigation_review(self):
         """Park the existing native tool call; Event.wait releases the GIL."""
+        if self.conversational:
+            with self.lock:
+                self.pending = None
+                return {'status': 'error', 'tool': 'dext_navigation', 'code': 'verified_dext_navigation_adapter_required',
+                        'operator_review_required': True, 'executed': False}
         while True:
             with self.lock:
                 if self._navigation_result:

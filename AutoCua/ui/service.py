@@ -2309,14 +2309,32 @@ def operator_intervention_route():
             return jsonify({'error': 'invalid_operator_response'}), 400
         with _agent_start_lock:
             was_resuming = (operator_requests.status(session) or {}).get('state') == 'resuming'
-            data = operator_requests.consume(session, loads(request.get_data(), 8192))
+            event = loads(request.get_data(), 8192)
+            if type(event) is dict and event.get('action') == 'chat':
+                control = operator_requests.control_for(session)
+                kind, data = operator_requests.chat(session, event, control=control)
+                if kind == 'waiting':
+                    pending = operator_requests.status(session)
+                    reply = pending.get('chat_message') or pending['request']['request']
+                    if pending.get('procedure_summary'):
+                        reply += '\n\n' + pending['procedure_summary']
+                    conversation.save_operator_reply(session, event['answer'], reply)
+                    return jsonify({'status': 'waiting_operator', 'pending': pending, 'session_id': session,
+                                    'answer': event['answer'], 'reply_html': md_render(reply)})
+            else:
+                data = operator_requests.consume(session, event)
             if data is None:
                 if was_resuming and active_agent_stop_event:
                     active_agent_stop_event.set()
                 if not was_resuming:
                     operator_requests.close_browser(session)
-                return jsonify({'status': 'cancelled'})
-            response = _start_agent_run_locked(data)
+                    try:
+                        conversation.save_operator_reply(session, event.get('answer') or 'Cancel', 'The task was cancelled.', status='cancelled')
+                    except Exception:
+                        debug_exception('record operator cancellation')
+                return jsonify({'status': 'cancelled', 'session_id': session, 'answer': event.get('answer') or 'Cancel',
+                                'reply_html': md_render('Cancellation requested.' if was_resuming else 'The task was cancelled.')})
+            response = _start_agent_run_locked(data, operator_reply=event['answer'] if event.get('action') == 'chat' else None)
             body, code = response if isinstance(response, tuple) else (response, 200)
             if code != 200:
                 operator_requests.retry(session)
@@ -2328,7 +2346,7 @@ def operator_intervention_route():
         return jsonify({'error': 'resume_verification_failed'}), 409
 
 
-def _start_agent_run_locked(data, via=None, hooks=None):
+def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None):
     """The run behind /api/start-agent, so a task from elsewhere (the Telegram
     bot) starts the same way and the page shows it as a sent message. data:
     the chat box's fields (provider, model, task, session_id, mode, os,
@@ -2355,7 +2373,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         req_session_id = data.get('session_id')   # None / "new" / existing chat id
         pending_operator = operator_requests.status(str(req_session_id))
         if pending_operator and pending_operator['state'] == 'waiting_operator':
-            return jsonify({'error': 'Use the pending operator Resume or Cancel controls.'}), 409
+            return jsonify({'error': 'Reply to the pending assistant question in this chat, or cancel the task.'}), 409
 
         if not all([provider, model, task]):
             return jsonify({'error': 'Missing provider, model, or task'}), 400
@@ -2441,6 +2459,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     data.get('headless', False), browser_profile,
                 )
             retained_browser = operator_requests.browser_for_resume(chat_session_id)
+            if pending_operator and pending_operator['state'] == 'resuming' and (not isinstance(prior_history, dict) or not prior_history.get('assistant_messages') or len(prior_history['assistant_messages']) != len(prior_history.get('tool_responses') or [])):
+                raise SessionContextError('The saved operator checkpoint is unavailable or unpaired. Cancel and review the original task.')
             if pending_operator and pending_operator['state'] == 'resuming' and not retained_browser:
                 raise SessionContextError('The suspended browser is unavailable. Cancel and review the task; a fresh Chrome cannot replace the operator session.')
             if retained_browser:
@@ -2470,7 +2490,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                 from AutoCua.saccade.dext_control import DextRunControl
                 from AutoCua.saccade.platform_registry import PROJECT_ROOT
                 run_dext_control = DextRunControl(platform_context, chat_session_id,
-                                                 project_root=PROJECT_ROOT, stop_event=run_stop_event)
+                    project_root=PROJECT_ROOT, stop_event=run_stop_event, conversational=True)
+                operator_requests.configure_teaching(chat_session_id, run_dext_control)
                 _dext_control = run_dext_control
 
         def run_agent():
@@ -2745,7 +2766,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                             results,
                             run_outcome.get("status", "success"),
                             run_outcome.get("message", "") or "",
-                            task,
+                            operator_reply or task,
                             getattr(agent, "last_messages", None),  # exact payload -> true memory log
                             context_tokens=token_tracker.current,   # latest context size for the bar
                             context_cap=token_tracker.cap,          # fixed 300k memory budget
@@ -2777,6 +2798,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                             if not checkpoint_saved or cleanup_failed:
                                 checkpoint['_checkpoint_unavailable'] = True
                             operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
+                            if run_dext_control is not None:
+                                operator_requests.present_procedure(chat_session_id, run_dext_control)
                             if agent is not None:
                                 operator_requests.retain_browser(chat_session_id, agent, profile_lease)
                         else:
@@ -2790,6 +2813,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                             webview_window.evaluate_js("window.agentComplete()")
                         elif status == "waiting_operator":
                             webview_window.evaluate_js("window.agentPaused && window.agentPaused()")
+                            webview_window.evaluate_js("document.dispatchEvent(new CustomEvent('operator:changed'))")
                         else:
                             # Surface the real reason instead of a silent "complete".
                             prefix = "❌ Error: " if status == "error" else "⚠️ Stopped without completing: "
@@ -2809,7 +2833,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                         if status == "success":
                             reply = message or "Done."
                         elif status == "waiting_operator":
-                            reply = "Paused for operator intervention. No model requests are running. Use Resume or Cancel in the operator panel."
+                            pending = operator_requests.status(chat_session_id) or {}
+                            reply = pending.get('request', {}).get('request', 'Please review the current environment before continuing.')
                         else:
                             reply = ("Error: " if status == "error" else "Stopped without completing: ") + message
                         webview_window.evaluate_js(

@@ -1,21 +1,28 @@
-import { useEffect, useState } from 'react';
-import { operatorResumePayload } from './operator_resume';
+import { useEffect, useRef, useState } from 'react';
+import { submitOperatorChat, type PendingOperator } from './operator_chat.ts';
 
-declare global { interface Window { remoteRunStarted?: (payload: string) => void; } }
+declare global { interface Window {
+    remoteRunStarted?: (payload: string) => void;
+    submitOperatorChat?: (text: string, session: string) => Promise<boolean>;
+    operatorChatReply?: (payload: string) => void;
+} }
 
-interface Pending {
-    session_id: string; run_id: string; intervention_id: string; revision: string; token: string;
-    state: string; request: { category: string; reason: string; request: string };
-    error?: string;
-}
-
+/** The assistant reply and ordinary composer are the operator interface. */
 export function OperatorReview() {
-    const [pending, setPending] = useState<Pending | null>(null);
-    const [answer, setAnswer] = useState('');
-    const [safe, setSafe] = useState(false);
+    const [pending, setPending] = useState<PendingOperator | null>(null);
     const [error, setError] = useState('');
-    const [busy, setBusy] = useState(false);
+    const presented = useRef<PendingOperator | null>(null);
+    useEffect(() => { presented.current = pending; }, [pending]);
     useEffect(() => {
+        window.submitOperatorChat = (text, session) => submitOperatorChat(text, session, {
+            fetch: window.fetch.bind(window), currentSession: () => window.currentSessionId,
+            presented: () => presented.current, update: setPending,
+            resume: payload => window.remoteRunStarted?.(payload),
+            reply: payload => window.operatorChatReply?.(payload),
+        }).catch(error => {
+            if (window.currentSessionId === session) setError(error instanceof Error ? error.message : 'Could not verify this reply.');
+            throw error;
+        });
         const abort = new AbortController();
         const refresh = async () => {
             const session = window.currentSessionId;
@@ -24,44 +31,25 @@ export function OperatorReview() {
                 const response = await fetch('/api/operator?session_id=' + encodeURIComponent(session), { signal: abort.signal });
                 const value = await response.json();
                 if (window.currentSessionId === session) setPending(response.ok ? value : null);
-            } catch { if (!abort.signal.aborted) setError('Could not verify operator checkpoint.'); }
+            } catch { if (!abort.signal.aborted) setError('Could not verify the assistant pause. Please retry before replying.'); }
         };
         void refresh();
+        document.addEventListener('operator:changed', refresh);
         const timer = window.setInterval(() => { void refresh(); }, 1500);
-        return () => { abort.abort(); window.clearInterval(timer); };
+        return () => { abort.abort(); window.clearInterval(timer); document.removeEventListener('operator:changed', refresh); delete window.submitOperatorChat; };
     }, []);
-    useEffect(() => { setAnswer(''); setSafe(false); }, [pending?.revision]);
     if (!pending || !['waiting_operator', 'resuming'].includes(pending.state)) return null;
-    const respond = async (action: string) => {
-        setBusy(true); setError('');
-        try {
-            const response = await fetch('/api/operator?session_id=' + encodeURIComponent(pending.session_id), {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-                    run_id: pending.run_id, intervention_id: pending.intervention_id, revision: pending.revision,
-                    token: pending.token, action, answer, non_sensitive: safe,
-                }),
-            });
-            const value = await response.json();
-            if (!response.ok) throw new Error(value.error || 'Resume failed. The task remains suspended.');
-            if (value.status === 'started') {
-                document.dispatchEvent(new CustomEvent('platformsession:busy'));
-                window.remoteRunStarted?.(JSON.stringify(operatorResumePayload(value, pending.session_id)));
-            }
-            setPending(null); setAnswer('');
-        } catch (e) { setError(e instanceof Error ? e.message : 'Resume failed.'); }
-        finally { setBusy(false); }
-    };
-    return <section className="platform-session" style={{ pointerEvents: 'auto', background: 'white', maxHeight: '45vh', overflow: 'auto' }} aria-label="Operator intervention">
-        <strong>{pending.state === 'resuming' ? 'Revalidating resources…' : 'Agent paused — no model requests'}</strong>
-        <p>{pending.request.category}: {pending.request.request}</p>
-        <p>Reason: {pending.request.reason}. Responses grant no permissions. Never enter passwords, authentication codes, keys or secrets.</p>
-        {pending.error && <p role="alert">{pending.error}</p>}
-        {pending.request.category === 'question' && <>
-            <textarea aria-label="Non-sensitive operator answer" maxLength={2000} value={answer} onChange={e => setAnswer(e.target.value)} />
-            <label><input type="checkbox" checked={safe} onChange={e => setSafe(e.target.checked)} />This answer contains no sensitive information.</label>
+    return <section className="operator-assistance" aria-label="Assistant assistance" style={{ pointerEvents: 'auto', padding: '8px 12px', maxHeight: '35vh', overflow: 'auto' }}>
+        <small role="status">{pending.state === 'resuming' ? 'Checking the browser before continuing...' : 'Paused - no model requests'}</small>
+        {pending.chat_message && <p>{pending.chat_message}</p>}
+        {pending.procedure_summary && <>
+            <p>I can remember this operator-assisted procedure for future sessions. Should I save it?</p>
+            <p style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_label}</p>
+            <details><summary>Read the procedure to be saved</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_summary}</pre></details>
+            <details><summary>What will change?</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_diff}</pre></details>
         </>}
-        <button type="button" disabled={busy || pending.state !== 'waiting_operator' || (pending.request.category === 'question' && (!safe || !answer.trim()))} onClick={() => void respond('resume')}>Resume original task</button>
-        <button type="button" disabled={busy} onClick={() => void respond('cancel')}>Cancel task</button>
+        <p>Reply in the chat below. Send only non-sensitive information; never send passwords or authentication codes. You can say "Cancel" to stop.</p>
+        {pending.error && <p role="alert">{pending.error}</p>}
         {error && <p role="alert">{error}</p>}
     </section>;
 }

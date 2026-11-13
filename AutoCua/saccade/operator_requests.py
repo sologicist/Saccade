@@ -17,14 +17,14 @@ def validate_request(value):
     if value['category'] not in CATEGORIES or value['reason'] not in REASONS or type(value['request']) is not str or not 1 <= len(value['request']) <= 1000:
         reject('invalid_operator_request')
     if value['category'] == 'authentication':
-        return {**value, 'request': 'Complete authentication privately in the external environment, then resume. Do not enter credentials in chat.'}
+        return {**value, 'request': 'Please sign in privately in the dedicated Chrome window, then tell me when you are connected. Do not enter credentials in chat.'}
     if _SECRET.search(value['request']) or re.search(r'[<>]|[A-Za-z]:\\|(?:^|\s)/\w|https?://|javascript:|\beval\(|powershell|cmd\.exe|\bbash\b|\bshell\b|python\s+-', value['request'], re.I):
         reject('unsafe_operator_request')
     return dict(value)
 
 
 class OperatorRequests:
-    """No waiting execution thread, timers, model polling or persisted answers.
+    """No waiting execution thread, model polling or independent answer journal.
 
     Continuation uses the existing launcher/conversation and fresh native scanning.
     Passive browser ownership stays here until resume or explicit cleanup. No
@@ -35,6 +35,144 @@ class OperatorRequests:
         self.lock = threading.RLock()
         self.pending = {}
         self._browsers = {}
+        self._teaching = {}
+        self._reviews = {}
+        self._controls = {}
+
+    def configure_teaching(self, session, control):
+        with self.lock:
+            if control.session_id != session:
+                reject('operator_control_session_mismatch')
+            self._controls[session] = control
+            if session in self._teaching:
+                control.attach_teaching(self._teaching[session])
+
+    def control_for(self, session):
+        with self.lock:
+            return self._controls.get(session)
+
+    def present_procedure(self, session, control):
+        """Seal the exact host-generated candidate to this suspended request."""
+        with self.lock:
+            item = self.pending.get(session)
+            if not item or item['state'] != 'waiting_operator' or not control.teaching or not control.proposal or control.teaching.index != len(control.teaching.routes):
+                return
+            if control.proposal['teaching_source'] != 'operator_chat_correction' or control.proposal['observation_digest'] != digest(control.teaching.evidence):
+                reject('unverified_navigation_teaching')
+            self._reviews[session] = (control, copy.deepcopy(control.proposal))
+            item['procedure_summary'] = control.proposal['new']
+            item['procedure_diff'] = control.proposal['diff']
+            item['procedure_label'] = control.proposal['summary']
+            item['presentation_digest'] = digest([session, item['run_id'], item['intervention_id'], item['revision'],
+                {key: control.proposal[key] for key in ('proposal_id', 'base_revision', 'candidate_revision', 'new', 'diff', 'summary')}])
+
+    def _rotate(self, item, message):
+        item.update(revision=secrets.token_hex(32), token=secrets.token_urlsafe(32), chat_message=message)
+        # A clarification is still a presentation of the same exact proposal.
+        if item.get('presentation_digest'):
+            item['presentation_digest'] = digest([item['presentation_digest'], item['revision']])
+
+    def _event_item(self, session, event):
+        item = self.pending.get(session)
+        keys = {'run_id', 'intervention_id', 'revision', 'token', 'action', 'answer', 'non_sensitive'}
+        if not item or type(event) is not dict or set(event) != keys or (item['state'] != 'waiting_operator' and not (item['state'] == 'resuming' and event.get('action') == 'cancel')):
+            reject('stale_operator_response')
+        if any(type(event[k]) is not str or not secrets.compare_digest(event[k], item[k]) for k in ('run_id', 'intervention_id', 'revision', 'token')):
+            reject('stale_operator_response')
+        return item
+
+    def _review(self, session, approve):
+        control, proposal = self._reviews[session]
+        if not control.proposal or any(control.proposal.get(key) != proposal[key] for key in ('proposal_id', 'base_revision', 'candidate_revision', 'new', 'diff', 'summary')):
+            reject('proposal_identity_mismatch')
+        control.operator_event({'event': 'review', 'review_token': control.review_token, 'approve': approve,
+            **{key: proposal[key] for key in ('proposal_id', 'base_revision', 'candidate_revision')}}, busy=False)
+        del self._reviews[session]
+        item = self.pending[session]
+        for key in ('procedure_summary', 'procedure_diff', 'procedure_label', 'presentation_digest'):
+            item.pop(key, None)
+
+    def chat(self, session, event, *, control=None):
+        """The ordinary composer enters the same one-use continuation broker.
+
+        Informational answers, exact procedure decisions and external-effect
+        authorization never share a permission or dispatch path.
+        """
+        from .operator_language import normalized, reply_intent, navigation_question
+        from .navigation_correction import correction_routes, NavigationTeaching
+        from .business_contract import BusinessError
+        with self.lock:
+            if type(event) is not dict or set(event) != {'run_id', 'intervention_id', 'revision', 'token', 'action', 'answer', 'non_sensitive', 'presentation_digest'} or event['action'] != 'chat':
+                reject('invalid_operator_response')
+            presentation = event['presentation_digest']
+            base = {key: value for key, value in event.items() if key != 'presentation_digest'}
+            item = self._event_item(session, {**base, 'action': 'resume'})
+            answer = base['answer']
+            if type(answer) is not str or not 1 <= len(answer.strip()) <= 2000 or base['non_sensitive'] is not True or _SECRET.search(answer) or _SECRET.search(normalized(answer)) or any(ord(c) < 32 and c not in '\n\r\t' for c in answer):
+                reject('non_sensitive_answer_required')
+            intent = reply_intent(answer)
+            if intent == 'cancel':
+                return 'cancel', self.consume(session, {**base, 'action': 'cancel', 'answer': ''})
+            if item['data'].get('_checkpoint_unavailable'):
+                reject('continuation_checkpoint_unavailable')
+            if session in self._reviews:
+                if type(presentation) is not str or not secrets.compare_digest(presentation, item['presentation_digest']):
+                    reject('stale_procedure_presentation')
+                if intent == 'show':
+                    self._rotate(item, 'Here is the complete procedure proposed for future sessions. Should I remember it?')
+                    return 'waiting', None
+                if intent == 'edit_second':
+                    self._review(session, False)
+                    item['edit_second'] = True
+                    item['request'] = {'category': 'question', 'reason': 'missing_information', 'request': 'What should the second navigation step be? Describe the section only.'}
+                    self._rotate(item, item['request']['request'])
+                    return 'waiting', None
+                approve = intent == 'save' or normalized(answer) in ('yes', 'oui')
+                decline = intent == 'reject' or normalized(answer) in ('no', 'non', 'no thanks', 'non merci')
+                if not approve and not decline:
+                    self._rotate(item, 'Should I save this exact navigation procedure, or leave it unremembered?')
+                    return 'waiting', None
+                approved = approve
+                self._review(session, approved)
+                self._teaching.pop(session, None)
+                item['request'] = {'category': 'confirmation', 'reason': 'condition_confirmation',
+                                   'request': 'The procedure decision is recorded. Shall I continue the original task?'}
+                data = self.consume(session, {**base, 'action': 'resume', 'answer': ''})
+                data['task'] += '\nProcedure ' + ('saved for future sessions. The current conversation retains its pinned version.' if approved else 'not saved.') + ' No external effect is authorized.'
+                return 'resume', data
+            category = item['request']['category']
+            if intent in ('negative', 'reject', 'uncertain'):
+                self._rotate(item, 'Take your time. Tell me when the manual step is complete, or clarify what is still missing. You can also cancel the task.')
+                return 'waiting', None
+            if category in ('authentication', 'manual_action', 'confirmation'):
+                if intent != 'affirmative':
+                    self._rotate(item, 'Is the requested manual step complete? Please confirm when it is done; never send credentials or authentication codes.')
+                    return 'waiting', None
+                return 'resume', self.consume(session, {**base, 'action': 'resume', 'answer': ''})
+            routes = None
+            try:
+                routes = correction_routes(answer)
+            except BusinessError:
+                pass
+            if item.get('edit_second') and routes:
+                old = self._teaching.get(session)
+                if not old or len(old.routes) < 2 or len(routes) != 1:
+                    reject('invalid_navigation_correction')
+                routes = old.routes[:1] + routes + old.routes[2:]
+            if routes and control is not None:
+                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline)
+                item.pop('edit_second', None)
+            elif not routes and (category == 'blocked' or navigation_question(item['request']['request']) or item.get('edit_second')):
+                if category == 'blocked' and not navigation_question(item['request']['request']):
+                    item['request'] = {'category': 'question', 'reason': 'missing_information',
+                        'request': 'What information has changed? Describe non-sensitive context; I will recheck it before continuing. This cannot authorize an external action.'}
+                    self._rotate(item, item['request']['request'])
+                else:
+                    self._rotate(item, 'Which section should be opened next? Describe a navigation path such as Purchases, then Inbox. I cannot infer selectors, record identities or permissions.')
+                return 'waiting', None
+            # Existing informational continuation is the only path to the model.
+            item['request'] = {**item['request'], 'category': 'question'}
+            return 'resume', self.consume(session, {**base, 'action': 'resume'})
 
     def retain_browser(self, session, agent, lease):
         """Host-only ownership transfer; native objects never enter JSON checkpoints."""
@@ -77,6 +215,7 @@ class OperatorRequests:
                         item['data']['_checkpoint_unavailable'] = True
                     raise
                 del self._browsers[session]
+                self._controls.pop(session, None)
 
     def close_all_browsers(self):
         with self.lock:
@@ -107,13 +246,16 @@ class OperatorRequests:
 
     def consume(self, session, event):
         with self.lock:
-            item = self.pending.get(session)
-            keys = {'run_id', 'intervention_id', 'revision', 'token', 'action', 'answer', 'non_sensitive'}
-            if not item or type(event) is not dict or set(event) != keys or (item['state'] != 'waiting_operator' and not (item['state'] == 'resuming' and event.get('action') == 'cancel')):
-                reject('stale_operator_response')
-            if any(type(event[k]) is not str or not secrets.compare_digest(event[k], item[k]) for k in ('run_id', 'intervention_id', 'revision', 'token')):
-                reject('stale_operator_response')
+            item = self._event_item(session, event)
             if event['action'] == 'cancel':
+                if session in self._reviews:
+                    try:
+                        self._review(session, False)
+                    except (ValueError, OSError):
+                        # Cancellation never needs a successful procedure decision.
+                        self._reviews.pop(session, None)
+                self._teaching.pop(session, None)
+                self._controls.pop(session, None)
                 item['state'] = 'cancelled'
                 return None
             if event['action'] != 'resume':
@@ -148,6 +290,9 @@ class OperatorRequests:
                     self.retry(session)
                 else:
                     item['state'] = 'completed'
+                    self._teaching.pop(session, None)
+            if not item or item['state'] not in ('waiting_operator', 'resuming'):
+                self._controls.pop(session, None)
 
 
 operator_requests = OperatorRequests()

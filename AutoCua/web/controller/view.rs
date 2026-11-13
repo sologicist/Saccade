@@ -136,6 +136,23 @@ impl ControllerView {
         match control { Some(control) => control.bind(py).call_method0("overlay")?.extract(), None => Ok(String::new()) }
     }
 
+    pub fn conversational_intervention(&self, py: Python<'_>) -> PyResult<Option<Value>> {
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let Some(control) = control else { return Ok(None) };
+        let control = control.bind(py);
+        if !control.getattr("conversational")?.extract::<bool>()? { return Ok(None) }
+        control.call_method0("freeze_decision")?;
+        let (elements, stamp) = super::service::scan_op(py, &self.scanner, |scanner| {
+            Ok((scanner.mapping.clone(), scanner.dext_navigation_stamp()?))
+        }).map_err(|error| match error {
+            ActErr::Py(error) => error,
+            ActErr::Msg(message) => pyo3::exceptions::PyValueError::new_err(message),
+        })?;
+        control.call_method1("observe_native", (pythonize::pythonize(py, &elements)?, pythonize::pythonize(py, &stamp)?))?;
+        let request = control.call_method0("learning_intervention")?;
+        if request.is_none() { Ok(None) } else { pythonize::depythonize(&request).map(Some).map_err(Into::into) }
+    }
+
     fn request_dext_navigation(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
         let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
         let Some(control) = control else {

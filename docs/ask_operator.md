@@ -5,6 +5,8 @@ Date: 2026-11-13. Branch: `feat/dext-live-navigation-learning`.
 The browser lifetime correction and current validation results are documented in
 [Operator browser handoff](ask_operator_browser_handoff.md). The initial
 validation record below is historical; its original cleanup behavior is superseded.
+The ordinary-chat interface, contextual replies and Markdown learning integration
+are described in [PR5 conversational assistance](pr5_conversational_operator.md).
 
 ## Architecture and state machine
 
@@ -67,12 +69,15 @@ bounded `incomplete` outcome; that termination is not an operator continuation.
 
 ## Trusted UI and privacy
 
-The existing chat displays the exact validated request/category, paused state,
-non-sensitive answer field for questions, Resume, Cancel and revalidation errors.
+The existing chat displays the validated request as an assistant reply and a
+subtle paused indicator. The ordinary composer routes contextual replies to the
+trusted broker. It also handles exact procedure review separately from assistance;
+advanced technical review remains optional.
 Authentication requests use fixed private-intervention wording and accept no text.
 Manual/confirmation/blocked events accept only completion, never textual secrets.
-Question answers require explicit non-sensitive attestation, size limits and
-defensive secret-pattern rejection. This is not a general DLP classifier: an
+The composer instructs the operator to send only non-sensitive answers; the host
+requires the UI's non-sensitive assertion, size limits and defensive secret-pattern
+rejection. This is not a general DLP classifier: an
 operator must not submit obfuscated secrets or private credentials. Approved
 non-sensitive informational answers enter the ordinary task/history/model context.
 
