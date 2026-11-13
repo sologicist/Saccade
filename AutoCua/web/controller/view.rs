@@ -256,10 +256,12 @@ impl ControllerView {
         });
         match checked {
             Ok(()) => Ok(None),
-            Err(ActErr::Msg(message)) => Ok(Some(json!({
-                "status": "error", "tool": tool, "message": message,
-                "operator_review_required": true,
-            }))),
+            Err(ActErr::Msg(message)) => {
+                let undispatched = message == crate::platform_scope::APPROVAL_UNAVAILABLE;
+                Ok(Some(json!({"status":"error", "tool":tool, "message":message,
+                    "code": if undispatched { "unsupported_navigation" } else { "platform_scope_mismatch" },
+                    "executed": if undispatched { Some(false) } else { None }, "operator_review_required":true})))
+            },
             Err(ActErr::Py(error)) => Err(error),
         }
     }
@@ -826,11 +828,16 @@ mod platform_tests {
             for kind in ["click", "hold_click", "input", "vault", "keyboard", "scroll", "dialog",
                          "run_script", "more", "index", "navigate_tab", "close_tab", "download", "call_function", "unknown"] {
                 let fixture = Fixture::new();
+                fixture.scanner.lock().unwrap().business_test_observations = Some(std::collections::VecDeque::from(vec![json!({
+                    "schema_version":1, "observer_id":"synthetic-observer", "failure":"", "overflow":false,
+                    "downloads_denied":true, "tabs":[{"id":"1", "url":"https://app.dext.com/login"}], "events":[]
+                }); 8]));
                 let result = fixture.view.route_action(py, &json!({"type": kind, "id": 1, "value": "synthetic"})).unwrap();
                 assert_eq!(result["status"], "error", "{kind}: {result}");
                 assert_eq!(result["tool"], kind);
                 assert_eq!(result["operator_review_required"], true);
-                assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+                assert!(fixture.scanner.lock().unwrap().platform_violation().is_none());
+                if result["code"] == "unsupported_navigation" { assert_eq!(result["executed"], false); }
             }
         });
     }

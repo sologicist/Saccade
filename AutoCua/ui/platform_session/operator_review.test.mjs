@@ -123,3 +123,20 @@ test('the same operator continuation restores a second installed platform', () =
     assert.equal(payload.session_id, 'portal-chat');
     assert.equal(restored.bound, true);
 });
+
+test('a hard ownership failure offers cancellation without dispatching a replacement run', async () => {
+    const ui = operatorTransport({ recovery: 'cancel_restart', diagnostic_code: 'chrome_pipe_disconnected' });
+    const original = ui.options.fetch;
+    ui.options.fetch = async (url, init) => init ? { ok: false, json: async () => ({ error: 'continuation_checkpoint_unavailable' }) } : original(url, init);
+    await assert.rejects(submitOperatorChat('Continue', 'chat', ui.options), /Send Cancel/);
+    assert.equal(ui.resumed.length, 0);
+    assert.ok(ui.calls.every(call => !call.url.includes('start-agent')));
+});
+
+test('an intentional wait accepts new instructions through the same broker', async () => {
+    const ui = operatorTransport({ request: { category: 'question', reason: 'awaiting_instructions', request: 'What next?' } });
+    await submitOperatorChat('Describe the public page.', 'chat', ui.options);
+    assert.equal(ui.resumed[0].task, 'Describe the public page.');
+    assert.equal(ui.resumed[0].session_id, 'chat');
+    assert.ok(ui.calls.every(call => call.url.includes('/api/operator?')));
+});

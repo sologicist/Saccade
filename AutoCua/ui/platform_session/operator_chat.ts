@@ -6,6 +6,7 @@ export interface PendingOperator {
     chat_message?: string; error?: string; procedure_summary?: string; procedure_diff?: string;
     presentation_digest?: string;
     procedure_label?: string;
+    recovery?: 'cancel_restart'; diagnostic_code?: string;
 }
 
 export function samePresentation(a: PendingOperator | null, b: PendingOperator): boolean {
@@ -64,7 +65,7 @@ export async function submitOperatorChat(text: string, session: string, options:
             revision: pending.revision, token: pending.token, action: 'chat', answer: text,
             non_sensitive: true, presentation_digest: pending.presentation_digest || null }) });
     const value = await result.json();
-    if (!result.ok) throw new Error('This reply could not be matched safely. Review the current assistant question and try again.');
+    if (!result.ok) throw new Error(pending.recovery === 'cancel_restart' ? 'This session cannot resume safely. Send Cancel, then start a new conversation after reviewing the browser.' : 'This reply could not be matched safely. Review the current assistant question and try again.');
     if (options.currentSession() !== session) return true;
     if (value.status === 'started') {
         options.update(null);

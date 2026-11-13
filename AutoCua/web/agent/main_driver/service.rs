@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError, PyValueError};
@@ -402,6 +403,7 @@ struct RunState {
 
 #[pyclass(frozen)]
 pub struct AgentService {
+    observed_run: AtomicBool,
     // Shared across continuation wrappers that borrow the same browser.
     active_run: Arc<Mutex<()>>,
     platform_context: Option<Py<PyAny>>,
@@ -454,7 +456,8 @@ struct ScopedSurfaceGuard<'a, 'py> {
 impl Drop for ScopedSurfaceGuard<'_, '_> {
     fn drop(&mut self) {
         if let Err(error) = self.scanner.locked(self.py, |scanner| scanner.end_platform_scope()) {
-            eprintln!("Platform cleanup requires operator review: {error}");
+            let _ = error;
+            eprintln!("operator_lifecycle: observation_failed during scope cleanup");
         }
     }
 }
@@ -468,6 +471,34 @@ impl Drop for AgentService {
 }
 
 impl AgentService {
+    /// The constructor and regression tests share this exact native reclaim
+    /// boundary. No new scanner connection, lease or browser is created here.
+    fn reclaim_scanner(&self, py: Python<'_>, lease: &Bound<'_, PyAny>, context: &Option<Py<PyAny>>,
+        browser_profile: Option<&str>, headless: bool) -> PyResult<Arc<Mutex<crate::browser::ScannerInner>>> {
+            if self.owns_profile_lease || !self.profile_lease.bind(py).is(lease) {
+                return Err(PyValueError::new_err("operator_resume:profile_lease_lost"));
+            }
+            py.import("AutoCua.saccade.profile_lease")?.call_method1("validate_web_profile_lease", (lease, browser_profile))
+                .map_err(|_| PyValueError::new_err("operator_resume:profile_lease_lost"))?;
+            let same_context = match (&self.platform_context, context) {
+                (Some(a), Some(b)) => a.bind(py).eq(b.bind(py))?, (None, None) => true, _ => false,
+            };
+            if self.profile_name.as_deref() != browser_profile || !same_context || self.headless != headless {
+                return Err(PyValueError::new_err("operator_resume:foreign_browser_ownership"));
+            }
+            let inner = self.scanner.get().inner.clone();
+            {
+                let held = inner.lock().map_err(|_| PyValueError::new_err("operator_resume:native_checkpoint_invalid"))?;
+                if held.platform_violation().is_some() {
+                    return Err(PyValueError::new_err("operator_resume:platform_scope_mismatch"));
+                }
+                if !held.operator_handoff {
+                    return Err(PyValueError::new_err("operator_resume:native_checkpoint_invalid"));
+                }
+            }
+        Ok(inner)
+    }
+
     fn platform_violation(&self) -> Option<String> {
         self.scanner.get().inner.lock().ok().and_then(|scanner| scanner.platform_violation())
     }
@@ -899,7 +930,14 @@ impl AgentService {
         // Keep the shared owner locked throughout construction, including scope
         // installation and fresh controller creation, not only scanner borrowing.
         let _continuation_guard = continuation_owner.as_ref().map(|owner| owner.try_lock()
-            .map_err(|_| PyValueError::new_err("Suspended browser still has an active execution owner."))).transpose()?;
+            .map_err(|_| PyValueError::new_err("operator_resume:foreign_browser_ownership"))).transpose()?;
+        if continuation_owner.is_some() {
+            let history: Value = prior_history.as_ref().map(pythonize::depythonize).transpose()?.unwrap_or(Value::Null);
+            let paired = history.get("assistant_messages").and_then(Value::as_array)
+                .zip(history.get("tool_responses").and_then(Value::as_array))
+                .is_some_and(|(messages, results)| !messages.is_empty() && messages.len() == results.len());
+            if !paired { return Err(PyValueError::new_err("operator_resume:paired_history_mismatch")); }
+        }
         let agent_dir = crate::agent_dir(py)?;
 
         // Parallel runs hand each agent a session id (scopes the shared
@@ -967,27 +1005,11 @@ impl AgentService {
         let headless_flag = headless;
         let browser_dir = crate::browser_dir(py)?;
         // Chrome itself, installed now if it is missing (utils/chrome.py).
-        crate::ensure_chrome(py);
+        if continuation_owner.is_none() { crate::ensure_chrome(py); }
         let active_run = continuation_owner.clone().unwrap_or_else(|| Arc::new(Mutex::new(())));
         let scanner = if let Some(retained) = operator_session.as_ref().filter(|s| !s.is_none()) {
             let previous: PyRef<'_, AgentService> = retained.extract()?;
-            if previous.owns_profile_lease || !previous.profile_lease.bind(py).is(&lease) {
-                return Err(PyValueError::new_err("Continuation must retain the exact browser profile lease."));
-            }
-            previous.profile_lease.bind(py).call_method0("ensure_held")?;
-            let same_context = match (&previous.platform_context, &context) {
-                (Some(a), Some(b)) => a.bind(py).eq(b.bind(py))?, (None, None) => true, _ => false,
-            };
-            if previous.profile_name != browser_profile || !same_context || previous.headless != headless_flag {
-                return Err(PyValueError::new_err("Suspended browser context does not match this continuation."));
-            }
-            let inner = previous.scanner.get().inner.clone();
-            {
-                let held = inner.lock().map_err(|_| PyValueError::new_err("Suspended browser state unavailable."))?;
-                if !held.operator_handoff || held.platform_violation().is_some() {
-                    return Err(PyValueError::new_err("Suspended browser is not available for verified reattachment; cancel and restart after operator review."));
-                }
-            }
+            let inner = previous.reclaim_scanner(py, &lease, &context, browser_profile.as_deref(), headless_flag)?;
             let mut scanner = BrowserScanner::create(&browser_dir, 0, frontend_callback, None, single_tab);
             scanner.inner = inner;
             Py::new(py, scanner)?
@@ -1111,7 +1133,7 @@ impl AgentService {
         if system_prompt.contains(OS_PLACEHOLDER) {
             system_prompt = system_prompt.replace(OS_PLACEHOLDER, current_os());
         }
-        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If platform target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect.\n");
+        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If platform target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect. After an operator claims login is complete, reobserve the same browser; the claim is not authentication proof. If the requested authenticated state is not observable, ask a focused question before acting. When the task asks you to reach a page and wait, call ask_operator with category question and reason awaiting_instructions; stop model requests and retain the browser. Never search unrelated websites for internal bank or scribe functions; use only the trusted registered business capabilities.\n");
         if single_tab {
             // Overrides the base prompt's tab guidance without editing the
             // file: this agent has no tab tools and must never plan around
@@ -1207,6 +1229,7 @@ impl AgentService {
         )?;
 
         let service = AgentService {
+            observed_run: AtomicBool::new(false),
             active_run,
             platform_context: context,
             context_provider: provider.clone(),
@@ -1294,7 +1317,11 @@ impl AgentService {
         let _active_run = self.active_run.try_lock().map_err(|_| {
             PyValueError::new_err("Chrome profile is busy with another active run on this agent instance.")
         })?;
-        self.profile_lease.bind(py).call_method0("ensure_held")?;
+        self.observed_run.store(false, Ordering::Relaxed);
+        if self.platform_context.is_some() {
+            py.import("AutoCua.saccade.profile_lease")?.call_method1("validate_web_profile_lease", (self.profile_lease.bind(py), self.profile_name.as_deref()))
+                .map_err(|_| PyValueError::new_err("operator_resume:profile_lease_lost"))?;
+        } else { self.profile_lease.bind(py).call_method0("ensure_held")?; }
         let _run_lease = OwnedLeaseGuard {
             lease: self.profile_lease.bind(py).clone(), release: self.owns_profile_lease,
         };
@@ -1526,11 +1553,14 @@ impl AgentService {
                         return Err(e);
                     }
                     let msg = py_err_str(py, &e);
-                    println!("Error processing request: {msg}");
+                    if self.platform_context.is_some() { eprintln!("operator_lifecycle: internal_exception during scoped execution"); }
+                    else { println!("Error processing request: {msg}"); }
                     final_status = if self.platform_violation().is_some() { "waiting_operator" } else { "error" }.into();
                     final_message = format!("could not read the page: {msg}");
                     break;
                 }
+
+                self.observed_run.store(true, Ordering::Relaxed);
 
                 // Check Stop AFTER Scan
                 if self.stop_set(py)? {
@@ -1769,7 +1799,8 @@ impl AgentService {
                         return Err(e);
                     }
                     let msg = py_err_str(py, &e);
-                    println!("Error processing request: {msg}");
+                    if self.platform_context.is_some() { eprintln!("operator_lifecycle: internal_exception during scoped execution"); }
+                    else { println!("Error processing request: {msg}"); }
                     // Same pairing guarantee for a failure ANYWHERE in the
                     // step (the NameError guard in Python = ctx presence here).
                     if let Some(ctx) = &step_ctx {
@@ -1827,6 +1858,20 @@ impl AgentService {
     fn close_operator_session(&self, py: Python<'_>) -> PyResult<()> {
         let _inactive = self.active_run.try_lock().map_err(|_| PyValueError::new_err("Cannot close an executing operator session."))?;
         self.scanner.get().locked(py, |scanner| scanner.close_operator_handoff())
+    }
+
+    #[getter]
+    fn operator_resume_observed(&self) -> bool { self.observed_run.load(Ordering::Relaxed) }
+
+    #[getter]
+    fn operator_diagnostic_code(&self) -> Option<String> {
+        self.platform_violation().map(|message| {
+            for code in ["browser_process_unavailable", "chrome_pipe_disconnected", "unverified_external_effect"] {
+                if message.contains(&format!("operator_resume:{code}")) { return code.to_string(); }
+            }
+            if message.contains("observation") || message.contains("observer") { "observation_failed".into() }
+            else { "platform_scope_mismatch".into() }
+        })
     }
 
     #[getter]
@@ -2151,7 +2196,8 @@ impl AgentService {
                 *final_message = blocked_intervention("Repeated reasoning without observed environmental progress. Operator information or intervention is required.");
                 return Ok(Flow::Break);
             }
-            println!("{}", view::format_response_impl(&display_payload, true));
+            if self.platform_context.is_none() { println!("{}", view::format_response_impl(&display_payload, true)); }
+            else { println!("operator_lifecycle: scoped reasoning received"); }
             if let Some(cb) = &self.text_callback {
                 cb.call1(py, (view::format_response_impl(&display_payload, false),))?;
             }
@@ -2321,10 +2367,9 @@ impl AgentService {
 
         if !rejects.is_empty() {
             for r in &rejects {
-                println!(
-                    "invalid tool call '{}' - error returned to the model",
-                    py_str_of_value(&r["name"])
-                );
+                if self.platform_context.is_none() {
+                    println!("invalid tool call '{}' - error returned to the model", py_str_of_value(&r["name"]));
+                } else { eprintln!("operator_lifecycle: invalid scoped tool call"); }
             }
             if actions_val.is_empty() {
                 // Nothing valid to route — counts as the SAME strike.
@@ -2389,6 +2434,9 @@ impl AgentService {
                 *final_message = if rows.iter().any(|row| row["tool"] == "dext_navigation") {
                     json!({"category":"manual_action", "reason":"manual_intervention",
                         "request":"Please open the requested section manually in the dedicated Chrome window, then tell me when it is done. Automatic Dext navigation needs verified control and frame semantics, which are not available yet."}).to_string()
+                } else if rows.iter().any(|row| row["code"] == "unsupported_navigation") {
+                    json!({"category":"manual_action", "reason":"manual_intervention",
+                        "request":"I did not execute the requested action. Please perform the navigation manually in the dedicated Chrome window, then confirm when it is complete. Automatic execution requires verified target, frame and effect semantics; a visible label alone is insufficient."}).to_string()
                 } else { blocked_intervention("An action failed or requires independent review. Reconcile its effects before resuming; permissions remain unchanged.") };
                 return Ok(Flow::Break);
             }
@@ -2435,7 +2483,8 @@ impl AgentService {
                     .get("summary")
                     .map(py_str_of_value)
                     .unwrap_or_else(|| "Task completed".to_string());
-                println!("\nTask Complete: {summary}");
+                if self.platform_context.is_none() { println!("\nTask Complete: {summary}"); }
+                else { println!("operator_lifecycle: scoped task completed"); }
                 println!("Agent has finished all tasks. Exiting loop.");
                 *final_status = "success".into();
                 *final_message = summary;
@@ -2557,7 +2606,8 @@ impl AgentService {
                 let msg = failed.or_else(|| action_result.get("message").map(py_str_of_value)).unwrap_or_else(|| {
                     format!("no message in the result: {}", action_result.to_string().chars().take(300).collect::<String>())
                 });
-                println!("Action result: {msg}");
+                if self.platform_context.is_none() { println!("Action result: {msg}"); }
+                else { eprintln!("operator_lifecycle: scoped action requires review"); }
             }
 
             *is_first_iteration = false;
@@ -2571,7 +2621,8 @@ impl AgentService {
                     return Err(e); // BaseException — fly past both handlers
                 }
                 let msg = py_err_str(py, &e);
-                println!("Error processing action: {msg}");
+                if self.platform_context.is_none() { println!("Error processing action: {msg}"); }
+                else { eprintln!("operator_lifecycle: internal_exception during scoped action"); }
                 // The step died mid-flight: record the error against every
                 // call so the saved chat never carries a dangling tool call.
                 close_pairing(tr, &calls, &note_results, &reject_results, &format!("error: {msg}"))?;
@@ -2777,7 +2828,10 @@ def loop_business_factory(context):
 business_module.BusinessRun = loop_business_factory
 full_loop = True
 chat_results = []
-fake_lease = types.SimpleNamespace(ensure_held=lambda:None, release=lambda:None)
+from AutoCua.saccade import profile_lease as lease_module
+original_lease_root = lease_module.data_root
+lease_module.data_root = lambda: fixture.root / 'lease-data'
+fake_lease = lease_module.acquire_web_profile('saccade-dext')
 compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *args:None,
     maybe_trigger=lambda *args:None, finish_run=lambda:None)
 "#).unwrap(), Some(&locals), None).unwrap();
@@ -2785,6 +2839,7 @@ compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *arg
             browser.inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 128]));
             let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root).join("full-loop"), None, false, browser.inner.clone(), None).unwrap();
             let mut service = AgentService {
+                observed_run: AtomicBool::new(false),
                 active_run: Arc::new(Mutex::new(())), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
                 context_provider: "openai".into(), context_model: "synthetic".into(), profile_name: Some("saccade-dext".into()),
                 profile_lease: locals.get_item("fake_lease").unwrap().unwrap().unbind(), owns_profile_lease: false,
@@ -2894,13 +2949,22 @@ operator_thread.start()
             assert_eq!(outcome["status"], "waiting_operator");
             assert!(outcome["message"].as_str().unwrap().contains("missing_information"));
             assert!(service.scanner.get().inner.lock().unwrap().operator_handoff);
+            let same = service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), service.headless).unwrap();
+            assert!(Arc::ptr_eq(&same, &service.scanner.get().inner));
+            let denied = service.controller.route_action(py, &json!({"type":"click","id":1,"times":1})).unwrap();
+            assert_eq!(denied["code"], "unsupported_navigation");
+            assert_eq!(denied["executed"], false);
+            assert!(service.platform_violation().is_none());
+            assert!(service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), service.headless).is_ok());
             // The retained execution owner cannot be resumed or closed by a
             // competing wrapper while its shared run guard is held.
             {
                 let shared_owner = service.active_run.clone();
                 let _running = shared_owner.lock().unwrap();
                 assert!(service.close_operator_session(py).is_err());
+                let observed = service.operator_resume_observed();
                 assert!(service.process_request(py, PyString::new(py, "Competing continuation").into_any()).is_err());
+                assert_eq!(service.operator_resume_observed(), observed);
             }
             let state = service.state.lock().unwrap();
             let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
@@ -2962,6 +3026,8 @@ session_context._registered_vision_model = lambda provider, model: True
 os.environ['AutoCua_WEB_DIR'] = str(fixture.root / 'native-web')
 (loop_domain / 'skills.json').write_text(__import__('json').dumps({'app.dext.com':'dext.md', HOST: PLATFORM + '.md'}), encoding='utf-8')
 (loop_domain / (PLATFORM + '.md')).write_text(BASELINE, encoding='utf-8')
+fake_lease.release()
+portal_lease = lease_module.acquire_web_profile(other_context['browser_profile'])
 portal = PlatformLearningControl(other_context, 'portal-approval', project_root=fixture.root, conversational=True)
 p = portal.store.propose_steps(portal.store.adapter.steps(['billing_page']), portal.run_id)
 portal.store.review(p['proposal_id'], p['base_revision'], p['candidate_revision'], True)
@@ -2974,6 +3040,7 @@ before_portal = provider_calls
             let portal_context = locals.get_item("other_context").unwrap().unwrap();
             service.platform_context = Some(portal_context.clone().unbind());
             service.profile_name = Some("saccade-synthetic_portal".into());
+            service.profile_lease = locals.get_item("portal_lease").unwrap().unwrap().unbind();
             service.controller.configure_learning_control(py, Some(&locals.get_item("portal").unwrap().unwrap()), Some(&portal_context)).unwrap();
             service.scanner.get().inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://portal.example.test/login"); 128]));
             let outcome = service.process_request(py, PyString::new(py, "Open the synthetic Billing section.").into_any()).unwrap();
@@ -2994,9 +3061,89 @@ before_portal = provider_calls
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "waiting_operator");
             assert!(outcome["message"].as_str().unwrap().contains("Settings"));
+            let retained = service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), false).unwrap();
+            assert!(Arc::ptr_eq(&retained, &service.scanner.get().inner));
+            let history = PyDict::new(py);
+            {
+                let state = service.state.lock().unwrap();
+                history.set_item("assistant_messages", state.assistant_messages.bind(py)).unwrap();
+                history.set_item("tool_responses", state.tool_responses.bind(py)).unwrap();
+                history.set_item("task", "Open the synthetic Billing section and wait.").unwrap();
+            }
+            service.prior_history = Some(history.into_any().unbind());
+            py.run(&CString::new("assert provider_calls == before_portal_pause\nportal.close()\nold_event = threading.Event(); old_event.set()\nfresh_event = threading.Event()\nportal_resumed = PlatformLearningControl(other_context, 'portal-native-chat', project_root=fixture.root, stop_event=fresh_event, conversational=True)\nforced_tool_name = 'ask_operator'\nforced_action = {'category':'question','reason':'awaiting_instructions','request':'I have reached the requested page and stopped. What would you like me to do next?'}\nbefore_portal_resume = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            service.stop_event = Some(locals.get_item("fresh_event").unwrap().unwrap().unbind());
+            service.controller.configure_learning_control(py, Some(&locals.get_item("portal_resumed").unwrap().unwrap()), Some(&portal_context)).unwrap();
+            let result = service.process_request(py, PyString::new(py, "Operator claims login is complete; reobserve before continuing the same task.").into_any()).unwrap();
+            let result: Value = pythonize::depythonize(result.bind(py)).unwrap();
+            assert_eq!(result["status"], "waiting_operator");
+            assert!(result["message"].as_str().unwrap().contains("awaiting_instructions"));
+            assert!(service.operator_resume_observed());
+            assert!(service.operator_handoff_available());
+            assert!(Arc::ptr_eq(&retained, &service.scanner.get().inner));
+            let owner = Py::new(py, service).unwrap();
+            locals.set_item("native_owner", owner.bind(py)).unwrap();
+            locals.set_item("NativeAgentClass", py.get_type::<AgentService>()).unwrap();
             py.run(&CString::new(r#"
-assert provider_calls == before_portal_pause
+assert provider_calls == before_portal_resume + 1
+assert old_event.is_set() and not fresh_event.is_set()
+# Exercise the actual compiled constructor's retained-owner path, with only
+# provider/compression and browser observation boundaries replaced.
+from pathlib import Path
+prompt_dir = fixture.root / 'native-web/agent/main_driver'
+prompt_dir.mkdir(parents=True, exist_ok=True)
+(prompt_dir / 'system_prompt.md').write_text('Synthetic supervised continuation. Ask before effects.', encoding='utf-8')
+old_native_module = sys.modules.get('AutoCua.web.agent_native')
+old_compression_module = sys.modules.get('AutoCua.memory_compression.controller')
+native_stub = types.ModuleType('AutoCua.web.agent_native')
+native_stub.compression_dump = lambda *args: None
+native_stub.compression_entry = lambda *args: None
+compression_stub = types.ModuleType('AutoCua.memory_compression.controller')
+compression_stub.CompressionController = lambda *args, **kwargs: compression
+sys.modules[native_stub.__name__] = native_stub
+sys.modules[compression_stub.__name__] = compression_stub
+fresh_event.set()
+resume_event = threading.Event()
+portal_constructor_control = PlatformLearningControl(other_context, 'portal-native-chat', project_root=fixture.root, stop_event=resume_event, conversational=True)
+kwargs = dict(provider='openai', model='synthetic', speed='quality', platform_context=other_context,
+    browser_profile=other_context['browser_profile'], profile_lease=portal_lease, operator_session=native_owner,
+    stop_event=resume_event, learning_control=portal_constructor_control,
+    prior_history={'task':'Open Billing and wait.', 'assistant_messages':native_owner.assistant_messages,
+                   'tool_responses':native_owner.tool_responses})
+try:
+    NativeAgentClass(**{**kwargs, 'prior_history':{'assistant_messages':['unpaired'],'tool_responses':[]}})
+except ValueError as error:
+    assert str(error) == 'operator_resume:paired_history_mismatch'
+else:
+    raise AssertionError('Unpaired checkpoint was accepted')
+constructor_resumed = NativeAgentClass(**kwargs)
+assert provider_calls == before_portal_resume + 1
+"#).unwrap(), Some(&locals), None).unwrap();
+            {
+                let resumed = locals.get_item("constructor_resumed").unwrap().unwrap();
+                let resumed: PyRef<'_, AgentService> = resumed.extract().unwrap();
+                assert!(Arc::ptr_eq(&retained, &resumed.scanner.get().inner));
+                assert!(Arc::ptr_eq(&owner.borrow(py).active_run, &resumed.active_run));
+            }
+            py.run(&CString::new(r#"
+before_constructed_run = provider_calls
+forced_tool_name = 'ask_operator'
+forced_action = {'category':'question','reason':'awaiting_instructions','request':'I have reached the requested page and stopped. What would you like me to do next?'}
+constructed_result = constructor_resumed.process_request('Operator claims login is complete; continue the original task after reobservation.')
+assert constructed_result['status'] == 'waiting_operator'
+assert 'awaiting_instructions' in constructed_result['message']
+assert constructor_resumed.operator_resume_observed
+assert constructor_resumed.operator_handoff_available
+assert provider_calls == before_constructed_run + 1
+assert fresh_event.is_set() and not resume_event.is_set()
+portal_constructor_control.close()
+for name, old in [('AutoCua.web.agent_native', old_native_module), ('AutoCua.memory_compression.controller', old_compression_module)]:
+    sys.modules.pop(name, None)
+    if old is not None: sys.modules[name] = old
+portal_resumed.close()
 portal.close()
+portal_lease.release()
+lease_module.data_root = original_lease_root
 platform_config.PROJECT_ROOT = original_project_root
 session_context._registered_vision_model = original_vision_check
 if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)

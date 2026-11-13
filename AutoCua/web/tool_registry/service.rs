@@ -359,7 +359,7 @@ fn main_tools(track: &[(String, String)], notes: Option<&Value>) -> Vec<Value> {
 /// tool this crate offers a model is still in this one file.
 pub fn ask_operator_tool() -> Value {
     tool("ask_operator", &[("category", json!({"type":"string","enum":["question","manual_action","authentication","confirmation","blocked"]})),
-        ("reason", json!({"type":"string","enum":["missing_information","manual_intervention","authentication_required","condition_confirmation","unsafe_or_blocked","no_progress"]})),
+        ("reason", json!({"type":"string","enum":["missing_information","manual_intervention","authentication_required","condition_confirmation","unsafe_or_blocked","no_progress","awaiting_instructions"]})),
         ("request", json!({"type":"string","minLength":1,"maxLength":1000}))],
         "Suspend immediately for the operator. No further model calls while paused. Ask a non-sensitive question or request private manual intervention. Never request passwords, MFA codes, API keys or secrets in chat. No answer grants permissions. Use immediately for a known human-only blocker.", &[])
 }

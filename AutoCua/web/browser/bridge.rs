@@ -578,6 +578,8 @@ pub struct Bridge {
     launched: Option<(Option<PathBuf>, bool, Vec<String>)>,
     #[cfg(windows)]
     scoped_download_transport: Option<crate::chrome_pipe::ChromePipeTransport>,
+    #[cfg(windows)]
+    scoped_process: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl Drop for Bridge {
@@ -623,6 +625,8 @@ impl Bridge {
             launched: None,
             #[cfg(windows)]
             scoped_download_transport: None,
+            #[cfg(windows)]
+            scoped_process: None,
         })
     }
 
@@ -662,15 +666,22 @@ impl Bridge {
     /// Require a fresh browser-level acknowledgment before scoped work.
     #[cfg(windows)]
     pub fn ensure_scoped_downloads_denied(&mut self) -> SResult<()> {
+        if let Some(process) = &self.scoped_process {
+            use std::os::windows::io::AsRawHandle;
+            let state = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle() as _, 0) };
+            if state != 258 { // WAIT_TIMEOUT means this exact retained process is live.
+                return Err(ScanErr::s("operator_resume:browser_process_unavailable"));
+            }
+        }
         let transport = self.scoped_download_transport.as_mut()
             .ok_or_else(|| ScanErr::s(
-                "The scoped Chrome CDP connection is unavailable."
+                "operator_resume:chrome_pipe_disconnected"
             ))?;
 
         transport.set_downloads_denied(true)
-            .map_err(|error| ScanErr::s(format!(
-                "Browser-level download denial is not verified: {error}"
-            )))
+            .map_err(|error| ScanErr::s(if error == "scoped_download_attempt_observed" {
+                "operator_resume:unverified_external_effect"
+            } else { "operator_resume:chrome_pipe_disconnected" }))
     }
 
     #[cfg(windows)]
@@ -689,6 +700,7 @@ impl Bridge {
 
         // Close the private CDP channel after successful restoration.
         self.scoped_download_transport = None;
+        self.scoped_process = None;
 
         Ok(())
     }
@@ -697,8 +709,24 @@ impl Bridge {
     /// a manual handoff must retain the same browser-level connection.
     #[cfg(windows)]
     pub fn close_operator_transport(&mut self) -> SResult<()> {
+        if self.close_exited_owned_process() { return Ok(()); }
         if self.scoped_download_transport.is_some() { self.finish_scoped_download_session()?; }
         Ok(())
+    }
+
+    /// Terminal cancellation may release a session whose exact retained process
+    /// object has exited. A missing handle or failed wait is never death proof.
+    #[cfg(windows)]
+    pub fn close_exited_owned_process(&mut self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        let exited = self.scoped_process.as_ref().is_some_and(|process| unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle() as _, 0) == 0
+        });
+        if exited {
+            self.scoped_download_transport = None;
+            self.scoped_process = None;
+        }
+        exited
     }
 
 
@@ -718,7 +746,12 @@ impl Bridge {
                 "Could not create private Chrome pipes: {error}"
             )))?;
 
-        launch_chrome_with_pipes(profile, &pipes)?;
+        let pid = launch_chrome_with_pipes(profile, &pipes)?;
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+        let process = unsafe { windows_sys::Win32::System::Threading::OpenProcess(0x0010_0000, 0, pid) };
+        if process == 0 { return Err(ScanErr::s("operator_resume:browser_process_unavailable")); }
+        // Keep the exact process object, avoiding PID reuse during a pause.
+        self.scoped_process = Some(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(process as RawHandle) });
 
         // Retain the parent pipe ends for the entire scoped session.
         self.scoped_download_transport = Some(
@@ -1232,17 +1265,21 @@ mod scoped_profile_tests {
     #[cfg(windows)]
     #[test]
     fn operator_handoff_retains_private_pipe_and_revalidates_the_same_page() {
-        operator_handoff_case(true);
+        // This test now enters Python through the normal tab controller; do
+        // not overlap the native-loop fixture's process-wide module patches.
+        let _runtime = crate::controller::skills::service::STATE_TEST.lock().unwrap();
+        for platform in ["dext", "synthetic_portal"] { operator_handoff_case(true, platform); }
     }
 
     #[cfg(windows)]
     #[test]
     fn failed_operator_reattachment_retains_pipe_until_explicit_cleanup() {
-        operator_handoff_case(false);
+        operator_handoff_case(false, "dext");
     }
 
     #[cfg(windows)]
-    fn operator_handoff_case(valid_page: bool) {
+    fn operator_handoff_case(valid_page: bool, platform: &str) {
+        let host = if platform == "dext" { "app.dext.com" } else { "portal.example.test" };
         Python::initialize();
         let fixture = Fixture::new();
         let mut bridge = fixture.bridge("operator-profile");
@@ -1259,7 +1296,7 @@ mod scoped_profile_tests {
             let (mut ws, _) = tungstenite::client(request, stream).unwrap();
             let mut observers = Vec::new();
             let kinds = if valid_page {
-                vec!["platform_scope_end", "release", "platform_scope_begin", "platform_scope_protect_tab", "platform_scope_observe", "activate", "platform_scope_end"]
+                vec!["platform_scope_end", "release", "platform_scope_begin", "platform_scope_protect_tab", "platform_scope_observe", "activate", "platform_scope_observe", "navigate", "platform_scope_observe", "platform_scope_end"]
             } else {
                 vec!["platform_scope_end", "release", "platform_scope_begin", "platform_scope_end"]
             };
@@ -1274,8 +1311,8 @@ mod scoped_profile_tests {
                     },
                     "platform_scope_begin" | "platform_scope_observe" => json!({
                         "schema_version":1,"observer_id":observer,
-                        "tabs": if valid_page { json!([{"id":7,"url":"https://app.dext.com/after-manual-auth","pendingUrl":""}]) }
-                            else { json!([{"id":7,"url":"https://app.dext.com/one"}, {"id":8,"url":"https://app.dext.com/two"}]) },
+                        "tabs": if valid_page { json!([{"id":7,"url":format!("https://{host}/after-manual-auth"),"pendingUrl":""}]) }
+                            else { json!([{"id":7,"url":format!("https://{host}/one")}, {"id":8,"url":format!("https://{host}/two")}]) },
                         "failure":"","events":[],"overflow":false
                     }),
                     "platform_scope_protect_tab" => {
@@ -1291,9 +1328,9 @@ mod scoped_profile_tests {
         let bridge = Arc::new(Mutex::new(bridge));
         let mut scanner = crate::browser::ScannerInner::new(&fixture.0, 0, None, false);
         scanner.set_bridge(bridge.clone());
-        let context = json!({"schema_version":1,"platform_id":"dext","execution_mode":"supervised",
-            "browser_profile":"saccade-dext","start_url":"https://app.dext.com/login",
-            "allowed_hosts":["app.dext.com"],"max_steps":45,"config_revision":"a".repeat(64)});
+        let context = json!({"schema_version":1,"platform_id":platform,"execution_mode":"supervised",
+            "browser_profile":format!("saccade-{platform}"),"start_url":format!("https://{host}/login"),
+            "allowed_hosts":[host],"max_steps":45,"config_revision":"a".repeat(64)});
         scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&context).unwrap());
         scanner.operator_handoff = true;
         assert!(scanner.end_platform_scope().is_ok());
@@ -1304,6 +1341,21 @@ mod scoped_profile_tests {
             assert!(scanner.initialize_platform_scope(true).is_ok());
             assert_eq!(scanner.current_target_id().ok().as_deref(), Some("7"));
             assert!(!scanner.operator_handoff);
+            // Pre-dispatch refusal is not browser compromise. Manual login and
+            // a denied click must leave this retained session resumable.
+            assert!(scanner.authorize_platform_action(&json!({"type":"click","id":1})).is_err());
+            assert!(scanner.platform_violation().is_none());
+            let action = json!({"type":"update_tab","value":format!("https://{host}/login")});
+            assert!(scanner.authorize_platform_action(&action).is_ok());
+            // Exercise the existing generic native tab handler, not a second
+            // navigator or a raw script/selector. Only fixed bootstrap is granted.
+            let shared = Arc::new(Mutex::new(scanner));
+            Python::attach(|py| {
+                let result = crate::controller::tab::service::update(py, &shared, &action["value"]).ok().expect("Generic tab navigation failed");
+                assert_eq!(result["status"], "success");
+            });
+            scanner = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+            assert!(scanner.check_platform_scope().is_ok());
         } else {
             assert!(scanner.initialize_platform_scope(true).is_err());
             assert!(scanner.platform_violation().unwrap().contains("exactly one authorized page"));
@@ -1315,7 +1367,46 @@ mod scoped_profile_tests {
         assert!(scanner.close_operator_handoff().is_ok());
         extension_peer.join().unwrap();
         let policies = policy_peer.join().unwrap();
-        assert_eq!(policies, if valid_page { vec!["deny", "deny", "deny", "default"] } else { vec!["deny", "deny", "default"] });
+        assert_eq!(policies, if valid_page { vec!["deny", "deny", "deny", "deny", "deny", "default"] } else { vec!["deny", "deny", "default"] });
+    }
+
+    #[test]
+    fn resume_preserves_the_known_target_without_guessing_among_allowed_tabs() {
+        let authorized = vec!["original".to_string(), "manual-login-tab".to_string()];
+        assert_eq!(crate::browser::ScannerInner::resume_target(Some("original"), &authorized).unwrap(), "original");
+        assert!(crate::browser::ScannerInner::resume_target(Some("missing"), &authorized).is_err());
+        assert!(crate::browser::ScannerInner::resume_target(None, &authorized).is_err());
+        assert!(crate::browser::ScannerInner::resume_target(Some("missing"), &["other".to_string()]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_owned_process_is_distinguished_from_a_disconnected_pipe() {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+        use std::os::windows::process::CommandExt;
+        let fixture = Fixture::new();
+        let mut bridge = fixture.bridge("dead-synthetic-process");
+        let mut child = std::process::Command::new("cmd.exe").args(["/C", "exit", "0"])
+            .creation_flags(0x08000000).spawn().unwrap();
+        let process = unsafe { windows_sys::Win32::System::Threading::OpenProcess(0x0010_0000, 0, child.id()) };
+        assert_ne!(process, 0);
+        bridge.scoped_process = Some(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(process as RawHandle) });
+        child.wait().unwrap();
+        let error = bridge.ensure_scoped_downloads_denied().err().unwrap();
+        assert!(matches!(error, ScanErr::Scanner(message) if message == "operator_resume:browser_process_unavailable"));
+        let retained_process = bridge.scoped_process.take();
+        let error = bridge.ensure_scoped_downloads_denied().err().unwrap();
+        assert!(matches!(error, ScanErr::Scanner(message) if message == "operator_resume:chrome_pipe_disconnected"));
+        bridge.scoped_process = retained_process;
+        let shared = Arc::new(Mutex::new(bridge));
+        let mut scanner = crate::browser::ScannerInner::new(&fixture.0, 0, None, false);
+        scanner.set_bridge(shared.clone());
+        scanner.operator_handoff = true;
+        // No websocket acknowledgment exists: exact process death is the only
+        // reason terminal cancellation can safely release this ownership.
+        assert!(scanner.close_operator_handoff().is_ok());
+        assert!(!scanner.operator_handoff);
+        assert!(shared.lock().unwrap().scoped_process.is_none());
     }
 
     #[cfg(windows)]

@@ -40,7 +40,7 @@ export function OperatorReview() {
     }, []);
     if (!pending || !['waiting_operator', 'resuming', 'pausing_operator'].includes(pending.state)) return null;
     return <section className="operator-assistance" aria-label="Assistant assistance" style={{ pointerEvents: 'auto', padding: '8px 12px', maxHeight: '35vh', overflow: 'auto' }}>
-        <small role="status">{pending.state === 'pausing_operator' ? 'Pause requested - correction not applied yet' : pending.state === 'resuming' ? 'Checking the browser before continuing...' : 'Paused - no model requests'}</small>
+        <small role="status">{pending.state === 'pausing_operator' ? 'Pause requested - correction not applied yet' : pending.state === 'resuming' ? 'Checking the browser before continuing...' : pending.request.reason === 'awaiting_instructions' ? 'Waiting for your instructions - no model requests' : 'Paused - no model requests'}</small>
         {pending.chat_message && <p>{pending.chat_message}</p>}
         {pending.procedure_summary && <>
             <p>I can remember this operator-assisted procedure for future sessions. Should I save it?</p>
@@ -49,6 +49,7 @@ export function OperatorReview() {
             <details><summary>What will change?</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_diff}</pre></details>
         </>}
         <p>Reply in the chat below. Send only non-sensitive information; never send passwords or authentication codes. You can say "Cancel" to stop.</p>
+        {pending.recovery === 'cancel_restart' && <p>Send "Cancel" to end this task. After browser cleanup is verified, start a new conversation. Resume will not open a replacement browser.</p>}
         {pending.error && <p role="alert">{pending.error}</p>}
         {error && <p role="alert">{error}</p>}
     </section>;

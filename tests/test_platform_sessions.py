@@ -273,6 +273,7 @@ class PlatformSessionAPI(SessionFixtures):
         self.created = []
         self.outcomes = []
         self.fail_reattachment = False
+        self.fail_runtime = False
         self.fail_cleanup = False
         self.scan = None
         self.provider_calls = 0
@@ -282,9 +283,10 @@ class PlatformSessionAPI(SessionFixtures):
         class FakeWebAgent:
             def __init__(self, **kwargs):
                 if test.fail_reattachment and kwargs.get('operator_session'):
-                    raise RuntimeError('Synthetic reattachment refused before model call.')
+                    raise ValueError('operator_resume:chrome_pipe_disconnected')
                 self.kwargs = kwargs
                 self.closed = False
+                self.operator_resume_observed = False
                 self.assistant_messages = ["Synthetic step"]
                 self.tool_responses = ["Synthetic result"]
                 test.created.append(self)
@@ -297,6 +299,9 @@ class PlatformSessionAPI(SessionFixtures):
                 if getattr(self.kwargs['stop_event'], 'operator_pause', False):
                     return {'status': 'waiting_operator', 'message': json.dumps({'category': 'question',
                         'reason': 'missing_information', 'request': 'Navigation is paused for correction.'})}
+                if test.fail_runtime:
+                    raise RuntimeError('PRIVATE SYNTHETIC https://example.test/?token=not-for-logs')
+                self.operator_resume_observed = True
                 control = self.kwargs.get('learning_control')
                 if test.scan is not None and control:
                     control.freeze_decision()
@@ -573,6 +578,76 @@ class PlatformSessionAPI(SessionFixtures):
         self.acquire('saccade-dext')
         self.assertEqual(self.respond_operator(sid, event).status_code, 409)
 
+    def test_authentication_claim_resumes_to_intentional_wait_on_both_platforms(self):
+        from tests.platform_learning_fixtures import install_synthetic, PLATFORM
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        install_synthetic(self.root)
+        for platform in ('dext', PLATFORM):
+            with self.subTest(platform=platform):
+                self.outcomes = [{'status':'waiting_operator','message':json.dumps({'category':'authentication',
+                    'reason':'authentication_required','request':'Please sign in privately in the dedicated Chrome window.'})}]
+                first = self.post(platform_id=platform, task='Open a harmless section and wait for instructions.')
+                self.assertEqual(first.status_code, 200, first.json)
+                self.finish_run()
+                sid = first.json['session_id']
+                self.clean_correction(sid)
+                previous = self.created[-1]
+                before = self.provider_calls
+                event = self.chat_event(sid, broker, "c'est connecté")
+                self.outcomes = [{'status':'waiting_operator','message':json.dumps({'category':'question',
+                    'reason':'awaiting_instructions','request':'I have reached the requested page and stopped. What would you like me to do next?'})}]
+                result = self.respond_operator(sid, event)
+                self.assertEqual(result.status_code, 200, result.json)
+                self.finish_run()
+                current = self.created[-1]
+                self.assertIs(current.kwargs['operator_session'], previous)
+                self.assertIs(current.kwargs['profile_lease'], previous.kwargs['profile_lease'])
+                self.assertIsNot(current.kwargs['stop_event'], previous.kwargs['stop_event'])
+                self.assertEqual(current.kwargs['platform_context'], previous.kwargs['platform_context'])
+                self.assertIn('wait for instructions', current.task)
+                self.assertIn('login is not verified', current.task)
+                self.assertEqual(len(current.kwargs['prior_history']['assistant_messages']), len(current.kwargs['prior_history']['tool_responses']))
+                self.assertEqual(self.provider_calls, before + 1)
+                self.assertEqual(broker.status(sid)['request']['reason'], 'awaiting_instructions')
+                for _ in range(3):
+                    self.client.get('/api/operator?session_id=' + sid, headers=self.headers, base_url=self.base_url)
+                self.assertEqual(self.provider_calls, before + 1)
+                self.assertFalse(previous.closed)
+                self.assertFalse(current.closed)
+                self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker, 'cancel')).status_code, 200)
+
+    def test_lost_operator_lease_is_not_reacquired_by_resume(self):
+        sid, previous, broker = self.pause_browser()
+        lease = previous.kwargs['profile_lease']
+        lease.release()
+        response = self.respond_operator(sid, self.chat_event(sid, broker, "c'est connecté"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(broker.status(sid)['diagnostic_code'], 'profile_lease_lost')
+        self.assertEqual(broker.status(sid)['recovery'], 'cancel_restart')
+        self.assertEqual(len(self.created), 1)
+        self.assertIsNone(lease._file)
+        self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker, 'cancel')).status_code, 200)
+
+    def test_runtime_failure_is_not_misreported_as_browser_reattachment_and_requires_cancel(self):
+        sid, previous, broker = self.pause_browser()
+        self.fail_runtime = True
+        self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, 'oui')).status_code, 200)
+        self.finish_run()
+        self.assertEqual(len(self.created), 2)
+        pending = broker.status(sid)
+        self.assertEqual(pending['recovery'], 'cancel_restart')
+        self.assertEqual(pending['diagnostic_code'], 'internal_exception')
+        diagnostics = self.client.get('/api/operator/diagnostics?session_id=' + sid, headers=self.headers, base_url=self.base_url)
+        self.assertEqual(diagnostics.status_code, 200)
+        self.assertIn({'code':'internal_exception','phase':'execution'}, [{k: r[k] for k in ('code','phase')} for r in diagnostics.json['events']])
+        self.assertNotIn('https://', diagnostics.get_data(as_text=True))
+        self.assertNotIn('PRIVATE', diagnostics.get_data(as_text=True))
+        for answer in ('oui', 'What information has changed?', 'Continue'):
+            self.assertEqual(self.respond_operator(sid, self.chat_event(sid, broker, answer)).status_code, 409)
+        self.assertEqual(len(self.created), 2)
+        self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
+        self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker, 'cancel')).status_code, 200)
+
     def test_failed_reattachment_keeps_browser_and_rotates_resume_token_without_fresh_launch(self):
         sid, previous, broker = self.pause_browser()
         event = self.operator_event(sid, broker)
@@ -584,6 +659,8 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertFalse(previous.closed)
         self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
         self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+        self.assertEqual(broker.status(sid)['diagnostic_code'], 'chrome_pipe_disconnected')
+        self.assertEqual(broker.status(sid)['recovery'], 'cancel_restart')
         self.assertNotEqual(broker.status(sid)['revision'], event['revision'])
         self.assertEqual(self.respond_operator(sid, event).status_code, 409)
         cancelled = self.respond_operator(sid, self.operator_event(sid, broker, 'cancel'))
@@ -631,7 +708,8 @@ class PlatformSessionAPI(SessionFixtures):
         }, {'category': 'manual_action', 'reason': 'manual_intervention', 'request': 'Review the environment.'})
         result = self.respond_operator(sid, self.operator_event(sid, broker))
         self.assertEqual(result.status_code, 400, result.json)
-        self.assertIn('fresh Chrome cannot replace', result.json['error'])
+        self.assertEqual(result.json['error'], 'operator_resume:native_checkpoint_invalid')
+        self.assertEqual(broker.status(sid)['recovery'], 'cancel_restart')
         self.assertEqual(len(self.created), 1)
         self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
 

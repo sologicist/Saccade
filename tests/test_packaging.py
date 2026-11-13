@@ -52,6 +52,7 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/dext_learning.py",
             "AutoCua/saccade/dext_control.py",
             "AutoCua/saccade/operator_requests.py",
+            "AutoCua/saccade/operator_diagnostics.py",
             "AutoCua/saccade/operator_language.py",
             "AutoCua/ui/platform_session/operator_chat.ts",
             "AutoCua/ui/platform_session/operator_resume.ts",

@@ -180,8 +180,15 @@ impl PlatformScope {
             "new_tab" | "update_tab" => {
                 // An exact hostname does not classify a GET/navigation as safe.
                 // Dext bootstrap uses its fixed installed start URL directly;
-                // model-selected URLs require the future verified adapter.
-                if self.platform_id == "dext" { return Err(APPROVAL_UNAVAILABLE.to_string()); }
+                // An explicit return of the existing tab to that exact installed
+                // bootstrap is the same trusted navigation contract, not a
+                // grant for arbitrary same-host URLs or new tabs.
+                if self.platform_id == "dext" {
+                    if kind == "update_tab" && action.get("value").and_then(Value::as_str) == Some(self.start_url.as_str()) {
+                        return self.validate_url(&self.start_url);
+                    }
+                    return Err(APPROVAL_UNAVAILABLE.to_string());
+                }
                 let url = action.get("value").and_then(Value::as_str)
                     .ok_or_else(|| scope_error("Platform navigation requires an explicit HTTPS URL."))?;
                 self.validate_url(url)

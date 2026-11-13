@@ -7,7 +7,7 @@ import threading
 from .business_contract import digest, reject
 
 CATEGORIES = ('question', 'manual_action', 'authentication', 'confirmation', 'blocked')
-REASONS = ('missing_information', 'manual_intervention', 'authentication_required', 'condition_confirmation', 'unsafe_or_blocked', 'no_progress')
+REASONS = ('missing_information', 'manual_intervention', 'authentication_required', 'condition_confirmation', 'unsafe_or_blocked', 'no_progress', 'awaiting_instructions')
 _SECRET = re.compile(r'password|mot de passe|\bmfa\b|\botp\b|\b2fa\b|\bpin\b|verification.?code|authentication.?code|code de verification|api.?key|(?:session|access).?token|bearer|private.?key|secret|credential|\b\d{6}\b|sk-[A-Za-z0-9]+', re.I)
 
 
@@ -203,7 +203,7 @@ class OperatorRequests:
         Informational answers, exact procedure decisions and external-effect
         authorization never share a permission or dispatch path.
         """
-        from .operator_language import normalized, reply_intent, navigation_question
+        from .operator_language import normalized, reply_intent, intervention_intent, navigation_question
         from .navigation_correction import correction_routes, NavigationTeaching
         from .business_contract import BusinessError
         with self.lock:
@@ -215,6 +215,7 @@ class OperatorRequests:
             answer = base['answer']
             intent = reply_intent(answer) if type(answer) is str else 'ambiguous'
             item = self._event_item(session, {**base, 'action': 'cancel' if intent == 'cancel' else 'resume'})
+            intent = intervention_intent(answer, item['request']['category']) if type(answer) is str else 'ambiguous'
             if type(answer) is not str or not 1 <= len(answer.strip()) <= 2000 or base['non_sensitive'] is not True or _SECRET.search(answer) or _SECRET.search(normalized(answer)) or any(ord(c) < 32 and c not in '\n\r\t' for c in answer):
                 reject('non_sensitive_answer_required')
             if intent == 'cancel':
@@ -355,6 +356,19 @@ class OperatorRequests:
                     'policy_revision': digest({k: original.get(k) for k in ('platform_id', 'execution_mode', 'browser_profile', 'mode', 'speed')})}
             self.pending[session] = item
 
+    def block_recovery(self, session, code):
+        """Hard ownership/checkpoint failures cannot become information loops."""
+        from .operator_diagnostics import HARD_FAILURES
+        if code not in HARD_FAILURES:
+            return
+        with self.lock:
+            item = self.pending.get(session)
+            if item:
+                item['data']['_checkpoint_unavailable'] = True
+                item.update(diagnostic_code=code, recovery='cancel_restart',
+                    request={'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                        'request': 'This browser session cannot safely continue. Cancel this task, then start a new conversation after reviewing the dedicated browser. No replacement browser was started.'})
+
     def status(self, session):
         with self.lock:
             item = self.pending.get(session)
@@ -389,7 +403,9 @@ class OperatorRequests:
             item['state'] = 'resuming'
             data = copy.deepcopy(item['data'])
             data['session_id'] = session
-            data['task'] = (item['data']['task'] + '\n\nOperator intervention completed. Reobserve the environment before acting. '
+            claim = ('Operator claims authentication is complete; login is not verified. Reobserve the same browser and check visible authentication state. '
+                     if item['request']['category'] == 'authentication' else 'Operator intervention completed. Reobserve the environment before acting. ')
+            data['task'] = (item['data']['task'] + '\n\n' + claim +
                             'This response grants no permissions. Informational answer: ' + (answer or '[manual completion confirmed]'))
             return data
 

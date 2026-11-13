@@ -33,6 +33,15 @@ def reply_intent(text):
     return 'ambiguous'
 
 
+def intervention_intent(text, category):
+    """An authentication reply is an operator claim, never verified login."""
+    if category == 'authentication' and normalized(text) in {
+        "c'est connecte", 'c est connecte', 'je suis bien connecte', 'je suis bien connectee',
+        'la connexion est faite', "i've signed in", 'i have signed in', "i've logged in", 'i have logged in'}:
+        return 'affirmative'
+    return reply_intent(text)
+
+
 def navigation_question(text):
     value = normalized(text)
     return any(word in value.split() for word in ('navigation', 'route', 'path', 'reach', 'chemin', 'atteindre', 'acceder')) or bool(

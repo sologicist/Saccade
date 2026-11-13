@@ -2385,6 +2385,15 @@ def spontaneous_navigation_correction():
         return jsonify({'error': 'navigation_correction_verification_failed'}), 409
 
 
+@app.route('/api/operator/diagnostics', methods=['GET'])
+def operator_diagnostics_route():
+    from flask import request
+    from AutoCua.saccade.operator_diagnostics import events
+    response = jsonify({'events': events(request.args.get('session_id', ''))})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @app.route('/api/operator', methods=['GET', 'POST'])
 def operator_intervention_route():
     from flask import request
@@ -2426,6 +2435,8 @@ def operator_intervention_route():
                         debug_exception('record operator cancellation')
                 return jsonify({'status': 'cancelled', 'session_id': session, 'answer': event.get('answer') or 'Cancel',
                                 'reply_html': md_render('Cancellation requested.' if was_resuming else 'The task was cancelled.')})
+            from AutoCua.saccade.operator_diagnostics import record as diagnostic
+            diagnostic('resume_requested', session, (operator_requests.status(session) or {}).get('run_id'), 'resume')
             response = _start_agent_run_locked(data, operator_reply=event['answer'] if event.get('action') == 'chat' else None,
                 correction_reopen=operator_requests.correction_reopen(session))
             body, code = response if isinstance(response, tuple) else (response, 200)
@@ -2433,10 +2444,18 @@ def operator_intervention_route():
                 operator_requests.retry(session)
             return body, code
     except BusinessError as error:
+        from AutoCua.saccade.operator_diagnostics import record as diagnostic, classify as diagnostic_code
+        code = diagnostic_code(error)
+        if code != 'internal_exception':
+            diagnostic(code, session, (operator_requests.status(session) or {}).get('run_id'), 'resume')
+            operator_requests.block_recovery(session, code)
         return jsonify({'error': str(error)}), 409
-    except Exception:
+    except Exception as error:
+        from AutoCua.saccade.operator_diagnostics import record as diagnostic, classify as diagnostic_code
+        code = diagnostic(diagnostic_code(error), session, (operator_requests.status(session) or {}).get('run_id'), 'resume')
         operator_requests.retry(session)
-        return jsonify({'error': 'resume_verification_failed'}), 409
+        operator_requests.block_recovery(session, code)
+        return jsonify({'error': 'resume_verification_failed', 'recovery': 'cancel_restart'}), 409
 
 
 def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, correction_reopen=False):
@@ -2554,12 +2573,16 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                 )
             retained_browser = operator_requests.browser_for_resume(chat_session_id)
             if pending_operator and pending_operator['state'] == 'resuming' and (not isinstance(prior_history, dict) or not prior_history.get('assistant_messages') or len(prior_history['assistant_messages']) != len(prior_history.get('tool_responses') or [])):
-                raise SessionContextError('The saved operator checkpoint is unavailable or unpaired. Cancel and review the original task.')
+                raise SessionContextError('operator_resume:paired_history_mismatch')
             if pending_operator and pending_operator['state'] == 'resuming' and not retained_browser and not correction_reopen:
-                raise SessionContextError('The suspended browser is unavailable. Cancel and review the task; a fresh Chrome cannot replace the operator session.')
+                raise SessionContextError('operator_resume:native_checkpoint_invalid')
             if retained_browser:
                 profile_lease = retained_browser[1]
-                profile_lease.ensure_held()
+                from AutoCua.saccade.profile_lease import validate_web_profile_lease
+                try:
+                    validate_web_profile_lease(profile_lease, browser_profile)
+                except ValueError:
+                    raise SessionContextError('operator_resume:profile_lease_lost') from None
             else:
                 profile_lease = acquire_web_profile(browser_profile)
             conversation.bind_platform_context(chat_session_id, platform_context)
@@ -2600,6 +2623,8 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                 operator_requests.begin_run(chat_session_id, current_session_id, fixed)
 
         def run_agent():
+            from AutoCua.saccade.operator_diagnostics import record as diagnostic, classify as diagnostic_code
+            lifecycle_failure = None
             stop_event = run_stop_event
 
             # Clear stale todo/scratchpad and blank the top-right card immediately;
@@ -2794,6 +2819,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                     **daisy,
                 )
                 if retained_browser:
+                    diagnostic('resume_attached', chat_session_id, current_session_id, 'resume')
                     # Transfer the passive reference to the current execution
                     # owner, including its active-run cleanup guard.
                     operator_requests.retain_browser(chat_session_id, agent, profile_lease)
@@ -2819,16 +2845,21 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                 # to, so the follow-up tasks of one chat can be put back together.
                 data_extraction.chat_id = chat_session_id
                 run_outcome = agent.process_request(task)
+                if retained_browser and getattr(agent, 'operator_resume_observed', False) and not getattr(agent, 'operator_diagnostic_code', None):
+                    diagnostic('resume_observed', chat_session_id, current_session_id, 'observation')
                 if not isinstance(run_outcome, dict):
                     run_outcome = {"status": "success", "message": ""}
 
             except Exception as agent_exc:
-                debug_exception("run_agent")
-                run_outcome = {"status": "error", "message": str(agent_exc)}
-                if retained_browser:
+                if run_pkg == 'web':
+                    lifecycle_failure = diagnostic(diagnostic_code(agent_exc), chat_session_id, current_session_id,
+                        'resume' if retained_browser and agent is None else 'execution')
                     run_outcome = {'status': 'waiting_operator', 'message': json.dumps({
                         'category': 'blocked', 'reason': 'unsafe_or_blocked',
-                        'request': 'Browser reattachment could not be verified. Review the retained window and profile. Cancel if browser ownership was lost.'})}
+                        'request': 'The task could not safely continue. Cancel and review the dedicated browser before starting a new conversation.'})}
+                else:
+                    debug_exception("run_agent")
+                    run_outcome = {"status": "error", "message": str(agent_exc)}
             finally:
                 data_extraction.chat_id = None
                 stop_event.set()
@@ -2913,6 +2944,17 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                             if not checkpoint_saved or cleanup_failed:
                                 checkpoint['_checkpoint_unavailable'] = True
                             operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
+                            native_code = getattr(agent, 'operator_diagnostic_code', None) if agent is not None else None
+                            if native_code:
+                                lifecycle_failure = diagnostic(native_code, chat_session_id, current_session_id, 'observation')
+                            if agent is not None and not bool(getattr(agent, 'operator_handoff_available', False)) and not lifecycle_failure:
+                                lifecycle_failure = diagnostic('native_checkpoint_invalid', chat_session_id, current_session_id, 'handoff')
+                            if not checkpoint_saved or cleanup_failed:
+                                lifecycle_failure = diagnostic('paired_history_mismatch' if not checkpoint_saved else 'native_checkpoint_invalid', chat_session_id, current_session_id, 'handoff')
+                            if lifecycle_failure:
+                                operator_requests.block_recovery(chat_session_id, lifecycle_failure)
+                            else:
+                                diagnostic('handoff_retained', chat_session_id, current_session_id, 'handoff')
                             if run_learning_control is not None:
                                 operator_requests.present_procedure(chat_session_id, run_learning_control)
                             if agent is not None:
@@ -3007,8 +3049,19 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                         'platform_context': platform_context})
 
     except (SessionContextError, ProfileBusyError) as error:
+        from AutoCua.saccade.operator_diagnostics import record as diagnostic, classify as diagnostic_code
+        code = diagnostic(diagnostic_code(error), data.get('session_id') if isinstance(data, dict) else None, _latest_run_id, 'resume' if retained_browser else 'startup')
+        if retained_browser or (operator_requests.status(data.get('session_id')) or {}).get('state') == 'resuming':
+            operator_requests.retry(data.get('session_id'))
+            operator_requests.block_recovery(data.get('session_id'), code)
         return jsonify({'error': str(error), 'status': 'conflict' if error.status_code == 409 else 'invalid'}), error.status_code
     except Exception as e:
+        if retained_browser:
+            from AutoCua.saccade.operator_diagnostics import record as diagnostic, classify as diagnostic_code
+            code = diagnostic(diagnostic_code(e), data.get('session_id'), _latest_run_id, 'resume')
+            operator_requests.retry(data.get('session_id'))
+            operator_requests.block_recovery(data.get('session_id'), code)
+            return jsonify({'error': code, 'recovery': 'cancel_restart'}), 409
         debug_exception("start_agent API")
         return jsonify({'error': error_text(e)}), 500
     finally:

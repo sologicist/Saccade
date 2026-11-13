@@ -2427,6 +2427,7 @@ pub struct ScannerInner {
     pub mapping: serde_json::Map<String, Value>,
     /// The host broker owns this passive browser; keep its private pipe alive.
     pub operator_handoff: bool,
+    scope_session_id: String,
     scope_cleanup_verified: bool,
     /// device px per CSS px, from the most recent scan.
     pub dpr: f64,
@@ -2558,6 +2559,7 @@ impl ScannerInner {
             url: String::new(),
             mapping: serde_json::Map::new(),
             operator_handoff: false,
+            scope_session_id: String::new(),
             scope_cleanup_verified: false,
             dpr: 1.0,
             last_scan_seconds: 0.0,
@@ -2589,6 +2591,7 @@ impl ScannerInner {
         self.scope_observer_id = format!("{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_nanos());
+        if self.scope_session_id.is_empty() { self.scope_session_id = self.scope_observer_id.clone(); }
     }
 
     pub fn platform_violation(&self) -> Option<String> {
@@ -2679,6 +2682,17 @@ impl ScannerInner {
         }).collect()
     }
 
+    pub(crate) fn resume_target(remembered: Option<&str>, authorized: &[String]) -> Result<String, &'static str> {
+        if let Some(target) = remembered {
+            return if authorized.iter().any(|id| id == target) { Ok(target.to_string()) }
+                else { Err("Operator review required: the original controlled page is unavailable.") };
+        }
+        if authorized.len() != 1 {
+            return Err("Operator review required: resume needs exactly one authorized page in this profile.");
+        }
+        Ok(authorized[0].clone())
+    }
+
     /// Open or resume the scoped surface before any model observation. A resumed
     /// run never guesses among several pages or navigates away from a login handoff.
     pub fn initialize_platform_scope(&mut self, resumed: bool) -> SResult<()> {
@@ -2731,10 +2745,8 @@ impl ScannerInner {
             return Err(self.platform_failure(format!("Operator review required before starting: {message}")));
         }
         let target = if resumed {
-            if authorized.len() != 1 {
-                return Err(self.platform_failure("Operator review required: resume needs exactly one authorized page in this profile."));
-            }
-            authorized.remove(0)
+            Self::resume_target(self.tab_id.as_deref(), &authorized)
+                .map_err(|message| self.platform_failure(message))?
         } else {
             self.create_tab_raw()?
         };
@@ -2890,6 +2902,11 @@ impl ScannerInner {
     pub fn authorize_platform_action(&mut self, action: &Value) -> SResult<()> {
         let Some(scope) = self.platform_scope.as_ref() else { return Ok(()) };
         if let Err(message) = scope.validate_action(action) {
+            // A pre-dispatch refusal proves that no action ran. It must not
+            // poison the browser ownership checkpoint as a scope violation.
+            if message == crate::platform_scope::APPROVAL_UNAVAILABLE {
+                return Err(ScanErr::s(message));
+            }
             return Err(self.platform_failure(message));
         }
         self.check_platform_scope()?;
@@ -2920,7 +2937,7 @@ impl ScannerInner {
         self.check_platform_scope()?;
         let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
         Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
-            "platform_id": scope.platform_id, "profile": scope.browser_profile,
+            "platform_id": scope.platform_id, "profile": scope.browser_profile, "session": self.scope_session_id,
             "config_revision": scope.config_revision}))
     }
 
@@ -3729,6 +3746,16 @@ impl ScannerInner {
     }
 
     pub fn close_operator_handoff(&mut self) -> SResult<()> {
+        #[cfg(windows)]
+        if let Some(bridge) = self.bridge.clone() {
+            if bridge.lock().map_err(|_| ScanErr::s("Protected bridge lock unavailable."))?.close_exited_owned_process() {
+                self.operator_handoff = false;
+                self.scope_initialized = false;
+                self.scope_observer_id.clear();
+                self.scope_cleanup_verified = true;
+                return Ok(());
+            }
+        }
         self.operator_handoff = false;
         self.end_platform_scope()?;
         if self.platform_scope.is_some() && !self.scope_cleanup_verified {

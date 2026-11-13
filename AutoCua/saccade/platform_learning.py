@@ -93,7 +93,7 @@ class PlatformLearningControl:
                 reject("control_stopped")
             self.validate_native(self.context)
             required = {"observer", "tab", "profile", "config_revision", "platform_id"}
-            if type(stamp) is not dict or set(stamp) != required or any(type(stamp[k]) is not str or not 1 <= len(stamp[k]) <= 128 for k in ("observer", "tab")) or stamp["profile"] != self.context["browser_profile"] or stamp["platform_id"] != self.context["platform_id"] or stamp["config_revision"] != self.context["config_revision"]:
+            if type(stamp) is not dict or set(stamp) not in (required, required | {"session"}) or ("session" in stamp and (type(stamp["session"]) is not str or not 1 <= len(stamp["session"]) <= 128)) or any(type(stamp[k]) is not str or not 1 <= len(stamp[k]) <= 128 for k in ("observer", "tab")) or stamp["profile"] != self.context["browser_profile"] or stamp["platform_id"] != self.context["platform_id"] or stamp["config_revision"] != self.context["config_revision"]:
                 reject("unverified_navigation_observation")
             if type(elements) is not dict:
                 reject("unverified_navigation_observation")
@@ -107,7 +107,10 @@ class PlatformLearningControl:
             self._last_observation_digest = digest([self.run_id, self.observation["id"], stamp])
             from .navigation_correction import landmarks
             controls, headings = landmarks(elements, self.store.adapter)
-            surface = digest([stamp[k] for k in ('observer', 'tab', 'profile', 'config_revision', 'platform_id')])
+            # Observer generations change on a verified handoff. The native
+            # retained scanner's session identity remains stable; a new browser
+            # can never corroborate the previous browser's source observation.
+            surface = digest([stamp.get('session', stamp['observer']), *[stamp[k] for k in ('tab', 'profile', 'config_revision', 'platform_id')]])
             self.teaching_baseline = (controls, headings, self._last_observation_digest, surface)
             if self.teaching:
                 self.teaching.observe(controls, headings, self._last_observation_digest, surface)

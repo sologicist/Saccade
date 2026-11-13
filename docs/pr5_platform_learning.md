@@ -72,8 +72,11 @@ DOM text. Evidence contains digests rather than raw observations.
 
 A step needs exactly one visible supported control with that closed label,
 followed by a different trusted observation with exactly one matching heading.
-A heading already present does not prove a transition. Changing observer, tab,
-profile, platform or configuration invalidates the source evidence. Browser
+A heading already present does not prove a transition. Changing browser session,
+tab, profile, platform or configuration invalidates the source evidence. A fresh
+observer generation after a verified handoff may corroborate the same native
+retained session; a replacement scanner cannot. Legacy stamps without a native
+session identity still require the same observer. Browser
 scope checks, exact authorized hosts and sticky security violations remain the
 native scanner's responsibility and precede the learning checkpoint.
 
