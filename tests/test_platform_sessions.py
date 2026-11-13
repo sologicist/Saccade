@@ -463,6 +463,30 @@ class PlatformSessionAPI(SessionFixtures):
         forged = self.client.post(url, json={**body, "approve": True}, headers=headers, base_url=self.base_url)
         self.assertEqual(forged.status_code, 409)
 
+    def test_generic_operator_resume_reuses_chat_and_revalidates_launcher(self):
+        from AutoCua.saccade.operator_requests import operator_requests
+        response = self.post(platform_id="dext")
+        self.finish_run()
+        sid = response.json['session_id']
+        self.addCleanup(lambda: operator_requests.pending.pop(sid, None))
+        data = {'provider':'openai','model':'synthetic','mode':'web','speed':'quality','platform_id':'dext','task':'Original synthetic objective'}
+        operator_requests.suspend(sid, 'originating-run', data, {'category':'question','reason':'missing_information','request':'Which invented option?'})
+        url = '/api/operator?session_id=' + sid
+        status = self.client.get(url, headers=self.headers, base_url=self.base_url)
+        self.assertEqual(status.headers['Cache-Control'], 'no-store')
+        self.assertEqual(len(self.created), 1)
+        event = {**{k:status.json[k] for k in ('run_id','intervention_id','revision','token')},'action':'resume','answer':'Option A','non_sensitive':True}
+        self.assertEqual(self.client.post(url,json=event,headers=self.headers,base_url=self.base_url).status_code,403)
+        headers = {**self.headers,'Origin':self.base_url}
+        self.assertEqual(self.client.post(url,json={**event,'token':'foreign'},headers=headers,base_url=self.base_url).status_code,409)
+        resumed = self.client.post(url,json=event,headers=headers,base_url=self.base_url)
+        self.assertEqual(resumed.status_code,200,resumed.json)
+        self.finish_run()
+        self.assertEqual(resumed.json['session_id'],sid)
+        self.assertIsNotNone(self.created[-1].kwargs['prior_history'])
+        self.assertEqual(self.created[-1].kwargs['browser_profile'],'saccade-dext')
+        self.assertEqual(self.client.post(url,json=event,headers=headers,base_url=self.base_url).status_code,409)
+
     def test_generic_chat_has_no_dext_operator_control(self):
         response = self.post()
         self.finish_run()

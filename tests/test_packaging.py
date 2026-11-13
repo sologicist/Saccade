@@ -48,6 +48,7 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/business_worker.py",
             "AutoCua/saccade/procedure_store.py",
             "AutoCua/saccade/dext_control.py",
+            "AutoCua/saccade/operator_requests.py",
             "AutoCua/saccade/client_references.py",
             "AutoCua/saccade/reference_management.py",
             "AutoCua/saccade/navigation_correction.py",
