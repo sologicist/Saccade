@@ -5,6 +5,7 @@ export interface PendingOperator {
     state: string; request: { category: string; reason: string; request: string };
     chat_message?: string; error?: string; procedure_summary?: string; procedure_diff?: string;
     presentation_digest?: string;
+    execution_summary?: string; execution_phrase?: string;
     procedure_label?: string;
     recovery?: 'cancel_restart'; diagnostic_code?: string;
 }

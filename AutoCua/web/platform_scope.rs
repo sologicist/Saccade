@@ -182,6 +182,7 @@ impl PlatformScope {
             // the same pre/post scope checks. This grants no click, form input,
             // download, disclosure or accounting authority.
             "scroll" if self.execution_mode == "supervised" => Ok(()),
+            "navigate_tab" if self.execution_mode == "supervised" && matches!(action.get("value").and_then(Value::as_str), Some("back" | "forward")) => Ok(()),
             "new_tab" | "update_tab" => {
                 // The same declared-origin navigation contract applies to all
                 // installed platforms. A platform name is not a permission.
@@ -199,10 +200,10 @@ impl PlatformScope {
 
     /// Separate native authorization; JSON flags can never manufacture a permit.
     pub fn validate_business_action(&self, action: &Value, permit: &crate::tool_registry::business::BusinessPermit) -> Result<(), String> {
-        if self.violation().is_some() || self.platform_id != "dext" || self.execution_mode != "supervised"
+        if self.violation().is_some() || self.execution_mode != "supervised"
             || permit.platform != self.platform_id || permit.context_revision != self.config_revision
             || !matches!(permit.effect.as_str(), "read" | "compute")
-            || !matches!(permit.name.as_str(), "dext.bank" | "dext.scribe")
+            || action.get("name").and_then(Value::as_str) != Some(permit.name.as_str())
             || permit.action != *action || action.get("type").and_then(Value::as_str) != Some("call_function") {
             return Err(APPROVAL_UNAVAILABLE.to_string());
         }

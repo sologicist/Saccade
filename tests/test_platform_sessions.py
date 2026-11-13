@@ -979,6 +979,53 @@ class PlatformSessionAPI(SessionFixtures):
         url = "/api/dext/control?session_id=" + response.json["session_id"]
         self.assertEqual(self.client.get(url, headers=self.headers, base_url=self.base_url).status_code, 409)
 
+    def test_exact_execution_chat_review_reuses_browser_and_authority_without_polling_model(self):
+        sid, previous, broker = self.pause_browser()
+        control=broker.control_for(sid)
+        action={'type':'click','id':2,'times':1}
+        stamp={'platform_id':'dext','profile':'saccade-dext','config_revision':control.context['config_revision'],
+               'session':'retained-native-session','tab':'1'}
+        # The physical scanner is the boundary stub in this route test; native
+        # dispatch and scanning have their own three-platform integration test.
+        control.execution.decide(action,stamp,{'name':'Unclassified control'},effect='interaction',run_id=control.run_id)
+        broker.present_execution(sid,control)
+        status=self.client.get('/api/operator?session_id='+sid,headers=self.headers,base_url=self.base_url)
+        self.assertIn('Unclassified control',status.json['execution_summary'])
+        calls=self.provider_calls
+        self.assertEqual(self.respond_operator(sid,self.chat_event(sid,broker,'Yes, remember this')).json['status'],'waiting_operator')
+        for _ in range(3):
+            self.client.get('/api/operator?session_id='+sid,headers=self.headers,base_url=self.base_url)
+        self.assertEqual(self.provider_calls,calls)
+        response=self.respond_operator(sid,self.chat_event(sid,broker,'Approve this interaction'))
+        self.assertEqual(response.status_code,200,response.json)
+        self.finish_run()
+        self.assertEqual(response.json['session_id'],sid)
+        self.assertIs(self.created[-1].kwargs['operator_session'],previous)
+        self.assertIs(self.created[-1].kwargs['profile_lease'],previous.kwargs['profile_lease'])
+        self.assertIs(self.created[-1].kwargs['learning_control'].execution,control.execution)
+
+    def test_local_results_require_api_auth_and_same_conversation_platform(self):
+        from AutoCua.saccade.procedure_store import ProcedureStore
+        first=self.post(platform_id='dext')
+        self.finish_run()
+        one=first.json['session_id']
+        second=self.post(platform_id='dext')
+        self.finish_run()
+        two=second.json['session_id']
+        store=ProcedureStore(self.root,'dext')
+        store._write('results/one.json',{'session':one,'platform':'dext','result':'SYNTHETIC PRIVATE ONE'},exclusive=True)
+        store._write('results/two.json',{'session':two,'platform':'dext','result':'SYNTHETIC PRIVATE TWO'},exclusive=True)
+        store._write('results/foreign.json',{'session':one,'platform':'foreign','result':'FOREIGN'},exclusive=True)
+        url='/api/operator/results?session_id='+one
+        self.assertEqual(self.client.get(url,base_url=self.base_url).status_code,403)
+        self.assertEqual(self.client.get(url,headers={**self.headers,'Origin':'https://foreign.test'},base_url=self.base_url).status_code,403)
+        response=self.client.get(url,headers=self.headers,base_url=self.base_url)
+        self.assertEqual(response.status_code,200,response.json)
+        self.assertEqual(response.headers['Cache-Control'],'no-store')
+        self.assertEqual(response.json,[{'receipt':'one','result':'SYNTHETIC PRIVATE ONE'}])
+        other=self.client.get('/api/operator/results?session_id='+two,headers=self.headers,base_url=self.base_url)
+        self.assertEqual(other.json,[{'receipt':'two','result':'SYNTHETIC PRIVATE TWO'}])
+
     def test_shell_start_cannot_steal_the_stop_channel_of_an_active_web_run(self):
         self.release.clear()
         first = self.post(platform_id="dext")

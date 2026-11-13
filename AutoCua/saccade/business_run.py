@@ -158,3 +158,15 @@ WORKER_ERRORS = {"business_revision_changed", "required_file_unavailable", "unsa
                  "duplicate_json_key", "nonfinite_number", "invalid_json", "empty_reference", "file_changed_during_read",
                  "json_integer_limit", "schema_depth", "invalid_reference_content", "unsafe_reference_link",
                  "unexpected_reference_file", "unapproved_reference_file"}
+
+
+def supports_legacy(context):
+    """Compatibility selection only; universal capabilities use their registry."""
+    return context.get('platform_id') == 'dext' and context.get('execution_mode') == 'supervised'
+
+
+def reserved_function_names(platform_id):
+    if supports_legacy({'platform_id':platform_id, 'execution_mode':'supervised'}):
+        from .business_catalogue import _APPROVED
+        return set(_APPROVED)
+    return set()

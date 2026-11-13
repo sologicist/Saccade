@@ -52,6 +52,8 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/dext_learning.py",
             "AutoCua/saccade/dext_control.py",
             "AutoCua/saccade/operator_requests.py",
+            "AutoCua/saccade/execution.py",
+            "AutoCua/saccade/capabilities.py",
             "AutoCua/saccade/operator_diagnostics.py",
             "AutoCua/saccade/operator_language.py",
             "AutoCua/ui/platform_session/operator_chat.ts",
@@ -111,7 +113,7 @@ class BuiltWheelContracts(unittest.TestCase):
             self.wheel.extractall(install_root)
             # -I removes the source checkout and ambient PYTHONPATH. No runtime
             # dependencies or Chrome session are needed to load configuration.
-            code = """
+            code = r"""
 import importlib
 import json
 import sys
@@ -155,6 +157,23 @@ run.refresh()
 ticket = run.prepare({"type":"call_function","version":1,"name":"dext.bank",
     "arguments":{"client_id":"wheel-synthetic","string":"SYNTHETIC WHEEL LABEL"}})
 assert run.execute(ticket)["result"] == {"compte":"40100000"}
+from AutoCua.saccade.platform_learning import PlatformLearningControl
+functions_dir = installed / "platforms/dext/functions"
+functions_dir.mkdir()
+(functions_dir / "echo.py").write_text('def echo(text: str) -> str:\n    return "WHEEL:" + text\n', encoding="utf-8")
+(installed / "platforms/dext/capabilities.json").write_text(json.dumps({"schema_version":1,"platform_id":"dext","functions":[
+    {"id":"dext.wheel_echo","source":"echo.py","symbol":"echo","effect":"compute","destination":"local",
+     "description":"Synthetic installed wheel function","output_visibility":"public"}]}), encoding="utf-8")
+control = PlatformLearningControl(build_platform_context("dext"), "wheel-capability")
+action = {"type":"call_function","version":1,"name":"dext.wheel_echo","arguments":{"text":"SYNTHETIC"}}
+stamp = {"platform_id":"dext","profile":"saccade-dext","config_revision":control.context["config_revision"],"session":"synthetic-browser","tab":"1"}
+assert "dext.wheel_echo" in str(control.execution_tools())
+assert not control.authorize_execution(action,stamp,{})["allowed"]
+control.execution.review(control.execution.pending["id"],True)
+assert control.authorize_execution(action,stamp,{})["allowed"]
+assert control.execute_capability(action)["result"] == "WHEEL:SYNTHETIC"
+assert set(catalogue("dext")["functions"]) == {"dext.bank", "dext.scribe"}
+control.close()
 native = importlib.import_module("AutoCua.web.agent_native")
 assert Path(native.__file__).resolve().is_relative_to(installed)
 print(json.dumps({"id": platform.id, "native_imported": True}))

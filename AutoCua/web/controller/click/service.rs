@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use serde_json::{json, Map, Value};
 
 use crate::browser::{web_store_url, Cdp, CdpFail, ScannerInner, WEB_STORE_BLOCKED};
-use crate::controller::service::{
+use crate::controller::service::{ActErr,
     err, label_for, py_float_str, py_float_value, py_int_value, rect_for, reject_viewport,
     resolve_element_id, scan_op, with_cursor, ActResult,
 };
@@ -99,7 +99,7 @@ pub(crate) fn press(
 /// The link's address is the href in its scan line's tag (an element's text can quote
 /// an href too), read against the address of the page it was scanned on, as the
 /// browser reads it (a scheme-relative or relative href included).
-fn refuse_web_store_link(elements: &Map<String, Value>, idx: i64, page: &str) -> ActResult<()> {
+fn refuse_web_store_link(elements: &Map<String, Value>, idx: i64, page: &str, scope: Option<&crate::platform_scope::PlatformScope>) -> ActResult<()> {
     let line = elements
         .get(&idx.to_string())
         .and_then(|e| e.get("line"))
@@ -125,6 +125,9 @@ fn refuse_web_store_link(elements: &Map<String, Value>, idx: i64, page: &str) ->
     if web_store_url(&address) {
         return err(WEB_STORE_BLOCKED);
     }
+    if let Some(scope) = scope {
+        scope.validate_url(&address).map_err(ActErr::Msg)?;
+    }
     Ok(())
 }
 
@@ -139,10 +142,18 @@ pub fn click(
     let idx = resolve_element_id(elements, raw_id)?;
     reject_viewport(idx, "click")?;
     let page = scan_op(py, scanner, |s| Ok(s.url.clone()))?;
-    refuse_web_store_link(elements, idx, &page)?;
+    let scope = scan_op(py, scanner, |s| Ok(s.navigation_scope()))?;
+    refuse_web_store_link(elements, idx, &page, scope.as_ref())?;
+
     let n = py_int_value(times).map(|n| n.clamp(1, MAX_CLICK_TIMES)).unwrap_or(1);
     let rect = rect_for(elements, idx)?;
     with_cursor(py, scanner, &rect, |s| {
+        #[cfg(test)]
+        if s.business_test_observations.is_some() {
+            // Replace only the physical input boundary in offline native tests.
+            s.business_test_actions.push(json!({"type":"click","rect":rect,"times":n}));
+            return Ok(());
+        }
         if s.bridged() {
             // Extension mode: the same press, dispatched by AutoCuaBridge (tools.js).
             return s.bridge_call(json!({"type": "click", "rect": rect, "times": n})).map(|_| ());
@@ -168,7 +179,9 @@ pub fn hold_click(
     let idx = resolve_element_id(elements, raw_id)?;
     reject_viewport(idx, "hold_click")?;
     let page = scan_op(py, scanner, |s| Ok(s.url.clone()))?;
-    refuse_web_store_link(elements, idx, &page)?;
+    let scope = scan_op(py, scanner, |s| Ok(s.navigation_scope()))?;
+    refuse_web_store_link(elements, idx, &page, scope.as_ref())?;
+
     let secs = py_float_value(seconds)
         .map(|s| s.max(MIN_HOLD_SECONDS))
         .unwrap_or(DEFAULT_HOLD_SECONDS);

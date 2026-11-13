@@ -2352,6 +2352,10 @@ def spontaneous_navigation_correction():
                 return jsonify({'status': 'waiting_operator', 'pending': pending})
             operator_requests.consume_correction_claim(session, body['claim'], context['signature'])
             kind, routes = spontaneous_correction(body['text'], eligible=context['eligible'], navigation=context['navigation'], adapter=context['adapter'])
+            from AutoCua.saccade.operator_language import recovery_correction
+            recovery = recovery_correction(body['text'], context['adapter']) if context['eligible'] and context['navigation'] else None
+            if recovery:
+                kind, routes = 'correction', recovery['routes']
             if kind == 'ordinary':
                 if context['active']:
                     return jsonify({'status': 'busy', 'message': 'The agent is still working. Send a navigation correction or stop the current task before starting another request.'})
@@ -2365,7 +2369,7 @@ def spontaneous_navigation_correction():
             if context['active'] and (not _run_thread or not _run_thread.is_alive() or context['run_id'] != active_agent_session_id or not active_agent_stop_event or active_agent_stop_event.is_set()):
                 reject('correction_handoff_unavailable')
             operator_requests.propose_correction(session, context['run_id'], context['data'], routes,
-                active=context['active'], clarify=kind == 'clarify')
+                active=context['active'], clarify=kind == 'clarify', recovery=recovery)
             if context['active']:
                 active_agent_stop_event.operator_pause = True
                 active_agent_stop_event.set()
@@ -2383,6 +2387,35 @@ def spontaneous_navigation_correction():
     except Exception:
         debug_exception('navigation correction')
         return jsonify({'error': 'navigation_correction_verification_failed'}), 409
+
+
+@app.route('/api/operator/results', methods=['GET'])
+def operator_local_results():
+    from flask import request
+    from AutoCua.saccade.platform_registry import PROJECT_ROOT
+    from AutoCua.saccade.session_context import _validate_context
+    from AutoCua.saccade.business_contract import loads, read_safe
+    session = request.args.get('session_id', '')
+    try:
+        saved = conversation.get_session(session) if session else None
+        context = saved.get('platform_context') if saved else None
+        result = []
+        if context:
+            context = _validate_context(context, root=PROJECT_ROOT)
+            folder = PROJECT_ROOT / 'platforms' / context['platform_id'] / 'data/navigation/results'
+            files = sorted(folder.glob('*.json'))
+            if len(files) > 1000:
+                return jsonify({'error':'result_history_limit'}), 409
+            for path in files:
+                value = loads(read_safe(PROJECT_ROOT, path, 65_536), 65_536)
+                if value.get('session') == session and value.get('platform') == context['platform_id']:
+                    result.append({'receipt':path.stem,'result':value['result']})
+            result = result[-32:]
+        response = jsonify(result)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception:
+        return jsonify({'error':'local_result_verification_failed'}), 409
 
 
 @app.route('/api/operator/diagnostics', methods=['GET'])
@@ -2957,6 +2990,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                                 diagnostic('handoff_retained', chat_session_id, current_session_id, 'handoff')
                             if run_learning_control is not None:
                                 operator_requests.present_procedure(chat_session_id, run_learning_control)
+                                operator_requests.present_execution(chat_session_id, run_learning_control)
                             if agent is not None:
                                 operator_requests.retain_browser(chat_session_id, agent, profile_lease)
                             if queued_correction:

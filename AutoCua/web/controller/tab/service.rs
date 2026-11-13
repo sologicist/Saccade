@@ -94,7 +94,7 @@ fn reload_tab(cdp: &mut Cdp, sess: &str) -> Result<(), CdpFail> {
 /// would leave the model unable to tell "went back" from "was already at the
 /// first page" — the same blindness the scroll tool had to solve, except here
 /// the answer is known up front.
-fn step_history(cdp: &mut Cdp, sess: &str, delta: i64) -> Result<(), CdpFail> {
+fn step_history(cdp: &mut Cdp, sess: &str, delta: i64, scope: Option<&crate::platform_scope::PlatformScope>) -> Result<(), CdpFail> {
     let unreadable = || CdpFail::Clean("could not read the tab's history".into());
     let h = cdp.rpc("Page.getNavigationHistory", json!({}), Some(sess), 5.0)?;
     let cur = h.get("currentIndex").and_then(Value::as_i64).ok_or_else(unreadable)?;
@@ -106,6 +106,10 @@ fn step_history(cdp: &mut Cdp, sess: &str, delta: i64) -> Result<(), CdpFail> {
             if delta < 0 { "back" } else { "forward" },
             if delta < 0 { "start" } else { "end" }
         )));
+    }
+    if let Some(scope) = scope {
+        let url = entries[want as usize].get("url").and_then(Value::as_str).ok_or_else(unreadable)?;
+        scope.validate_url(url).map_err(CdpFail::Clean)?;
     }
     let id = entries[want as usize]
         .get("id")
@@ -268,9 +272,11 @@ pub fn navigate(
                 if s.bridged() {
                     // Extension mode: the same history step, refused at the
                     // ends with the same words (tools.js history).
-                    return s.bridge_call(json!({"type": "history", "delta": delta})).map(|_| ());
+                    let hosts = s.navigation_scope().map(|scope| scope.allowed_hosts);
+                    return s.bridge_call(json!({"type": "history", "delta": delta, "scope_hosts": hosts})).map(|_| ());
                 }
-                s.with_tab(|cdp, sess| step_history(cdp, sess, delta))
+                let scope = s.navigation_scope();
+                s.with_tab(|cdp, sess| step_history(cdp, sess, delta, scope.as_ref()))
             })?;
         }
         format!(

@@ -480,6 +480,10 @@ pub fn claude_reasoning_tool() -> &'static Value {
              claude_reasoning_fields()))
 }
 
+pub fn download_tool() -> Value {
+    tool("download", &[("target_id", json!({"type":"integer","minimum":1}))], "Download an observed document link through the protected browser. Requires a separate exact operator decision. Returns a verified local receipt, never proof of record identity or disclosure permission.", &[])
+}
+
 pub fn main_tools_quality() -> &'static Vec<Value> {
     static T: OnceLock<Vec<Value>> = OnceLock::new();
     T.get_or_init(|| main_tools(&[], Some(main_reasoning_tool())))
@@ -565,6 +569,7 @@ pub fn main_action_defaults() -> &'static Value {
             "skills": {"type": "load", "id": 0},
             "done": {"value": ""},
             "call_function": {"version": 1, "name": "", "arguments": {}},
+            "download": {"target_id": 0},
             "ask_operator": {"category":"", "reason":"", "request":""},
             "dext_navigation": {"version": 1, "route": "", "target_id": 0},
         })
@@ -1076,6 +1081,7 @@ struct CoreState {
 #[pyclass(frozen, name = "LLMManager")]
 pub struct LLMManager {
     business_providers: Mutex<Option<(Value, Py<PyAny>, Py<PyAny>)>>,
+    base_registry: Vec<Value>,
     pub provider: String,
     pub model_short_name: String,
     pub runtime_api_key: Option<String>,
@@ -1197,6 +1203,7 @@ impl LLMManager {
 
         Ok(LLMManager {
             business_providers: Mutex::new(None),
+            base_registry: registry.clone(),
             provider,
             model_short_name: model.to_string(),
             runtime_api_key,
@@ -1448,7 +1455,7 @@ impl LLMManager {
             return Ok(())
         };
         if self.business_providers.lock().unwrap().as_ref().is_some_and(|(old, _, _)| old == &definition) { return Ok(()) }
-        let mut registry = if self.claude { main_tools_claude().clone() } else { main_tools_quality().clone() };
+        let mut registry = self.base_registry.clone();
         if let Some(definitions) = definition.as_array() { registry.extend(definitions.iter().cloned()); }
         else { registry.push(definition.clone()); }
         let make = |registry: &[Value]| -> PyResult<Py<PyAny>> {
@@ -1474,11 +1481,15 @@ impl LLMManager {
         Ok(())
     }
 
-    pub fn business_enabled(&self) -> bool { self.business_providers.lock().unwrap().is_some() }
+    pub fn registered_tool(&self, name: &str) -> bool {
+        self.business_providers.lock().unwrap().as_ref().is_some_and(|(definition, _, _)|
+            definition["name"] == name || definition.as_array().is_some_and(|tools| tools.iter().any(|tool|tool["name"] == name)))
+    }
+
+    pub fn business_enabled(&self) -> bool { self.registered_tool("call_function") }
 
     pub fn navigation_enabled(&self) -> bool {
-        self.business_providers.lock().unwrap().as_ref().is_some_and(|(definition, _, _)|
-            definition.as_array().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "dext_navigation")))
+        self.registered_tool("dext_navigation")
     }
 
     pub fn async_tools(&self) -> bool {

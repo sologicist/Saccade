@@ -12,7 +12,7 @@ from .session_context import _validate_context
 
 
 class PlatformLearningControl:
-    """No browser driver, execution permission or independent run loop."""
+    """Session hooks for learning and exact execution decisions; no agent loop."""
 
     def __init__(self, context, session_id, *, project_root=None, stop_event=None, conversational=False):
         from .platform_config import PROJECT_ROOT
@@ -35,6 +35,144 @@ class PlatformLearningControl:
         self.conversational = conversational
         self.teaching = None
         self.teaching_baseline = None
+        from .execution import ExecutionAuthority
+        self.execution = ExecutionAuthority(self.project, self.context, self.session_id)
+
+    def execution_tools(self):
+        if self.context['execution_mode'] != 'supervised':
+            return None
+        from .capabilities import catalogue, tool
+        snapshot = catalogue(self.project, self.context['platform_id'])
+        return tool(snapshot) if snapshot['functions'] else None
+
+    def authorize_execution(self, action, stamp, elements):
+        self.validate_native(self.context)
+        if self.context['execution_mode'] != 'supervised':
+            return {'unavailable':True}
+        from .capabilities import catalogue
+        kind = action.get('type')
+        if kind == 'call_function':
+            snapshot = catalogue(self.project, self.context['platform_id'])
+            entry = snapshot['functions'].get(action.get('name'))
+            if not entry:
+                return {'unavailable': True}
+            from .business_contract import validate
+            arguments = action.get('arguments')
+            if type(arguments) is not dict: reject('schema_mismatch')
+            arguments = {k:v for k,v in arguments.items() if v is not None or k in entry['input_schema']['properties']}
+            validate(arguments, entry['input_schema'])
+            target = {'function':entry['id'], 'arguments':action['arguments'],
+                      'result_visibility':entry['output_visibility'], 'description':entry['description']}
+            if entry.get('document_input'):
+                from .capabilities import verified_download
+                receipt = verified_download(self.project, self.context, self.session_id, arguments[entry['document_input']])
+                if entry.get('requires_verified_record') and not receipt['record_identity_verified']:
+                    reject('verified_record_identity_required')
+                target['document'] = {k:receipt[k] for k in ('id','sha256','bytes','record_identity_verified')}
+            return self.execution.decide(action, stamp, target,
+                effect=entry['effect'], destination=entry['destination'], revision=snapshot['revision'], run_id=self.run_id)
+        if kind not in ('click', 'hold_click', 'input', 'keyboard', 'dialog', 'download'):
+            return {'unavailable': True}
+        if kind == 'keyboard':
+            # Reuse the native renderer-only shortcut parser and dispatch.
+            # Exact approval still binds the observed focus and page.
+            if type(stamp.get('focus')) is not dict or stamp['focus'].get('type') in ('password','file') or stamp['focus'].get('tag') in ('IFRAME','FRAME'):
+                reject('private_manual_input_required')
+            target = {'page_digest':digest(elements),'focus':stamp['focus']}
+        elif kind == 'dialog':
+            if not stamp.get('dialog'): reject('unobserved_execution_target')
+            target = {'page_digest':digest(elements),'dialog':stamp['dialog']}
+        else:
+            key = action.get('target_id') if kind == 'download' else action.get('id')
+            target = elements.get(str(key))
+            if type(target) is not dict:
+                reject('unobserved_execution_target')
+            line = str(target.get('line', '')).lower()
+            if 'password' in line or 'type="file"' in line:
+                reject('private_manual_input_required')
+        # Only installed policy can classify a public control as navigation.
+        # A learned procedure or a model-supplied effect flag cannot do so.
+        effect = 'download' if kind == 'download' else 'interaction'
+        navigation = {'name':target.get('name'), 'role':target.get('role')}
+        unique = sum(1 for row in elements.values() if type(row) is dict
+                     and row.get('name') == target.get('name') and row.get('role') == target.get('role')) == 1
+        if kind == 'click' and action.get('times') == 1 and navigation in self.execution.policy['navigation'] and unique:
+            effect = 'navigation'
+        if effect != 'navigation': target = {**target, 'observation_digest':digest(elements)}
+        return self.execution.decide(action, stamp, target, effect=effect,
+            destination='private platform download storage' if kind == 'download' else self.context['platform_id'], run_id=self.run_id)
+
+    def execute_capability(self, action):
+        self.validate_native(self.context)
+        self.execution.validate()
+        from .capabilities import catalogue
+        from .business_process import run_worker
+        snapshot = catalogue(self.project, self.context['platform_id'])
+        entry = snapshot['functions'].get(action['name'])
+        if not entry:
+            reject('unregistered_capability')
+        decision = self.execution.pending
+        if not decision or decision['state'] != 'consumed' or decision['binding']['revision'] != snapshot['revision'] or decision['binding']['action'] != action:
+            reject('capability_authorization_required')
+        decision['state'] = 'executing'
+        result = run_worker({'version':2, 'session_id':self.session_id, 'context':self.context, 'project_root':str(self.project),
+            'revision':snapshot['revision'], 'name':action['name'], 'arguments':{k:v for k,v in action['arguments'].items() if v is not None or k in entry['input_schema']['properties']}},
+            package_root=Path(__file__).resolve().parents[1], stop_event=self.stop_event)
+        decision['state'] = 'completed' if result.get('status') == 'success' else 'failed'
+        if entry['output_visibility'] == 'operator' and result.get('status') == 'success':
+            key = secrets.token_hex(24)
+            self.store._write('results/' + key + '.json', {'session':self.session_id, 'platform':self.context['platform_id'], 'result':result['result']}, exclusive=True)
+            self.execution.receipts[key] = result['result']
+            return {'status':'success','tool':'call_function','result_receipt':key,
+                    'message':'The actual result is available locally to the operator; it was not disclosed to the model.'}
+        return {**result, 'tool':'call_function'}
+
+    def fail_execution(self):
+        """An uncertain effect never restores a consumed one-use approval."""
+        with self.execution.lock:
+            if self.execution.pending:
+                self.execution.pending['state'] = 'failed'
+
+    def save_download(self, result):
+        import base64
+        from .business_contract import read_safe
+        self.validate_native(self.context)
+        decision = self.execution.pending
+        if not decision or decision['state'] != 'consumed' or decision['binding']['effect'] != 'download':
+            reject('download_authorization_required')
+        decision['state'] = 'executing'
+        if type(result) is not dict or set(result) != {'base64','size','mime'} or result['mime'] not in ('application/pdf','application/octet-stream','text/plain'):
+            reject('invalid_download_receipt')
+        if type(result['base64']) is not str or len(result['base64']) > 12 * 1024 * 1024:
+            reject('download_size_limit')
+        try:
+            content = base64.b64decode(result['base64'], validate=True)
+        except Exception:
+            reject('invalid_download_receipt')
+        if type(result['size']) is not int or not 0 < len(content) == result['size'] <= 8 * 1024 * 1024:
+            reject('invalid_download_receipt')
+        if result['mime'] == 'application/pdf' and not content.startswith(b'%PDF-'):
+            reject('invalid_pdf_download')
+        # Reuse the store's path and atomic publication protections; downloaded
+        # data remains under this platform's Git/package-excluded data directory.
+        identifier = secrets.token_hex(24)
+        extension = {'application/pdf':'.pdf', 'text/plain':'.txt', 'application/octet-stream':'.bin'}[result['mime']]
+        relative = 'downloads/' + identifier + extension
+        self.store._publish(relative, content, exclusive=True)
+        path = self.store.root / relative
+        verified = read_safe(self.project, path, 8 * 1024 * 1024)
+        if verified != content:
+            reject('download_file_changed')
+        receipt = {'id':identifier, 'platform_id':self.context['platform_id'], 'session':self.session_id,
+            'sha256':digest(content), 'bytes':len(content), 'mime':result['mime'],
+            'path':str(path), 'decision_id':decision['id'], 'binding_digest':decision['identity'],
+            'record_identity_verified':False}
+        self.store._write('downloads/' + identifier + '.receipt.json', receipt, exclusive=True)
+        decision['state'] = 'completed'
+        self.execution.receipts[identifier] = receipt
+        # Path/contents stay operator-local; only the receipt metadata enters the model.
+        return {'status':'success','tool':'download','receipt_id':identifier,'sha256':receipt['sha256'],
+            'bytes':len(content), 'relative_path':str(path.relative_to(self.project)), 'record_identity_verified':False}
 
     def _invalidate_observation(self):
         pass

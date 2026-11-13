@@ -10,6 +10,18 @@ from .business_contract import BusinessError, MAX_OUTPUT, dumps, loads, reject, 
 
 
 def execute(request):
+    if type(request) is dict and request.get('version') == 2:
+        if type(request['version']) is not int or set(request) != {'version','context','project_root','revision','name','arguments','session_id'}:
+            reject('invalid_worker_request')
+        from .capabilities import execute_worker
+        try:
+            return execute_worker(request)
+        except BusinessError as error:
+            code = str(error)
+            allowed = {'capability_revision_changed','unregistered_capability','schema_mismatch','verified_download_receipt_required','foreign_download_receipt','download_file_changed','verified_record_identity_required','capability_effect_unverified'}
+            return {'status':'error','error':code if code in allowed else 'capability_execution_failed','result':None}
+        except Exception:
+            return {'status':'error','error':'capability_execution_failed','result':None}
     from .business_run import BusinessRun, WORKER_ERRORS
     if type(request) is not dict or set(request) != {"version", "ticket", "context", "project_root", "offline_receipts", "model"} or type(request["version"]) is not int or request["version"] != 1:
         reject("invalid_worker_request")

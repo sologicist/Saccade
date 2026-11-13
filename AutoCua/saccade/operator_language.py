@@ -82,3 +82,13 @@ def spontaneous_correction(text, *, eligible, navigation, adapter=None):
     if explicit or routes:
         return 'clarify', routes
     return 'ordinary', None
+
+
+def recovery_correction(text, adapter):
+    """Closed operational Back correction, separate from reusable landmarks."""
+    from .navigation_correction import correction_framing, correction_routes
+    value, _ = correction_framing(text)
+    match = re.fullmatch(r"(?:go back|back|reviens en arriere|retourne en arriere|reviens)(?:[.,;]?\s*(?:then|puis|ensuite)\s+(.+))?[.!]?", value)
+    if not match:
+        return None
+    return {'action': 'back', 'routes': correction_routes(match[1], adapter) if match[1] else []}

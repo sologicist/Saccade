@@ -1,8 +1,9 @@
-"""Same-process continuation broker. Answers never confer execution authority."""
+"""Same-process continuation broker with separate learning and action reviews."""
 import copy
 import re
 import secrets
 import threading
+import time
 
 from .business_contract import digest, reject
 
@@ -79,7 +80,7 @@ class OperatorRequests:
                 reject('stale_navigation_correction')
             del self._correction_claims[session]
 
-    def propose_correction(self, session, run, data, routes, *, active, clarify=False):
+    def propose_correction(self, session, run, data, routes, *, active, clarify=False, recovery=None):
         """Queue bounded guidance only; a running worker must acknowledge its pause."""
         with self.lock:
             if (self.pending.get(session) or {}).get('state') in ('waiting_operator', 'pausing_operator') or (not active and (self.pending.get(session) or {}).get('state') == 'resuming'):
@@ -87,7 +88,7 @@ class OperatorRequests:
             request = {'category': 'question', 'reason': 'missing_information',
                        'request': 'Which navigation path should replace the previous attempt? Describe the sections only.'}
             self.suspend(session, run, data, request)
-            self._queued_corrections[session] = {'run_id': run, 'routes': routes, 'clarify': clarify}
+            self._queued_corrections[session] = {'run_id': run, 'routes': routes, 'clarify': clarify, 'recovery': recovery}
             if active:
                 self.pending[session]['state'] = 'pausing_operator'
                 self.pending[session]['chat_message'] = 'I have queued your correction and requested a pause. It is not applied yet; I am waiting for a safe browser checkpoint.'
@@ -112,6 +113,12 @@ class OperatorRequests:
                 item['correction_reopen'] = True
             self._verify_control(session, control, item)
             routes = queued['routes']
+            if queued.get('recovery'):
+                item['data']['task'] += '\nOperator correction: use the existing browser Back tool in this same browser after checking the history destination. Back never undoes a business effect.'
+                if not routes:
+                    item['request'] = {'category':'confirmation','reason':'condition_confirmation','request':'I will go back in the same browser after checking the destination. Reply Continue to apply this navigation correction; it does not undo any completed business action.'}
+                    item['chat_message'] = item['request']['request']
+                    return
             adapter = control.store.adapter if control else adapter
             if routes and (adapter is None or adapter.platform_id != item['data'].get('platform_id')):
                 reject('learning_platform_mismatch')
@@ -146,6 +153,12 @@ class OperatorRequests:
     def configure_teaching(self, session, control):
         with self.lock:
             self._verify_control(session, control, self.pending.get(session))
+            previous = self._controls.get(session)
+            if previous:
+                previous.execution.validate()
+                if previous.context != control.context:
+                    reject('execution_context_invalid')
+                control.execution = previous.execution
             self._controls[session] = control
             if session in self._teaching:
                 control.attach_teaching(self._teaching[session])
@@ -153,6 +166,18 @@ class OperatorRequests:
     def control_for(self, session):
         with self.lock:
             return self._controls.get(session)
+
+    def present_execution(self, session, control):
+        with self.lock:
+            item = self.pending.get(session)
+            decision = control.execution.pending
+            if session in self._reviews or not item or item['state'] != 'waiting_operator' or not decision or decision['state'] != 'pending':
+                return
+            self._verify_control(session, control, item)
+            item['execution_summary'] = decision['summary']
+            item['execution_id'] = decision['id']
+            item['execution_phrase'] = {'interaction':'Approve this interaction','disclosure':'Approve this disclosure','mutation':'Approve this state change','delete':'Approve this deletion'}.get(decision['binding']['effect'], 'Approve this action')
+            item['presentation_digest'] = digest([session, item['run_id'], item['revision'], decision['id'], decision['identity'], decision['origin_run']])
 
     def present_procedure(self, session, control):
         """Seal the exact host-generated candidate to this suspended request."""
@@ -222,6 +247,37 @@ class OperatorRequests:
                 return 'cancel', self.consume(session, {**base, 'action': 'cancel', 'answer': ''})
             if item['data'].get('_checkpoint_unavailable'):
                 reject('continuation_checkpoint_unavailable')
+            if item.get('execution_id'):
+                self._verify_control(session, control, item)
+                if type(presentation) is not str or not secrets.compare_digest(presentation, item['presentation_digest']):
+                    reject('stale_execution_presentation')
+                decision = control.execution.pending
+                if not decision or item['execution_id'] != decision['id'] or item['execution_summary'] != decision['summary'] or digest(decision['binding']) != decision['identity']:
+                    reject('stale_execution_presentation')
+                if control.execution.pending['expires'] <= time.monotonic():
+                    control.execution.pending['state'] = 'expired'
+                    for key in ('execution_id', 'execution_summary', 'execution_phrase', 'presentation_digest'):
+                        item.pop(key, None)
+                    item['request'] = {'category':'confirmation', 'reason':'condition_confirmation',
+                        'request':'The action approval expired without executing. Reply Continue to reobserve the page and request a fresh decision, or Cancel.'}
+                    self._rotate(item, item['request']['request'])
+                    return 'waiting', None
+                effect = control.execution.pending['binding']['effect']
+                phrases = {'interaction':('approve this interaction','autorise cette interaction'), 'disclosure': ('approve this disclosure', 'autorise cette divulgation'), 'mutation': ('approve this state change', 'autorise cette modification'), 'delete': ('approve this deletion', 'autorise cette suppression')}
+                approve = normalized(answer) in phrases.get(effect, ('approve this action', 'approve this interaction', 'approve execution', 'autorise cette action', 'confirme cette action'))
+                decline = intent in ('negative', 'reject')
+                if not approve and not decline:
+                    phrase = phrases.get(effect, ('Approve this action',))[0]
+                    self._rotate(item, 'Review the exact action below. Reply "' + phrase + '" to authorize it once, or "No" to reject it. Saving a procedure does not approve execution.')
+                    return 'waiting', None
+                control.execution.review(item['execution_id'], approve)
+                action = control.execution.pending['binding']['action']
+                for key in ('execution_id','execution_summary','execution_phrase','presentation_digest'):
+                    item.pop(key, None)
+                item['request'] = {'category':'confirmation','reason':'condition_confirmation','request':'The execution decision is recorded.'}
+                data = self.consume(session, {**base,'action':'resume','answer':''})
+                data['task'] += '\nOperator ' + ('approved exactly once: ' + __import__('json').dumps(action) if approve else 'rejected the proposed action; do not repeat it.')
+                return 'resume', data
             if session in self._reviews:
                 if type(presentation) is not str or not secrets.compare_digest(presentation, item['presentation_digest']):
                     reject('stale_procedure_presentation')
@@ -385,6 +441,7 @@ class OperatorRequests:
                         # Cancellation never needs a successful procedure decision.
                         self._reviews.pop(session, None)
                 self._teaching.pop(session, None)
+                if self._controls.get(session): self._controls[session].execution.cancel()
                 self._controls.pop(session, None)
                 item['state'] = 'cancelled'
                 return None

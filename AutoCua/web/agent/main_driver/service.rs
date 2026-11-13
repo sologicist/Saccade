@@ -1133,7 +1133,7 @@ impl AgentService {
         if system_prompt.contains(OS_PLACEHOLDER) {
             system_prompt = system_prompt.replace(OS_PLACEHOLDER, current_os());
         }
-        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If platform target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect. After an operator claims login is complete, reobserve the same browser; the claim is not authentication proof. If the requested authenticated state is not observable, ask a focused question before acting. When the task asks you to reach a page and wait, call ask_operator with category question and reason awaiting_instructions; stop model requests and retain the browser. Never search unrelated websites for internal bank or scribe functions; use only the trusted registered business capabilities.\n");
+        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. Use the normal native Web tools for observed targets. The controller requests an exact operator decision when effects are uncertain; supervision is not a manual navigation mode. If the target or session cannot be verified, ask a focused question or request manual help rather than inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect. After an operator claims login is complete, reobserve the same browser; the claim is not authentication proof. If the requested authenticated state is not observable, ask a focused question before acting. When the task asks you to reach a page and wait, call ask_operator with category question and reason awaiting_instructions; stop model requests and retain the browser. Never search unrelated websites for internal functions; use only the trusted registered capabilities. An execution decision authorizes only the exact displayed action once; procedure approval never authorizes execution. When the protected download tool is offered, use it for an observed document link, never raw scripts or unrelated downloads.\n");
         if single_tab {
             // Overrides the base prompt's tab guidance without editing the
             // file: this agent has no tab tools and must never plan around
@@ -2047,6 +2047,7 @@ impl AgentService {
         let mut names = names.clone();
         if !in_scrape_mode && core.business_enabled() { names.insert("call_function".into()); }
         if !in_scrape_mode && core.navigation_enabled() { names.insert("dext_navigation".into()); }
+        if !in_scrape_mode && core.registered_tool("download") { names.insert("download".into()); }
         let (actions_val, calls, rejects, track_vec) =
             crate::tool_registry::service::tool_calls_to_steps(
                 raw_response.get("tool_calls").unwrap_or(&Value::Null),
@@ -2710,10 +2711,23 @@ class Provider:
         if full_loop and self.turn > 1:
             return {'choices':[{'message':{'content':'','tool_calls':[{'id':'note-2','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic result verified','next_goal':'Finish'}},{'id':'done-2','name':'done','arguments':{'value':'Synthetic computation completed'}}]}}], 'usage':{}}
         return {'choices':[{'message':{'content':'', 'tool_calls':[{'id':'note-1','name':'reasoning','arguments':{'thinking':'','memory':'Synthetic memory','next_goal':'Synthetic bank proof'}},{'id':'bank-1', 'name':'call_function', 'arguments':{'version':1,'name':'dext.bank','arguments':{'string':'SYNTHETIC BANK','client_id':'synthetic-alpha'}}}]}}], 'usage':{}}
-fake_llm.build_provider = lambda provider, model, info, tools, **kwargs: Provider(tools)
+built_tools = []
+fake_llm.build_provider = lambda provider, model, info, tools, **kwargs: built_tools.append(tools) or Provider(tools)
 sys.modules[module_name] = fake_llm
 "#).unwrap();
             py.run(&setup, Some(&locals), None).unwrap();
+            for (speed, single_tab) in [("fast", false), ("quality", true)] {
+                let augmented = crate::tool_registry::service::LLMManager::build(py, "openai", "synthetic", None, false, "main", speed, single_tab).unwrap();
+                assert!(!augmented.registered_tool("download"));
+                augmented.set_business_tool(py, Some(json!([crate::tool_registry::service::download_tool()]))).unwrap();
+                assert!(augmented.registered_tool("download"));
+                assert!(!augmented.business_enabled());
+                let tools: Value = pythonize::depythonize(&py.eval(&CString::new("built_tools[-2]").unwrap(), Some(&locals), None).unwrap()).unwrap();
+                let names: Vec<_> = tools.as_array().unwrap().iter().filter_map(|t|t["function"]["name"].as_str()).collect();
+                assert!(names.contains(&"download"));
+                if speed == "fast" { assert!(names.contains(&"memory")); assert!(!names.contains(&"reasoning")); }
+                if single_tab { assert!(!names.contains(&"new_tab")); assert!(!names.contains(&"close_tab")); }
+            }
             let fixture = locals.get_item("fixture").unwrap().unwrap();
             let root: String = fixture.getattr("root").unwrap().str().unwrap().extract().unwrap();
             let mut scanner = crate::browser::ScannerInner::new(&PathBuf::from(&root).join("browser"), 0, None, false);
@@ -2930,7 +2944,7 @@ operator_thread.start()
             drop(state);
             // Native manual-learning checkpoints run before the provider, using
             // the same scope-checked scanner and real Python control/store.
-            py.run(&CString::new("from AutoCua.saccade.navigation_correction import NavigationTeaching\nnext_control.conversational = True\nnext_control.attach_teaching(NavigationTeaching(['purchases']))\nbefore_learning = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("from AutoCua.saccade.navigation_correction import NavigationTeaching\nnext_control.conversational = True\nnext_control.attach_teaching(NavigationTeaching(['purchases']))\nforced_tool_name = 'click'\nforced_action = {'id':2,'times':1}\nbefore_learning = provider_calls").unwrap(), Some(&locals), None).unwrap();
             {
                 let mut scanner = service.scanner.get().inner.lock().unwrap();
                 scanner.mapping = json!({"2":{"name":"Purchases","role":"link","rect":[1,1,40,20]}}).as_object().unwrap().clone();
@@ -2939,8 +2953,8 @@ operator_thread.start()
             let outcome = service.process_request(py, PyString::new(py, "Find the synthetic purchase invoices.").into_any()).unwrap();
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "waiting_operator");
-            assert!(outcome["message"].as_str().unwrap().contains("manually"));
-            py.run(&CString::new("assert provider_calls == before_learning\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
+            assert!(outcome["message"].as_str().unwrap().contains("proposed operation"));
+            py.run(&CString::new("assert provider_calls == before_learning + 1\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
             service.controller.configure_dext_control(py, None, None).unwrap();
             py.run(&CString::new("before_ask = provider_calls; forced_tool_name = 'ask_operator'; forced_action = {'category':'question','reason':'missing_information','request':'Which synthetic option should be selected?'}").unwrap(), Some(&locals), None).unwrap();
             let task = pyo3::types::PyString::new(py, "Continue the original synthetic objective.").into_any();
@@ -2952,7 +2966,7 @@ operator_thread.start()
             let same = service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), service.headless).unwrap();
             assert!(Arc::ptr_eq(&same, &service.scanner.get().inner));
             let denied = service.controller.route_action(py, &json!({"type":"click","id":1,"times":1})).unwrap();
-            assert_eq!(denied["code"], "unsupported_navigation");
+            assert_eq!(denied["status"], "error");
             assert_eq!(denied["executed"], false);
             assert!(service.platform_violation().is_none());
             assert!(service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), service.headless).is_ok());
@@ -3055,12 +3069,12 @@ before_portal = provider_calls
             assert!(!prompt.contains("Dext navigation guidance"));
             assert!(!prompt.contains("Confirm the exact record"));
             drop(state);
-            py.run(&CString::new("assert provider_calls == before_portal + 1\nportal.attach_teaching(NavigationTeaching(['settings_page'], adapter=portal.store.adapter))\nbefore_portal_pause = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("assert provider_calls == before_portal + 1\nportal.attach_teaching(NavigationTeaching(['settings_page'], adapter=portal.store.adapter))\nbefore_portal_pause = provider_calls\nforced_tool_name = 'click'\nforced_action = {'id':1,'times':1}").unwrap(), Some(&locals), None).unwrap();
             service.scanner.get().inner.lock().unwrap().mapping = json!({"1":{"name":"Settings","role":"link","rect":[1,1,40,20]}}).as_object().unwrap().clone();
             let outcome = service.process_request(py, PyString::new(py, "Continue the same portal task.").into_any()).unwrap();
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "waiting_operator");
-            assert!(outcome["message"].as_str().unwrap().contains("Settings"));
+            assert!(outcome["message"].as_str().unwrap().contains("proposed operation"));
             let retained = service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), false).unwrap();
             assert!(Arc::ptr_eq(&retained, &service.scanner.get().inner));
             let history = PyDict::new(py);
@@ -3071,7 +3085,7 @@ before_portal = provider_calls
                 history.set_item("task", "Open the synthetic Billing section and wait.").unwrap();
             }
             service.prior_history = Some(history.into_any().unbind());
-            py.run(&CString::new("assert provider_calls == before_portal_pause\nportal.close()\nold_event = threading.Event(); old_event.set()\nfresh_event = threading.Event()\nportal_resumed = PlatformLearningControl(other_context, 'portal-native-chat', project_root=fixture.root, stop_event=fresh_event, conversational=True)\nforced_tool_name = 'ask_operator'\nforced_action = {'category':'question','reason':'awaiting_instructions','request':'I have reached the requested page and stopped. What would you like me to do next?'}\nbefore_portal_resume = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("assert provider_calls == before_portal_pause + 1\nportal.close()\nold_event = threading.Event(); old_event.set()\nfresh_event = threading.Event()\nportal_resumed = PlatformLearningControl(other_context, 'portal-native-chat', project_root=fixture.root, stop_event=fresh_event, conversational=True)\nforced_tool_name = 'ask_operator'\nforced_action = {'category':'question','reason':'awaiting_instructions','request':'I have reached the requested page and stopped. What would you like me to do next?'}\nbefore_portal_resume = provider_calls").unwrap(), Some(&locals), None).unwrap();
             service.stop_event = Some(locals.get_item("fresh_event").unwrap().unwrap().unbind());
             service.controller.configure_learning_control(py, Some(&locals.get_item("portal_resumed").unwrap().unwrap()), Some(&portal_context)).unwrap();
             let result = service.process_request(py, PyString::new(py, "Operator claims login is complete; reobserve before continuing the same task.").into_any()).unwrap();
@@ -3146,6 +3160,168 @@ portal_lease.release()
 lease_module.data_root = original_lease_root
 platform_config.PROJECT_ROOT = original_project_root
 session_context._registered_vision_model = original_vision_check
+if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)
+else: os.environ['AutoCua_WEB_DIR'] = original_web_override
+"#).unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new(r#"
+from tests.test_universal_execution import UniversalExecutionContracts
+from AutoCua.saccade.operator_requests import OperatorRequests
+execution_fixture = UniversalExecutionContracts()
+execution_fixture.setUp()
+platform_config.PROJECT_ROOT = execution_fixture.fixture.root
+session_context._registered_vision_model = lambda provider, model: True
+os.environ['AutoCua_WEB_DIR'] = str(fixture.root / 'native-web')
+lease_module.data_root = lambda: fixture.root / 'lease-data'
+sys.modules[native_stub.__name__] = native_stub
+sys.modules[compression_stub.__name__] = compression_stub
+manifest = __import__('json').loads((execution_fixture.fixture.root / 'AutoCua/default_skills/web/domain_skill/skills.json').read_text(encoding='utf-8'))
+(loop_domain / 'skills.json').write_text(__import__('json').dumps(manifest), encoding='utf-8')
+for ctx in execution_fixture.contexts:
+    filename = ctx['platform_id'] + '.md'
+    (loop_domain / filename).write_text((execution_fixture.fixture.root / 'AutoCua/default_skills/web/domain_skill' / filename).read_text(encoding='utf-8'), encoding='utf-8')
+"#).unwrap(), Some(&locals), None).unwrap();
+            for index in 0..3 {
+                locals.set_item("execution_index", index).unwrap();
+                py.run(&CString::new(r#"
+native_exec_context = execution_fixture.contexts[execution_index]
+native_exec_lease = lease_module.acquire_web_profile(native_exec_context['browser_profile'])
+native_exec_control = execution_fixture.control(execution_index)
+native_exec_control.conversational = True
+native_exec_broker = OperatorRequests()
+native_exec_broker.configure_teaching('chat', native_exec_control)
+forced_tool_name = 'call_function'
+forced_action = {'version':1,'name':native_exec_context['platform_id']+'.transform','arguments':{'text':'synthetic'}}
+native_exec_action = {'type':'call_function',**forced_action}
+before_execution = provider_calls
+"#).unwrap(), Some(&locals), None).unwrap();
+                let context: Value = pythonize::depythonize(&locals.get_item("native_exec_context").unwrap().unwrap()).unwrap();
+                let browser = BrowserScanner::create(&PathBuf::from(&root).join("execution-browser"), 0, None, None, false);
+                let host = context["start_url"].as_str().unwrap();
+                browser.inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation(host); 256]));
+                let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root).join("execution-controller"), None, false, browser.inner.clone(), None).unwrap();
+            let native_exec_service = AgentService {
+                observed_run: AtomicBool::new(false),
+                active_run: Arc::new(Mutex::new(())), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
+                context_provider: "openai".into(), context_model: "synthetic".into(), profile_name: Some(context["browser_profile"].as_str().unwrap().into()),
+                profile_lease: locals.get_item("native_exec_lease").unwrap().unwrap().unbind(), owns_profile_lease: false,
+                max_steps: 4, speed: "quality".into(), headless: false, save_conversation: false, browser_port: 0, correction_reopen: false,
+                system_prompt: "Synthetic supervised native-loop contract. Use notes first and done alone.".into(),
+                llm_manager: Py::new(py, crate::tool_registry::service::LLMManager::build(py, "openai", "synthetic", None, false, "main", "quality", false).unwrap()).unwrap(),
+                stop_event: None, scanner: Py::new(py, browser).unwrap(), controller,
+                compression: locals.get_item("compression").unwrap().unwrap().unbind(),
+                text_callback: Some(locals.get_item("chat_results").unwrap().unwrap().getattr("append").unwrap().unbind()),
+                tool_callback: None, token_callback: None, prior_history: None,
+                state: Mutex::new(RunState { assistant_messages: PyList::empty(py).into_any().unbind(),
+                    tool_responses: PyList::empty(py).into_any().unbind(), last_messages: py.None(),
+                    scrape_mode: false, scrape_start: None, scrape_shots: Vec::new() }),
+            };
+                native_exec_service.controller.configure_learning_control(py, Some(&locals.get_item("native_exec_control").unwrap().unwrap()), Some(&locals.get_item("native_exec_context").unwrap().unwrap())).unwrap();
+                let outcome = native_exec_service.process_request(py, PyString::new(py, "Use the installed function only, then stop.").into_any()).unwrap();
+                let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+                assert_eq!(outcome["status"], "waiting_operator", "{outcome}");
+                let owner = Py::new(py, native_exec_service).unwrap();
+                locals.set_item("native_exec_owner", owner.bind(py)).unwrap();
+                py.run(&CString::new(r#"
+assert provider_calls == before_execution + 1
+native_exec_broker.suspend('chat','native-run',{'platform_id':native_exec_context['platform_id'],'task':'Use the installed function only, then stop.'},
+    {'category':'confirmation','reason':'condition_confirmation','request':'May I execute the displayed function?'})
+native_exec_broker.present_execution('chat',native_exec_control)
+assert native_exec_control.execution.pending['state'] == 'pending'
+phrase = native_exec_broker.status('chat')['execution_phrase']
+event = execution_fixture.event(native_exec_broker, phrase)
+kind, continuation = native_exec_broker.chat('chat',event,control=native_exec_control)
+assert kind == 'resume'
+assert provider_calls == before_execution + 1
+native_exec_control.close()
+native_exec_next = execution_fixture.control(execution_index)
+native_exec_broker.configure_teaching('chat',native_exec_next)
+forced_tool_name = 'call_function'
+forced_action = {k:v for k,v in native_exec_action.items() if k != 'type'}
+native_exec_resumed = NativeAgentClass(provider='openai',model='synthetic',speed='quality',
+    platform_context=native_exec_context,browser_profile=native_exec_context['browser_profile'],
+    profile_lease=native_exec_lease,operator_session=native_exec_owner,learning_control=native_exec_next,
+    prior_history={'task':continuation['task'],'assistant_messages':native_exec_owner.assistant_messages,'tool_responses':native_exec_owner.tool_responses})
+result = native_exec_resumed.process_request(continuation['task'])
+assert result['status'] == 'success', result
+assert native_exec_next.execution.pending['state'] == 'completed'
+assert native_exec_resumed.operator_resume_observed
+assert 'PLATFORM-' + str(execution_index) in str(native_exec_resumed.tool_responses) if execution_index == 0 else 'result_receipt' in str(native_exec_resumed.tool_responses)
+assert native_exec_context['platform_id']+'.transform' in str(native_exec_resumed.last_messages)
+for other in execution_fixture.contexts:
+    if other['platform_id'] != native_exec_context['platform_id']:
+        assert other['platform_id']+'.transform' not in str(native_exec_resumed.last_messages)
+"#).unwrap(), Some(&locals), None).unwrap();
+                {
+                    let agent = locals.get_item("native_exec_resumed").unwrap().unwrap();
+                    let agent: PyRef<'_, AgentService> = agent.extract().unwrap();
+                    let mut scanner = agent.scanner.get().inner.lock().unwrap();
+                    scanner.mapping = json!({"2":{"tag":"a","role":"link","name":format!("Section {index}"),"line":"<a href=\"/document.pdf\">Document</a>","rect":[1,1,50,20]}}).as_object().unwrap().clone();
+                    scanner.business_test_observations = Some(VecDeque::from(vec![observation(context["start_url"].as_str().unwrap());256]));
+                    scanner.business_test_download = Some(json!({"base64":"JVBERi0xLjQKU3ludGhldGljCg==","size":19,"mime":"application/pdf"}));
+                }
+                py.run(&CString::new(r#"
+forced_tool_name = 'click'
+forced_action = {'id':2,'times':1}
+clicked = native_exec_resumed.process_request('Open the public section using the common click tool.')
+if execution_index == 1:
+    assert clicked['status'] == 'waiting_operator', clicked
+    native_exec_next.execution.review(native_exec_next.execution.pending['id'], True)
+    forced_action = {'id':2,'times':1}
+    clicked = native_exec_resumed.process_request('Operator approved the exact click; reobserve and execute it once.')
+assert clicked['status'] == 'success', clicked
+forced_tool_name = 'download'
+forced_action = {'target_id':2}
+requested = native_exec_resumed.process_request('Download only the displayed synthetic document.')
+assert requested['status'] == 'waiting_operator', requested
+assert native_exec_next.execution.pending['binding']['effect'] == 'download'
+native_exec_next.execution.review(native_exec_next.execution.pending['id'], True)
+forced_action = {'target_id':2}
+downloaded = native_exec_resumed.process_request('The exact download is approved; report its verified result.')
+assert downloaded['status'] == 'success', downloaded
+assert 'receipt_id' in str(native_exec_resumed.tool_responses)
+assert native_exec_next.execution.pending['state'] == 'completed'
+"#).unwrap(), Some(&locals), None).unwrap();
+                {
+                    let agent = locals.get_item("native_exec_resumed").unwrap().unwrap();
+                    let agent: PyRef<'_, AgentService> = agent.extract().unwrap();
+                    let scanner = agent.scanner.get().inner.lock().unwrap();
+                    assert_eq!(scanner.business_test_actions.iter().filter(|a|a["type"] == "click").count(), 1);
+                    assert_eq!(scanner.business_test_actions.iter().filter(|a|a["type"] == "download_observed").count(), 1);
+                }
+                {
+                    let agent = locals.get_item("native_exec_resumed").unwrap().unwrap();
+                    let agent: PyRef<'_, AgentService> = agent.extract().unwrap();
+                    let mut scanner = agent.scanner.get().inner.lock().unwrap();
+                    scanner.mapping.get_mut("2").unwrap()["line"] = json!("<a href=\"/unverified.pdf\">Unverified document</a>");
+                    scanner.business_test_download = Some(json!({}));
+                }
+                py.run(&CString::new(r#"
+forced_tool_name = 'download'
+forced_action = {'target_id':2}
+assert native_exec_resumed.process_request('Request the second document separately.')['status'] == 'waiting_operator'
+native_exec_next.execution.review(native_exec_next.execution.pending['id'], True)
+forced_action = {'target_id':2}
+before_failed_download = provider_calls
+failed_download = native_exec_resumed.process_request('Attempt only the separately approved document.')
+assert failed_download['status'] == 'waiting_operator', failed_download
+assert native_exec_next.execution.pending['state'] == 'failed'
+assert provider_calls == before_failed_download + 1
+assert native_exec_resumed.operator_handoff_available
+assert 'execution_not_verified' in str(native_exec_resumed.tool_responses)
+"#).unwrap(), Some(&locals), None).unwrap();
+                py.run(&CString::new(r#"
+native_exec_next.close()
+native_exec_lease.release()
+"#).unwrap(), Some(&locals), None).unwrap();
+            }
+            py.run(&CString::new(r#"
+execution_fixture.doCleanups()
+platform_config.PROJECT_ROOT = original_project_root
+session_context._registered_vision_model = original_vision_check
+lease_module.data_root = original_lease_root
+for name, old in [('AutoCua.web.agent_native', old_native_module), ('AutoCua.memory_compression.controller', old_compression_module)]:
+    sys.modules.pop(name, None)
+    if old is not None: sys.modules[name] = old
 if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)
 else: os.environ['AutoCua_WEB_DIR'] = original_web_override
 "#).unwrap(), Some(&locals), None).unwrap();

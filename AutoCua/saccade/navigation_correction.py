@@ -155,4 +155,4 @@ class NavigationTeaching:
         return {'category': 'manual_action', 'reason': 'manual_intervention',
                 'request': (f'Please open {label} manually in the dedicated Chrome window, then tell me when it is done. '
                             if self.source else f'Please show the {label} navigation control in the dedicated Chrome window, then tell me when it is visible. ') +
-                           'I will verify the visible section before proposing reusable guidance; automatic navigation is still unavailable.'}
+                           'I will verify the visible section before proposing reusable guidance.'}

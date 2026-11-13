@@ -2394,6 +2394,10 @@ fn show_by_tabs_api(port: u16, window: &Value, url: &str, twins: usize, place: u
 pub struct ScannerInner {
     #[cfg(test)]
     pub business_test_observations: Option<std::collections::VecDeque<Value>>,
+    #[cfg(test)]
+    pub business_test_actions: Vec<Value>,
+    #[cfg(test)]
+    pub business_test_download: Option<Value>,
     /// A selected platform is an execution policy, never page-provided context.
     platform_scope: Option<crate::platform_scope::PlatformScope>,
     scope_initialized: bool,
@@ -2527,6 +2531,10 @@ impl ScannerInner {
         ScannerInner {
             #[cfg(test)]
             business_test_observations: None,
+            #[cfg(test)]
+            business_test_actions: Vec::new(),
+            #[cfg(test)]
+            business_test_download: None,
             platform_scope: None,
             scope_initialized: false,
             scope_observer_id: String::new(),
@@ -2593,6 +2601,8 @@ impl ScannerInner {
                 .unwrap_or_default().as_nanos());
         if self.scope_session_id.is_empty() { self.scope_session_id = self.scope_observer_id.clone(); }
     }
+
+    pub(crate) fn navigation_scope(&self) -> Option<crate::platform_scope::PlatformScope> { self.platform_scope.clone() }
 
     pub fn platform_violation(&self) -> Option<String> {
         self.platform_scope.as_ref().and_then(|scope| scope.violation().map(str::to_string))
@@ -2939,6 +2949,31 @@ impl ScannerInner {
         Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
             "platform_id": scope.platform_id, "profile": scope.browser_profile, "session": self.scope_session_id,
             "config_revision": scope.config_revision}))
+    }
+
+    /// One explicitly approved, observed top-frame link, fetched by trusted
+    /// bridge code with redirect rejection; global download denial stays set.
+    pub fn download_observed(&mut self, action: &Value) -> SResult<Value> {
+        self.check_platform_scope()?;
+        let key = action.get("target_id").and_then(Value::as_i64).filter(|id| *id > 0)
+            .ok_or_else(|| ScanErr::s("invalid_download_target"))?.to_string();
+        let target = self.mapping.get(&key).ok_or_else(|| ScanErr::s("unobserved_download_target"))?;
+        let line = target["line"].as_str().unwrap_or_default();
+        let tag = line.split_once('<').and_then(|(_, s)| s.split_once('>')).map(|(s, _)| s).unwrap_or_default();
+        let href = tag.split_once("href=\"").and_then(|(_, s)| s.split_once('"')).map(|(s, _)| s)
+            .ok_or_else(|| ScanErr::s("download_requires_observed_link"))?;
+        let url = url::Url::parse(&self.url).and_then(|base| base.join(href)).map_err(|_| ScanErr::s("invalid_download_url"))?.to_string();
+        self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("download_requires_platform"))?.validate_url(&url).map_err(ScanErr::s)?;
+        let name = target["name"].as_str().unwrap_or_default().to_string();
+        #[cfg(test)]
+        if let Some(result) = self.business_test_download.clone() {
+            self.business_test_actions.push(json!({"type":"download_observed","url":url,"name":name}));
+            self.check_platform_scope()?;
+            return Ok(result);
+        }
+        let result = self.bridge_call(json!({"type":"download_observed", "url":url, "name":name}))?;
+        self.check_platform_scope()?;
+        Ok(result)
     }
 
     /// Scope-only metadata for a local UI preview; never an input permit.
