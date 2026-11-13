@@ -361,7 +361,18 @@ impl ControllerView {
             return Ok(Some(pythonize::depythonize(&result)?));
         }
         if kind == "download" {
-            let result = super::service::scan_op(py, &self.scanner, |scanner| scanner.download_observed(action))
+            let pending = control.bind(py).getattr("execution")?.getattr("pending")?;
+            if decision["effect"] != "download" || !decision["decision_id"].is_string()
+                || pending.is_none() || pending.get_item("state")?.extract::<String>()? != "consumed"
+                || pending.get_item("id")?.extract::<String>()? != decision["decision_id"].as_str().unwrap_or_default() {
+                return Err(pyo3::exceptions::PyValueError::new_err(crate::platform_scope::APPROVAL_UNAVAILABLE));
+            }
+            let result = super::service::scan_op(py, &self.scanner, |scanner| {
+                scanner.arm_scoped_gesture("download", action)?;
+                let result = scanner.download_observed(action);
+                scanner.clear_scoped_gesture();
+                result
+            })
                 .map_err(|e| match e { ActErr::Py(e) => e, ActErr::Msg(s) => pyo3::exceptions::PyValueError::new_err(s) })?;
             let receipt = control.bind(py).call_method1("save_download", (pythonize::pythonize(py, &result)?,))?;
             return Ok(Some(pythonize::depythonize(&receipt)?));
@@ -614,8 +625,17 @@ impl ControllerView {
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => return Err(error),
             Err(error) => {
                 let detail = error.value(py).to_string();
-                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download"];
-                let code = codes.iter().copied().find(|code| detail.contains(code)).unwrap_or("execution_not_verified");
+                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download", "download_requires_observed_link", "invalid_download_target", "unobserved_download_target", "invalid_download_url", "download_requires_platform", "download_observation_failed", "invalid_download_receipt"];
+                let code = if detail.contains(crate::platform_scope::APPROVAL_UNAVAILABLE) {
+                    "APPROVAL_UNAVAILABLE"
+                } else if detail.contains("not in extension mode") { "chrome_bridge_unavailable" }
+                else if detail.contains("bridge state poisoned") { "chrome_bridge_poisoned" }
+                else if detail.contains("connection to AutoCuaBridge was lost") { "chrome_bridge_disconnected" }
+                else if detail.contains("no answer from AutoCuaBridge") { "chrome_bridge_timeout" }
+                else if detail.contains("connect") && detail.contains("AutoCuaBridge") { "chrome_bridge_unavailable" }
+                else if detail.contains("Failed to fetch") || detail.contains("fetch failed") { "download_fetch_failed" }
+                else { codes.iter().copied().find(|code| detail.contains(code)).unwrap_or(
+                    if action["type"] == "download" { "download_failed" } else { "execution_not_verified" }) };
                 // Preserve the owned browser for a supported alternative. A
                 // lost security boundary still takes the existing hard-failure
                 // path; an unsupported download must never become success.
@@ -695,7 +715,7 @@ impl ControllerView {
 
         if scoped_gesture {
             super::service::scan_op(py, &self.scanner, |scanner| {
-                scanner.arm_scoped_gesture(&kind)
+                scanner.arm_scoped_gesture(&kind, action)
             })
             .map_err(|error| match error {
                 ActErr::Py(error) => error,

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { submitOperatorChat, type PendingOperator } from './operator_chat.ts';
+import { executionDetails, submitOperatorChat, type PendingOperator } from './operator_chat.ts';
 
 declare global { interface Window {
     remoteRunStarted?: (payload: string) => void;
@@ -44,10 +44,12 @@ export function OperatorReview() {
     }, []);
     const paused = pending && ['waiting_operator', 'resuming', 'pausing_operator'].includes(pending.state);
     const visibleResults = results.session === window.currentSessionId ? results.rows : [];
+    const execution = pending ? executionDetails(pending) : null;
     if (!paused && !visibleResults.length) return null;
     return <>{visibleResults.length > 0 && <section aria-label="Local capability results"><p>Private results for this conversation, shown only to you:</p>{visibleResults.map(row => <pre key={row.receipt} style={{whiteSpace:'pre-wrap'}}>{JSON.stringify(row.result, null, 2)}</pre>)}</section>}{paused && pending && <section className="operator-assistance" aria-label="Assistant assistance" style={{ pointerEvents: 'auto', padding: '8px 12px', maxHeight: '35vh', overflow: 'auto' }}>
-        {pending.chat_message && <p>{pending.chat_message}</p>}
-        {pending.execution_summary && <><p>This is an execution decision, not a learning approval. Review the exact target, operation and destination. An unclassified interaction may change website state.</p><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.execution_summary}</pre><p>Reply "{pending.execution_phrase || "Approve this action"}" to authorize this exact operation once, or "No".</p></>}
+        {execution && <><p>Operation: <strong>{execution.operation.type}</strong> — effect: {execution.effect}</p><pre style={{whiteSpace:'pre-wrap'}}>{JSON.stringify(execution.operation, null, 2)}</pre><p>Target:</p><pre style={{whiteSpace:'pre-wrap'}}>{JSON.stringify(execution.target, null, 2)}</pre><p>Destination: <strong>{execution.destination}</strong></p><p>Reply "{pending.execution_phrase || "Approve this action"}" to authorize this exact operation once, or "No". This does not approve learning.</p></>}
+        {pending.execution_summary && !execution && <p role="alert">The exact operation could not be verified. Cancel or refresh before approving.</p>}
+        {!pending.execution_summary && pending.chat_message && <p>{pending.chat_message}</p>}
         {pending.procedure_summary && <>
             <p>I can remember this operator-assisted procedure for future sessions. Should I save it?</p>
             <p style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_label}</p>

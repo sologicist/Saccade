@@ -892,6 +892,13 @@ impl Bridge {
         ScanErr::s(format!("{kind}: the connection to AutoCuaBridge was lost"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_scoped_socket(src: &Path, profile: &Path, stream: TcpStream) -> io::Result<Self> {
+        let mut bridge = open_scoped_bridge(src, profile)?;
+        bridge.conn = Some(WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None));
+        Ok(bridge)
+    }
+
     /// One request, answered. The extension's own messages read on the way are kept
     /// (`stash`); a reply to a request given up on earlier is dropped.
     pub fn request(&mut self, mut payload: Value, timeout: Duration) -> SResult<Value> {

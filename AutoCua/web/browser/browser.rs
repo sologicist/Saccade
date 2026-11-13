@@ -2400,7 +2400,7 @@ pub struct ScannerInner {
     pub business_test_download: Option<Value>,
     /// A selected platform is an execution policy, never page-provided context.
     platform_scope: Option<crate::platform_scope::PlatformScope>,
-    scoped_gesture: Option<(String, String)>,
+    scoped_gesture: Option<(String, String, Option<Value>)>,
     scope_initialized: bool,
     scope_observer_id: String,
     pub port: u16,
@@ -2959,6 +2959,13 @@ impl ScannerInner {
     /// bridge code with redirect rejection; global download denial stays set.
     pub fn download_observed(&mut self, action: &Value) -> SResult<Value> {
         self.check_platform_scope()?;
+        let req = self.observed_download_request(action)?;
+        let result = self.bridge_request(req)?;
+        self.check_platform_scope()?;
+        Ok(result)
+    }
+
+    fn observed_download_request(&self, action: &Value) -> SResult<Value> {
         let key = action.get("target_id").and_then(Value::as_i64).filter(|id| *id > 0)
             .ok_or_else(|| ScanErr::s("invalid_download_target"))?.to_string();
         let target = self.mapping.get(&key).ok_or_else(|| ScanErr::s("unobserved_download_target"))?;
@@ -2969,15 +2976,8 @@ impl ScannerInner {
         let url = url::Url::parse(&self.url).and_then(|base| base.join(href)).map_err(|_| ScanErr::s("invalid_download_url"))?.to_string();
         self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("download_requires_platform"))?.validate_url(&url).map_err(ScanErr::s)?;
         let name = target["name"].as_str().unwrap_or_default().to_string();
-        #[cfg(test)]
-        if let Some(result) = self.business_test_download.clone() {
-            self.business_test_actions.push(json!({"type":"download_observed","url":url,"name":name}));
-            self.check_platform_scope()?;
-            return Ok(result);
-        }
-        let result = self.bridge_call(json!({"type":"download_observed", "url":url, "name":name}))?;
-        self.check_platform_scope()?;
-        Ok(result)
+        let tab = self.tab_id.as_ref().ok_or_else(|| ScanErr::s("download_target_changed"))?;
+        Ok(json!({"type":"download_observed", "url":url, "name":name,"tabId":Self::bridge_tab_id(tab)}))
     }
 
     /// Scope-only metadata for a local UI preview; never an input permit.
@@ -3064,6 +3064,9 @@ impl ScannerInner {
     /// A request that names no tab (tabs, new_tab, the cursor broadcasts, glow,
     /// release). Answered, or an error the tool reports as it reports any other.
     pub fn bridge_request(&mut self, req: Value) -> SResult<Value> {
+        if req["type"] == "download_observed" && self.platform_scope.is_none() {
+            return Err(ScanErr::s(crate::platform_scope::APPROVAL_UNAVAILABLE));
+        }
         // Defense in depth for native helpers and automatic tool paths. Only
         // trusted observation/cosmetic requests and scoped navigation can use
         // the existing bridge while a platform context is installed.
@@ -3084,13 +3087,20 @@ impl ScannerInner {
                     Ok(())
                 },
 
-                "click" | "input" | "keyboard" | "dialog" => {
+                "click" | "input" | "keyboard" | "dialog" | "download_observed" => {
                     // A native controller action must have explicitly armed
                     // this exact browser gesture on this exact tab.
                     // Consume the permit before dispatch.
-                    let permitted = self.scoped_gesture.take().is_some_and(
-                        |(expected_kind, expected_tab)| {
+                    let grant = self.scoped_gesture.take();
+                    let armed = grant.is_some();
+                    let permitted = grant.is_some_and(
+                        |(expected_kind, expected_tab, download)| {
                             expected_kind == kind
+                                && self.tab_id.as_ref() == Some(&expected_tab)
+                                && (kind != "download_observed" || download.is_some_and(|bound| {
+                                    bound["request"] == req && bound["page"] == self.url
+                                        && self.mapping.get(bound["target_id"].as_str().unwrap_or_default()) == Some(&bound["target"])
+                                }))
                                 && req.get("tabId")
                                     == Some(&Self::bridge_tab_id(&expected_tab))
                         },
@@ -3100,10 +3110,7 @@ impl ScannerInner {
                         self.check_platform_scope()?;
                         Ok(())
                     } else {
-                        Err(
-                            crate::platform_scope::APPROVAL_UNAVAILABLE
-                                .to_string(),
-                        )
+                        Err(if armed && kind == "download_observed" { "download_target_changed".to_string() } else { crate::platform_scope::APPROVAL_UNAVAILABLE.to_string() })
                     }
                 },
 
@@ -3116,13 +3123,20 @@ impl ScannerInner {
             if let Err(message) = allowed {
                 // Missing action authority is a pre-dispatch refusal,
                 // not evidence that the browser escaped its platform.
-                if message == crate::platform_scope::APPROVAL_UNAVAILABLE {
+                if message == crate::platform_scope::APPROVAL_UNAVAILABLE || message == "download_target_changed" {
                     return Err(ScanErr::s(message));
                 }
 
                 return Err(self.platform_failure(message));
             }
 
+        }
+        #[cfg(test)]
+        if req["type"] == "download_observed" {
+            if let Some(result) = self.business_test_download.clone() {
+                self.business_test_actions.push(req);
+                return Ok(result);
+            }
         }
         let Some(bridge) = self.bridge.clone() else {
             return Err(ScanErr::s("not in extension mode"));
@@ -4308,12 +4322,15 @@ impl ScannerInner {
     pub(crate) fn arm_scoped_gesture(
         &mut self,
         kind: &str,
+        action: &Value,
     ) -> SResult<()> {
+        self.clear_scoped_gesture();
         let bridge_kind = match kind {
             "click" | "hold_click" => "click",
             "input" => "input",
             "keyboard" => "keyboard",
             "dialog" => "dialog",
+            "download" => "download_observed",
             _ => return Err(ScanErr::s(
                 "unsupported_scoped_gesture",
             )),
@@ -4323,10 +4340,12 @@ impl ScannerInner {
 
         let tab = self.current_target_id()?;
 
-        self.scoped_gesture = Some((
-            bridge_kind.to_string(),
-            tab,
-        ));
+        let download = if kind == "download" {
+            let req = self.observed_download_request(action)?;
+            let id = action["target_id"].as_i64().ok_or_else(|| ScanErr::s("invalid_download_target"))?.to_string();
+            Some(json!({"request":req,"target_id":id,"target":self.mapping[&id],"page":self.url}))
+        } else { None };
+        self.scoped_gesture = Some((bridge_kind.to_string(), tab, download));
 
         Ok(())
     }
@@ -6030,5 +6049,83 @@ mod platform_observation_tests {
         let decoded = ScannerInner::scope_tabs(&absent_pending).unwrap();
         assert_eq!(decoded[0]["pendingUrl"], "");
         assert_eq!(decoded[0]["id"], "1");
+    }
+}
+
+#[cfg(test)]
+mod download_permit_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use tungstenite::{Message, WebSocket, protocol::Role};
+
+    #[test]
+    fn real_native_bridge_consumes_download_permit_and_rejects_changed_targets() {
+        Python::initialize();
+        let root = std::env::temp_dir().join(format!("saccade-download-permit-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("extension")).unwrap();
+        std::fs::write(root.join("extension/manifest.json"), r#"{"manifest_version":3,"name":"Synthetic","version":"1.0","background":{"service_worker":"background.js"}}"#).unwrap();
+        std::fs::write(root.join("extension/background.js"), "// Synthetic fixture").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut ws = WebSocket::from_raw_socket(client, Role::Client, None);
+            for index in 0..2 {
+                let Message::Text(text) = ws.read().unwrap() else { panic!("Expected request") };
+                let req: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(req["type"], "download_observed");
+                assert_eq!(req["tabId"], 1);
+                let reply = if index == 0 { json!({"id":req["id"],"result":{"size":19,"mime":"application/pdf","base64":"JVBERi0xLjQKU3ludGhldGljCg=="}}) }
+                    else { json!({"id":req["id"],"error":"download_response_denied"}) };
+                ws.send(Message::Text(reply.to_string())).unwrap();
+            }
+        });
+        let bridge = Bridge::test_scoped_socket(&root.join("extension"), &root.join("synthetic-profile"), server).unwrap();
+        let mut scanner = ScannerInner::new(&root, 0, None, false);
+        scanner.bridge = Some(Arc::new(Mutex::new(bridge)));
+        scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&json!({
+            "schema_version":1,"platform_id":"dext","execution_mode":"supervised","browser_profile":"saccade-dext",
+            "start_url":"https://app.dext.com/invoice","allowed_hosts":["app.dext.com"],"max_steps":45,"config_revision":"a".repeat(64)})).unwrap());
+        scanner.url = "https://app.dext.com/invoice".into();
+        scanner.business_test_observations = Some(VecDeque::from(vec![json!({"schema_version":1,"observer_id":"synthetic-observer","failure":"","overflow":false,"downloads_denied":true,
+            "tabs":[{"id":"1","url":"https://app.dext.com/invoice"}],"events":[]});64]));
+        scanner.mapping = json!({"2":{"name":"Invoice PDF","line":"<a href=\"/invoice.pdf\">Invoice PDF</a>"}}).as_object().unwrap().clone();
+        let action = json!({"type":"download","target_id":2});
+        assert!(scanner.check_platform_scope().is_ok());
+        let request = scanner.observed_download_request(&action).unwrap_or_else(|_| panic!("Expected observed link"));
+        assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+        assert_eq!(scanner.download_observed(&action).unwrap_or_else(|_| panic!("Expected permitted download"))["size"], 19);
+        assert!(scanner.scoped_gesture.is_none());
+        assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        for change in ["request", "request_tab", "mapping", "tab", "page"] {
+            scanner.url = "https://app.dext.com/invoice".into();
+            assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+            let original = scanner.mapping.clone();
+            let mut altered = request.clone();
+            match change {
+                "request" => altered["url"] = json!("https://app.dext.com/other.pdf"),
+                "request_tab" => altered["tabId"] = json!(2),
+                "mapping" => scanner.mapping.get_mut("2").unwrap()["name"] = json!("Different invoice"),
+                "tab" => scanner.tab_id = Some("2".into()),
+                "page" => scanner.url = "https://app.dext.com/other".into(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(scanner.bridge_request(altered), Err(ScanErr::Scanner(ref code)) if code == "download_target_changed"), "{change}");
+            assert!(scanner.scoped_gesture.is_none());
+            scanner.mapping = original;
+            assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        }
+        scanner.url = "https://app.dext.com/invoice".into();
+        assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+        assert!(matches!(scanner.download_observed(&action), Err(ScanErr::Scanner(ref code)) if code == "download_response_denied"));
+        scanner.clear_scoped_gesture();
+        assert!(scanner.scoped_gesture.is_none());
+        peer.join().unwrap();
+        drop(scanner);
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

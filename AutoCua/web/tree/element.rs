@@ -1069,7 +1069,21 @@ impl<'a> Scanner<'a> {
                 continue;
             }
 
-            let display_name = if ax_name.is_empty() { &text } else { &ax_name };
+            let mut fallback_name = text.clone();
+            if ax_name.is_empty() && fallback_name.is_empty() && tag == "button" {
+                let classes = attr(ni, "class").unwrap_or_default();
+                if classes.split_whitespace().any(|c| c == "download") && classes.split_whitespace().any(|c| c == "s-button-download") {
+                    let mut parent = parent_idx.get(ni).copied().unwrap_or(-1);
+                    for _ in 0..100 {
+                        if parent < 0 { break }
+                        if attr(parent as usize, "class").unwrap_or_default().split_whitespace().any(|c| c == "receipt-page") {
+                            fallback_name = "T\u{e9}l\u{e9}charger PDF".into(); break;
+                        }
+                        parent = parent_idx.get(parent as usize).copied().unwrap_or(-1);
+                    }
+                }
+            }
+            let display_name = if ax_name.is_empty() { &fallback_name } else { &ax_name };
             let kind = if act {
                 'a'
             } else if land {

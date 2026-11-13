@@ -2994,6 +2994,57 @@ operator_thread.start()
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "success");
             py.run(&CString::new("assert provider_calls == before_learning + 2\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
+            // Exercise download -> private receipt -> production Scribe through
+            // the native controller. Only Chrome I/O and Gemini/worker transport
+            // are boundary stubs; production registry, grants and validation run.
+            {
+                let mut scanner = service.scanner.get().inner.lock().unwrap();
+                scanner.mapping = json!({"2":{"name":"Synthetic PDF","role":"link","rect":[1,1,40,20],"line":"<a href=\"/invoice.pdf\">Synthetic PDF</a>"}}).as_object().unwrap().clone();
+                scanner.business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/"); 256]));
+                scanner.business_test_download = Some(json!({"base64":"JVBERi0xLjQKU3ludGhldGljCg==","size":19,"mime":"application/pdf"}));
+            }
+            py.run(&CString::new("forced_tool_name='download'; forced_action={'target_id':2}").unwrap(), Some(&locals), None).unwrap();
+            let result = service.process_request(py, PyString::new(py, "Download the displayed synthetic invoice.").into_any()).unwrap();
+            assert_eq!(pythonize::depythonize::<Value>(result.bind(py)).unwrap()["status"], "waiting_operator");
+            py.run(&CString::new("next_control.execution.review(next_control.execution.pending['id'],True); forced_action={'target_id':2}").unwrap(), Some(&locals), None).unwrap();
+            let result = service.process_request(py, PyString::new(py, "Execute only the approved download.").into_any()).unwrap();
+            assert_eq!(pythonize::depythonize::<Value>(result.bind(py)).unwrap()["status"], "success");
+            py.run(&CString::new(r#"
+from unittest.mock import patch
+from AutoCua.saccade import scribe_pdf, business_process, capabilities
+native_pdf_receipt = next(v for v in next_control.execution.receipts.values() if type(v) is dict and v.get('mime') == 'application/pdf')
+fixture.registration['clients']['synthetic-alpha']['synthetic'] = False
+fixture.write_registration()
+forced_tool_name = 'call_function'
+native_scribe_args = {'version':1,'name':'dext.scribe_pdf','arguments':{'document':'receipt:'+native_pdf_receipt['id'],'client_id':'synthetic-alpha','sens':'achat'}}
+forced_action = native_scribe_args.copy()
+"#).unwrap(), Some(&locals), None).unwrap();
+            let result = service.process_request(py, PyString::new(py, "Analyze this current verified PDF with Scribe.").into_any()).unwrap();
+            assert_eq!(pythonize::depythonize::<Value>(result.bind(py)).unwrap()["status"], "waiting_operator");
+            py.run(&CString::new(r#"
+assert next_control.execution.pending['binding']['effect'] == 'disclosure'
+assert next_control.execution.pending['binding']['target']['scribe']['receipt'] == native_pdf_receipt['id']
+next_control.execution.review(next_control.execution.pending['id'], True)
+forced_action = native_scribe_args.copy()
+native_proposal = fixture.invoice()['fixture-one']['expected']
+def native_scribe_worker(request, **options):
+    assert request['authorization']['state'] == 'consumed'
+    with patch.object(scribe_pdf, 'complete', return_value=__import__('json').dumps(native_proposal)):
+        return capabilities.execute_worker(request)
+worker_patch = patch.object(business_process, 'run_worker', side_effect=native_scribe_worker)
+credential_patch = patch.object(scribe_pdf, 'credentials', return_value={'GEMINI_API_KEY':'synthetic','COMPTABLE_LLM_MODEL':scribe_pdf.DEFAULT_MODEL})
+worker_patch.start(); credential_patch.start()
+"#).unwrap(), Some(&locals), None).unwrap();
+            let result = service.process_request(py, PyString::new(py, "Execute the separately approved Gemini analysis; keep the proposal private.").into_any()).unwrap();
+            assert_eq!(pythonize::depythonize::<Value>(result.bind(py)).unwrap()["status"], "success");
+            py.run(&CString::new(r#"
+worker_patch.stop(); credential_patch.stop()
+assert next_control.execution.pending['state'] == 'completed'
+proposal = next(v for v in next_control.execution.receipts.values() if type(v) is dict and 'proposal' in v)
+assert proposal['proposal']['ecriture'] and proposal['posted_to_dext'] is False
+fixture.registration['clients']['synthetic-alpha']['synthetic'] = True
+fixture.write_registration()
+"#).unwrap(), Some(&locals), None).unwrap();
             service.controller.configure_dext_control(py, None, None).unwrap();
             py.run(&CString::new("before_ask = provider_calls; forced_tool_name = 'ask_operator'; forced_action = {'category':'question','reason':'missing_information','request':'Which synthetic option should be selected?'}").unwrap(), Some(&locals), None).unwrap();
             let task = pyo3::types::PyString::new(py, "Continue the original synthetic objective.").into_any();
@@ -3059,7 +3110,7 @@ assert not operator_thread.is_alive() and operator_answers[0]['executed'] is Fal
 assert len(loop_runs[-1].receipts) == 0
 control.close()
 next_control.close()
-assert len(loop_runs) == 12 and len(loop_runs[0].receipts) == 1
+assert len(loop_runs) == 16 and len(loop_runs[0].receipts) == 1, len(loop_runs)
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root
@@ -3341,7 +3392,7 @@ assert failed_download['status'] == 'waiting_operator', failed_download
 assert native_exec_next.execution.pending['state'] == 'failed'
 assert provider_calls == before_failed_download + 1
 assert native_exec_resumed.operator_handoff_available
-assert 'execution_not_verified' in str(native_exec_resumed.tool_responses)
+assert 'invalid_download_receipt' in str(native_exec_resumed.tool_responses)
 "#).unwrap(), Some(&locals), None).unwrap();
                 py.run(&CString::new(r#"
 native_exec_next.close()

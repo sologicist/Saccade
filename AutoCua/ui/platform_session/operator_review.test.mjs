@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { operatorResumePayload } from './operator_resume.ts';
 import { restoreSelection } from './selection.ts';
-import { submitOperatorChat } from './operator_chat.ts';
+import { executionDetails, submitOperatorChat } from './operator_chat.ts';
 
 function operatorTransport(changes = {}) {
     const pending = { session_id: 'chat', run_id: 'run', intervention_id: 'request', revision: 'revision', token: 'opaque',
@@ -18,6 +18,22 @@ function operatorTransport(changes = {}) {
         } };
     return { options, calls, resumed, updates, hide: () => { shown = null; }, move: () => { session = 'other'; } };
 }
+
+test('download approval exposes the operation, target and destination and cannot accept an unshown change', async () => {
+    const summary = JSON.stringify({operation:{type:'download',target_id:2},target:{name:'Synthetic PDF',line:'<a href="/invoice.pdf">PDF</a>'},effect:'download',destination:'private platform download storage'});
+    const ui = operatorTransport({execution_summary:summary,execution_phrase:'Approve this action',presentation_digest:'bound'});
+    const details = executionDetails({execution_summary:summary});
+    assert.equal(details.operation.type,'download');
+    assert.equal(details.target.name,'Synthetic PDF');
+    assert.equal(details.destination,'private platform download storage');
+    ui.hide();
+    assert.equal(await submitOperatorChat('Approve this action','chat',ui.options),true);
+    assert.equal(ui.calls.length,1);
+    assert.equal(ui.resumed.length,0);
+    const invalid = operatorTransport({execution_summary:'{}'});
+    await assert.rejects(submitOperatorChat('Approve this action','chat',invalid.options),/could not be displayed/);
+    assert.equal(invalid.calls.length,1);
+});
 
 test('ordinary replies enter only the broker and resume the same chat with the user text', async () => {
     const ui = operatorTransport();

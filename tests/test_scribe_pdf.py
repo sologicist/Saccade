@@ -14,6 +14,13 @@ from AutoCua.saccade.operator_requests import OperatorRequests
 from tests.business_fixtures import BusinessFixture
 
 class ProductionScribe(unittest.TestCase):
+    def test_navigation_click_does_not_create_or_consume_a_download_decision(self):
+        pending=copy.deepcopy(self.c.execution.pending)
+        decision=self.c.authorize_execution({'type':'click','id':2,'times':1},self.stamp,self.elements)
+        self.assertTrue(decision['allowed'])
+        self.assertEqual(decision['effect'],'interaction')
+        self.assertEqual(self.c.execution.pending,pending)
+
     def setUp(self):
         self.f=BusinessFixture(); self.addCleanup(self.f.close)
         self.f.registration['clients']['synthetic-alpha']['synthetic']=False

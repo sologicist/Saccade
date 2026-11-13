@@ -1,3 +1,11 @@
+// A descriptive label, never permission or document identity evidence.
+function elementDextPdfName(el, tag) {
+  const receipt = el.closest?.('.receipt-page');
+  return tag === 'button' && el.matches?.('button.download.s-button-download') && receipt &&
+    receipt.querySelector('.ipdfjs-preview iframe[title="PDF Preview"][src="/pdf-preview"]')
+      ? 'T\u00e9l\u00e9charger PDF' : '';
+}
+
 // AutoCua - browser element scanner, extension side (AutoCuaBridge)
 //
 // A copy of AutoCua/web/tree/element.rs that runs inside the extension instead of
@@ -796,7 +804,7 @@ function elementScanPage(cfg, scan) {
         const kind = act ? "a" : land ? "l" : "t";
         const rec = {
           el, tag, role, parent: parent[ni], node: ni, doc: docI, rect: r, kind,
-          name: clip(axName || text, lim.max_name),
+          name: clip(axName || text || elementDextPdfName(el, tag), lim.max_name),
           idx: null, ty: null, href: null, checked: false, expanded: null, val: null, editable: false,
         };
         if (act) {

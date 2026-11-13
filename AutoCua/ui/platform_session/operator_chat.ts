@@ -11,8 +11,17 @@ export interface PendingOperator {
 }
 
 export function samePresentation(a: PendingOperator | null, b: PendingOperator): boolean {
-    return !!a && ['session_id', 'run_id', 'intervention_id', 'revision', 'presentation_digest'].every(
+    return !!a && ['session_id', 'run_id', 'intervention_id', 'revision', 'presentation_digest', 'execution_summary', 'execution_phrase'].every(
         key => a[key as keyof PendingOperator] === b[key as keyof PendingOperator]);
+}
+
+export function executionDetails(pending: PendingOperator) {
+    try {
+        const value = JSON.parse(pending.execution_summary || '');
+        if (!value || typeof value.operation?.type !== 'string' || !value.target || typeof value.target !== 'object'
+            || typeof value.destination !== 'string' || !value.destination || typeof value.effect !== 'string') return null;
+        return { operation: value.operation, target: value.target, destination: value.destination, effect: value.effect };
+    } catch { return null; }
 }
 
 async function considerCorrection(text: string, session: string, options: {
@@ -57,6 +66,10 @@ export async function submitOperatorChat(text: string, session: string, options:
     const cancelling = ['cancel', 'cancel task', 'stop', 'annuler', 'annule'].includes(text.trim().toLowerCase());
     if (pending.state === 'resuming' && !cancelling) return considerCorrection(text, session, options);
     if (pending.state === 'pausing_operator' && !cancelling) { options.update(pending); return true; }
+    if (!cancelling && pending.execution_summary && !executionDetails(pending)) {
+        options.update(pending);
+        throw new Error('The exact operation could not be displayed safely. Cancel or refresh before approving.');
+    }
     if (!cancelling && !samePresentation(options.presented(), pending)) {
         options.update({ ...pending, chat_message: 'Please review the current question or proposed procedure below, then send your reply.' });
         return true;
