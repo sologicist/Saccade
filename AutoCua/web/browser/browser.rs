@@ -2400,6 +2400,7 @@ pub struct ScannerInner {
     pub business_test_download: Option<Value>,
     /// A selected platform is an execution policy, never page-provided context.
     platform_scope: Option<crate::platform_scope::PlatformScope>,
+    scoped_gesture: Option<(String, String)>,
     scope_initialized: bool,
     scope_observer_id: String,
     pub port: u16,
@@ -2536,6 +2537,7 @@ impl ScannerInner {
             #[cfg(test)]
             business_test_download: None,
             platform_scope: None,
+            scoped_gesture: None,
             scope_initialized: false,
             scope_observer_id: String::new(),
             port,
@@ -2593,6 +2595,7 @@ impl ScannerInner {
     }
 
     pub fn set_platform_scope(&mut self, scope: crate::platform_scope::PlatformScope) {
+        self.scoped_gesture = None;
         self.scope_cleanup_verified = false;
         self.platform_scope = Some(scope);
         self.scope_initialized = false;
@@ -2613,6 +2616,7 @@ impl ScannerInner {
     }
 
     pub fn end_platform_scope(&mut self) -> SResult<()> {
+        self.scoped_gesture = None;
         if self.platform_scope.is_none() || self.scope_observer_id.is_empty() || !self.bridged() {
             return Ok(());
         }
@@ -3073,14 +3077,52 @@ impl ScannerInner {
                         .unwrap_or_else(|| Err("Platform navigation requires an explicit URL.".into())),
                     None => Ok(()), // internal blank-first bootstrap only
                 },
+
+                "execution_focus" => {
+                    // Read-only focus inspection for keyboard authorization.
+                    self.check_platform_scope()?;
+                    Ok(())
+                },
+
+                "click" | "input" | "keyboard" | "dialog" => {
+                    // A native controller action must have explicitly armed
+                    // this exact browser gesture on this exact tab.
+                    // Consume the permit before dispatch.
+                    let permitted = self.scoped_gesture.take().is_some_and(
+                        |(expected_kind, expected_tab)| {
+                            expected_kind == kind
+                                && req.get("tabId")
+                                    == Some(&Self::bridge_tab_id(&expected_tab))
+                        },
+                    );
+
+                    if permitted {
+                        self.check_platform_scope()?;
+                        Ok(())
+                    } else {
+                        Err(
+                            crate::platform_scope::APPROVAL_UNAVAILABLE
+                                .to_string(),
+                        )
+                    }
+                },
+
                 "scan" | "tabs" | "platform_scope_begin" | "platform_scope_observe" | "platform_scope_end"
                 | "platform_scope_protect_tab" | "wait_load" | "settle" | "cursor"
                 | "frame" | "glow" | "release" | "activate" => Ok(()),
                 _ => Err(crate::platform_scope::APPROVAL_UNAVAILABLE.to_string()),
             };
+            
             if let Err(message) = allowed {
+                // Missing action authority is a pre-dispatch refusal,
+                // not evidence that the browser escaped its platform.
+                if message == crate::platform_scope::APPROVAL_UNAVAILABLE {
+                    return Err(ScanErr::s(message));
+                }
+
                 return Err(self.platform_failure(message));
             }
+
         }
         let Some(bridge) = self.bridge.clone() else {
             return Err(ScanErr::s("not in extension mode"));
@@ -4261,6 +4303,38 @@ impl ScannerInner {
             .collect();
         self.save_tabs(&tabs);
     }
+
+
+    pub(crate) fn arm_scoped_gesture(
+        &mut self,
+        kind: &str,
+    ) -> SResult<()> {
+        let bridge_kind = match kind {
+            "click" | "hold_click" => "click",
+            "input" => "input",
+            "keyboard" => "keyboard",
+            "dialog" => "dialog",
+            _ => return Err(ScanErr::s(
+                "unsupported_scoped_gesture",
+            )),
+        };
+
+        self.check_platform_scope()?;
+
+        let tab = self.current_target_id()?;
+
+        self.scoped_gesture = Some((
+            bridge_kind.to_string(),
+            tab,
+        ));
+
+        Ok(())
+    }
+
+    pub(crate) fn clear_scoped_gesture(&mut self) {
+        self.scoped_gesture = None;
+    }
+
 
     pub fn read_tabs(&mut self) -> String {
         let current = self.tab_id.clone().unwrap_or_default();

@@ -5,33 +5,24 @@ import threading
 import time
 from pathlib import Path
 
-from .business_contract import digest, dumps, loads, read_safe, reject
+from .business_contract import digest, dumps, reject
 from .session_context import _validate_context
 
 EFFECTS = ('navigation', 'interaction', 'download', 'read', 'compute', 'disclosure', 'mutation', 'delete')
 
 
+
 def execution_policy(project, context):
+    """Common execution contract; no per-platform click whitelist."""
     _validate_context(context, root=project)
-    path = project / 'platforms' / context['platform_id'] / 'execution.json'
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        value = {'schema_version': 1, 'navigation': []}
-    else:
-        value = loads(read_safe(project, path, 32_768), 32_768)
-    if type(value) is not dict or set(value) != {'schema_version', 'navigation'} or type(value['schema_version']) is not int or value['schema_version'] != 1 or type(value['navigation']) is not list or len(value['navigation']) > 64:
-        reject('invalid_execution_policy')
-    seen = set()
-    for row in value['navigation']:
-        if type(row) is not dict or set(row) != {'name', 'role'} or row['role'] not in ('link', 'button', 'tab', 'menuitem') or type(row['name']) is not str or not 1 <= len(row['name']) <= 80:
-            reject('invalid_execution_policy')
-        from .operator_requests import _SECRET
-        from .operator_language import normalized
-        if any(ord(c) < 32 or c in '<>\\' for c in row['name']) or _SECRET.search(normalized(row['name'])) or (row['name'], row['role']) in seen:
-            reject('invalid_execution_policy')
-        seen.add((row['name'], row['role']))
-    return value, digest(value)
+
+    policy = {
+        'schema_version': 1,
+        'navigation': [],
+    }
+
+    return policy, digest(policy)
+
 
 
 class ExecutionAuthority:
@@ -69,8 +60,6 @@ class ExecutionAuthority:
                 # Consume BEFORE dispatch; failures never restore this grant.
                 pending['state'] = 'consumed'
                 return {'allowed': True, 'decision_id': pending['id'], 'effect': effect}
-            if effect == 'navigation' and type(target) is dict and {'name': target.get('name'), 'role': target.get('role')} in self.policy['navigation']:
-                return {'allowed': True, 'effect': effect}
             if pending and pending['state'] in ('consumed', 'executing', 'completed', 'failed', 'rejected') and pending['identity'] == identity:
                 reject('execution_decision_consumed')
             if pending and pending['identity'] == identity and pending['expires'] > time.monotonic():

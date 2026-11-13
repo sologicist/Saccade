@@ -63,6 +63,9 @@ class PlatformLearningControl:
             validate(arguments, entry['input_schema'])
             target = {'function':entry['id'], 'arguments':action['arguments'],
                       'result_visibility':entry['output_visibility'], 'description':entry['description']}
+            if entry.get('builtin') and entry['id'] == 'dext.scribe_pdf':
+                from .scribe_pdf import prepare
+                target['scribe'] = prepare(self.project,self.context,self.session_id,arguments,stamp,elements)
             if entry.get('document_input'):
                 from .capabilities import verified_download
                 receipt = verified_download(self.project, self.context, self.session_id, arguments[entry['document_input']])
@@ -90,17 +93,39 @@ class PlatformLearningControl:
             line = str(target.get('line', '')).lower()
             if 'password' in line or 'type="file"' in line:
                 reject('private_manual_input_required')
-        # Only installed policy can classify a public control as navigation.
-        # A learned procedure or a model-supplied effect flag cannot do so.
+        
+        # Supervised uses the normal AutoCua Web interactions.
+        # No platform-specific navigation whitelist is required.
+        # The native controller still validates the observed target,
+        # browser ownership and platform scope.
+        if kind in ('click', 'hold_click', 'input', 'keyboard'):
+            return {
+                'allowed': True,
+                'effect': 'interaction',
+            }
+
+        # Downloads and confirmation dialogs remain subject
+        # to separate, explicit authorization.
         effect = 'download' if kind == 'download' else 'interaction'
-        navigation = {'name':target.get('name'), 'role':target.get('role')}
-        unique = sum(1 for row in elements.values() if type(row) is dict
-                     and row.get('name') == target.get('name') and row.get('role') == target.get('role')) == 1
-        if kind == 'click' and action.get('times') == 1 and navigation in self.execution.policy['navigation'] and unique:
-            effect = 'navigation'
-        if effect != 'navigation': target = {**target, 'observation_digest':digest(elements)}
-        return self.execution.decide(action, stamp, target, effect=effect,
-            destination='private platform download storage' if kind == 'download' else self.context['platform_id'], run_id=self.run_id)
+
+        target = {
+            **target,
+            'observation_digest': digest(elements),
+        }
+
+        return self.execution.decide(
+            action,
+            stamp,
+            target,
+            effect=effect,
+            destination=(
+                'private platform download storage'
+                if kind == 'download'
+                else self.context['platform_id']
+            ),
+            run_id=self.run_id,
+        )
+
 
     def execute_capability(self, action):
         self.validate_native(self.context)
@@ -114,10 +139,19 @@ class PlatformLearningControl:
         decision = self.execution.pending
         if not decision or decision['state'] != 'consumed' or decision['binding']['revision'] != snapshot['revision'] or decision['binding']['action'] != action:
             reject('capability_authorization_required')
+        authorization = loads(dumps(decision)) if entry.get('builtin') else None
         decision['state'] = 'executing'
+        extra = {}
+        if authorization:
+            from .scribe_pdf import credentials
+            extra = {'authorization':authorization}
+            provider_environment = credentials(self.project)
+        else:
+            provider_environment = None
         result = run_worker({'version':2, 'session_id':self.session_id, 'context':self.context, 'project_root':str(self.project),
-            'revision':snapshot['revision'], 'name':action['name'], 'arguments':{k:v for k,v in action['arguments'].items() if v is not None or k in entry['input_schema']['properties']}},
-            package_root=Path(__file__).resolve().parents[1], stop_event=self.stop_event)
+            **extra, 'revision':snapshot['revision'], 'name':action['name'], 'arguments':{k:v for k,v in action['arguments'].items() if v is not None or k in entry['input_schema']['properties']}},
+            package_root=Path(__file__).resolve().parents[1], stop_event=self.stop_event,
+            timeout=100 if authorization else 10, provider_environment=provider_environment)
         decision['state'] = 'completed' if result.get('status') == 'success' else 'failed'
         if entry['output_visibility'] == 'operator' and result.get('status') == 'success':
             key = secrets.token_hex(24)
@@ -166,6 +200,8 @@ class PlatformLearningControl:
         receipt = {'id':identifier, 'platform_id':self.context['platform_id'], 'session':self.session_id,
             'sha256':digest(content), 'bytes':len(content), 'mime':result['mime'],
             'path':str(path), 'decision_id':decision['id'], 'binding_digest':decision['identity'],
+            'source':{k:decision['binding'][v] for k,v in (('session','browser'),('tab','tab'),('page','page'))},
+            'observation_digest':decision['binding']['target'].get('observation_digest'),
             'record_identity_verified':False}
         self.store._write('downloads/' + identifier + '.receipt.json', receipt, exclusive=True)
         decision['state'] = 'completed'

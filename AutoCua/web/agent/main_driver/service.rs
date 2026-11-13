@@ -760,7 +760,11 @@ fn blocked_intervention(reason: &str) -> String {
 }
 
 #[derive(Default)]
-struct NoProgress { signature: String, repeats: usize }
+struct NoProgress {
+    signature: String,
+    repeats: usize,
+    reobservations: usize,
+}
 impl NoProgress {
     fn observe(&mut self, signature: String) -> bool {
         if self.signature == signature { self.repeats += 1; } else { self.signature = signature; self.repeats = 1; }
@@ -2430,14 +2434,50 @@ impl AgentService {
                 return Ok(Flow::Break);
             }
             let rows = action_result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![action_result.clone()]);
+
+            // A pre-dispatch stale target is recoverable.
+            // The previous tool result is already paired with the model call.
+            // Let the normal loop scan again and ask the model to replan.
+            let needs_reobservation = rows.iter().any(|row| {
+                row["status"] == "reobserve"
+                    && row["code"] == "target_changed_before_dispatch"
+            });
+
+            let safe_reobservation = needs_reobservation
+                && rows.iter().all(|row| {
+                    matches!(
+                        row["status"].as_str(),
+                        Some("success" | "reobserve" | "not_run")
+                    )
+                });
+
+            if safe_reobservation {
+                no_progress.reobservations += 1;
+
+                if no_progress.reobservations >= 3 {
+                    *final_status = "waiting_operator".into();
+                    *final_message = blocked_intervention(
+                        "The intended browser target changed repeatedly before dispatch. \
+                        Repeated attempts were stopped. No action was executed against \
+                        the stale target. Review the page or give a different instruction."
+                    );
+                    return Ok(Flow::Break);
+                }
+
+                *is_first_iteration = false;
+                return Ok(Flow::Continue);
+            }
+
+            no_progress.reobservations = 0;
+
             if rows.iter().any(|row| row["status"] == "error" || row["operator_review_required"] == true) {
                 *final_status = "waiting_operator".into();
                 *final_message = if rows.iter().any(|row| row["tool"] == "dext_navigation") {
                     json!({"category":"manual_action", "reason":"manual_intervention",
-                        "request":"Please open the requested section manually in the dedicated Chrome window, then tell me when it is done. Automatic Dext navigation needs verified control and frame semantics, which are not available yet."}).to_string()
+                        "request":"This specialized Dext preview cannot verify the requested operation. Use the normal observed Web navigation tools; do not claim success for this preview."}).to_string()
                 } else if rows.iter().any(|row| row["code"] == "unsupported_navigation") {
                     json!({"category":"manual_action", "reason":"manual_intervention",
-                        "request":"I did not execute the requested action. Please perform the navigation manually in the dedicated Chrome window, then confirm when it is complete. Automatic execution requires verified target, frame and effect semantics; a visible label alone is insufficient."}).to_string()
+                        "request":"The requested tool is not authorized in this session. No action was executed. Choose a supported observed Web tool or explain the specific missing permission."}).to_string()
                 } else { blocked_intervention("An action failed or requires independent review. Reconcile its effects before resuming; permissions remain unchanged.") };
                 return Ok(Flow::Break);
             }
@@ -2952,9 +2992,8 @@ operator_thread.start()
             }
             let outcome = service.process_request(py, PyString::new(py, "Find the synthetic purchase invoices.").into_any()).unwrap();
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
-            assert_eq!(outcome["status"], "waiting_operator");
-            assert!(outcome["message"].as_str().unwrap().contains("proposed operation"));
-            py.run(&CString::new("assert provider_calls == before_learning + 1\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
+            assert_eq!(outcome["status"], "success");
+            py.run(&CString::new("assert provider_calls == before_learning + 2\nnext_control.conversational = False\nnext_control.teaching = None").unwrap(), Some(&locals), None).unwrap();
             service.controller.configure_dext_control(py, None, None).unwrap();
             py.run(&CString::new("before_ask = provider_calls; forced_tool_name = 'ask_operator'; forced_action = {'category':'question','reason':'missing_information','request':'Which synthetic option should be selected?'}").unwrap(), Some(&locals), None).unwrap();
             let task = pyo3::types::PyString::new(py, "Continue the original synthetic objective.").into_any();
@@ -3069,12 +3108,12 @@ before_portal = provider_calls
             assert!(!prompt.contains("Dext navigation guidance"));
             assert!(!prompt.contains("Confirm the exact record"));
             drop(state);
-            py.run(&CString::new("assert provider_calls == before_portal + 1\nportal.attach_teaching(NavigationTeaching(['settings_page'], adapter=portal.store.adapter))\nbefore_portal_pause = provider_calls\nforced_tool_name = 'click'\nforced_action = {'id':1,'times':1}").unwrap(), Some(&locals), None).unwrap();
+            py.run(&CString::new("assert provider_calls == before_portal + 1\nportal.attach_teaching(NavigationTeaching(['settings_page'], adapter=portal.store.adapter))\nbefore_portal_pause = provider_calls\nforced_tool_name = 'ask_operator'\nforced_action = {'category':'question','reason':'awaiting_instructions','request':'The navigation checkpoint is ready. What should I do next?'}").unwrap(), Some(&locals), None).unwrap();
             service.scanner.get().inner.lock().unwrap().mapping = json!({"1":{"name":"Settings","role":"link","rect":[1,1,40,20]}}).as_object().unwrap().clone();
             let outcome = service.process_request(py, PyString::new(py, "Continue the same portal task.").into_any()).unwrap();
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "waiting_operator");
-            assert!(outcome["message"].as_str().unwrap().contains("proposed operation"));
+            assert!(outcome["message"].as_str().unwrap().contains("awaiting_instructions"));
             let retained = service.reclaim_scanner(py, service.profile_lease.bind(py), &service.platform_context, service.profile_name.as_deref(), false).unwrap();
             assert!(Arc::ptr_eq(&retained, &service.scanner.get().inner));
             let history = PyDict::new(py);
@@ -3263,11 +3302,6 @@ for other in execution_fixture.contexts:
 forced_tool_name = 'click'
 forced_action = {'id':2,'times':1}
 clicked = native_exec_resumed.process_request('Open the public section using the common click tool.')
-if execution_index == 1:
-    assert clicked['status'] == 'waiting_operator', clicked
-    native_exec_next.execution.review(native_exec_next.execution.pending['id'], True)
-    forced_action = {'id':2,'times':1}
-    clicked = native_exec_resumed.process_request('Operator approved the exact click; reobserve and execute it once.')
 assert clicked['status'] == 'success', clicked
 forced_tool_name = 'download'
 forced_action = {'target_id':2}

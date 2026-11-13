@@ -13,11 +13,17 @@ def catalogue(project, platform):
     try:
         path.lstat()
     except FileNotFoundError:
-        return {'revision': digest([platform, 'no-capabilities']), 'functions': {}}
-    value = loads(read_safe(project, path, 65_536), 65_536)
+        value = {'schema_version':1,'platform_id':platform,'functions':[]}
+    else:
+        value = loads(read_safe(project, path, 65_536), 65_536)
     if type(value) is not dict or set(value) != {'schema_version', 'platform_id', 'functions'} or type(value['schema_version']) is not int or value['schema_version'] != 1 or value['platform_id'] != platform or type(value['functions']) is not list or len(value['functions']) > 32:
         reject('invalid_capability_registry')
     functions, sources = {}, {}
+    if platform == 'dext':
+        from .scribe_pdf import installed
+        entry = installed(project)
+        functions[entry['id']] = entry
+        sources['builtin_scribe_pdf'] = entry['source_digest']
     for row in value['functions']:
         if type(row) is not dict or set(row) - {'id', 'source', 'symbol', 'effect', 'destination', 'description', 'output_visibility', 'verify', 'document_input', 'requires_verified_record'} or not {'id', 'source', 'symbol', 'effect', 'destination', 'description', 'output_visibility'} <= set(row):
             reject('invalid_capability_registry')
@@ -78,6 +84,9 @@ def execute_worker(request):
     if not entry:
         reject('unregistered_capability')
     validate(request['arguments'], entry['input_schema'])
+    if request['name'] == 'dext.scribe_pdf' and context['platform_id'] == 'dext':
+        from .scribe_pdf import execute
+        return execute(request)
     arguments = dict(request['arguments'])
     if entry.get('document_input'):
         receipt = verified_download(project, context, request['session_id'], arguments[entry['document_input']])

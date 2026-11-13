@@ -96,6 +96,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+scribe = ["litellm>=1.0"]
 # Paired iPhone/iPad (the simulator path needs only Xcode).
 ios = ["pymobiledevice3>=10; sys_platform == 'darwin'"]
 

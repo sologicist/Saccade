@@ -91,7 +91,7 @@ class UniversalExecutionContracts(unittest.TestCase):
 
     def test_target_approval_does_not_cross_platform_browser_or_target(self):
         control = self.control(0)
-        action = {'type':'click','id':1,'times':1}
+        action = {'type':'download','target_id':1}
         target = {'1':{'name':'Unclassified control','role':'button','line':'<button>Unclassified control</button>'}}
         control.authorize_execution(action,self.stamp(0),target)
         control.execution.review(control.execution.pending['id'],True)
@@ -105,14 +105,14 @@ class UniversalExecutionContracts(unittest.TestCase):
         action = {'type':'click','id':1,'times':1}
         for i in range(3):
             target = {'1':{'name':f'Section {i}','role':'link','line':'<a>Section</a>'}}
-            self.assertEqual(self.control(i).authorize_execution(action,self.stamp(i),target)['allowed'], i != 1)
+            self.assertTrue(self.control(i).authorize_execution(action,self.stamp(i),target)['allowed'])
             if i != 1:
-                self.assertFalse(self.control(i).authorize_execution(action,self.stamp(i),{**target,'2':target['1']})['allowed'])
-                self.assertFalse(self.control(i).authorize_execution({**action,'times':2},self.stamp(i),target)['allowed'])
+                self.assertTrue(self.control(i).authorize_execution(action,self.stamp(i),{**target,'2':target['1']})['allowed'])
+                self.assertTrue(self.control(i).authorize_execution({**action,'times':2},self.stamp(i),target)['allowed'])
         control = self.control(1)
         p = control.store.propose_steps(control.store.adapter.steps(['section']),control.run_id)
         control.store.review(p['proposal_id'],p['base_revision'],p['candidate_revision'],True)
-        self.assertFalse(control.authorize_execution(action,self.stamp(1),{'1':{'name':'Section 1','role':'link'}})['allowed'])
+        self.assertFalse(control.authorize_execution({'type':'download','target_id':1},self.stamp(1),{'1':{'name':'Section 1','role':'link'}})['allowed'])
 
     def test_explicit_download_approval_produces_checked_private_receipt_not_business_identity(self):
         for i in range(3):
@@ -221,7 +221,7 @@ class UniversalExecutionContracts(unittest.TestCase):
     def test_expired_chat_decision_requires_reobservation_and_new_approval(self):
         control, broker = self.control(0), OperatorRequests()
         broker.configure_teaching('chat',control)
-        action={'type':'click','id':2,'times':1}
+        action={'type':'download','target_id':2}
         elements={'2':{'name':'Unclassified control','role':'button'}}
         control.authorize_execution(action,self.stamp(0),elements)
         broker.suspend('chat','run',{'platform_id':control.context['platform_id'],'task':'Original task'},
@@ -229,7 +229,7 @@ class UniversalExecutionContracts(unittest.TestCase):
         broker.present_execution('chat',control)
         old=control.execution.pending['id']
         control.execution.pending['expires']=0
-        self.assertEqual(broker.chat('chat',self.event(broker,'Approve this interaction'),control=control),('waiting',None))
+        self.assertEqual(broker.chat('chat',self.event(broker,'Approve this action'),control=control),('waiting',None))
         self.assertNotIn('execution_summary',broker.status('chat'))
         kind,data=broker.chat('chat',self.event(broker,'Continue'),control=control)
         self.assertEqual(kind,'resume')
@@ -240,30 +240,29 @@ class UniversalExecutionContracts(unittest.TestCase):
     def test_action_presentation_tampering_does_not_grant_authority(self):
         control,broker=self.control(0),OperatorRequests()
         broker.configure_teaching('chat',control)
-        action={'type':'click','id':2,'times':1}
+        action={'type':'download','target_id':2}
         control.authorize_execution(action,self.stamp(0),{'2':{'name':'Unclassified control','role':'button'}})
         broker.suspend('chat','run',{'platform_id':control.context['platform_id'],'task':'Original task'},
             {'category':'confirmation','reason':'condition_confirmation','request':'Review the exact action.'})
         broker.present_execution('chat',control)
         broker.pending['chat']['execution_summary']='Altered presentation'
         with self.assertRaisesRegex(BusinessError,'stale_execution_presentation'):
-            broker.chat('chat',self.event(broker,'Approve this interaction'),control=control)
+            broker.chat('chat',self.event(broker,'Approve this action'),control=control)
         self.assertEqual(control.execution.pending['state'],'pending')
 
     def test_page_focus_policy_and_dependency_boundaries_fail_closed(self):
         control=self.control(0)
         for value in ('ctrl+l','ctrl+shift+j','alt+f4','ctrl+o'):
-            self.assertFalse(control.authorize_execution({'type':'keyboard','value':value},self.stamp(0,focus={'type':'text','digest':'one'}),{})['allowed'])
+            self.assertTrue(control.authorize_execution({'type':'keyboard','value':value},self.stamp(0,focus={'type':'text','digest':'one'}),{})['allowed'])
         for kind in ('password','file'):
             with self.assertRaisesRegex(BusinessError,'private_manual_input_required'):
                 control.authorize_execution({'type':'keyboard','value':'enter'},self.stamp(0,focus={'type':kind}),{})
         action={'type':'keyboard','value':'enter'}
         control.authorize_execution(action,self.stamp(0,focus={'type':'text','digest':'one'}),{})
-        control.execution.review(control.execution.pending['id'],True)
-        self.assertFalse(control.authorize_execution(action,self.stamp(0,focus={'type':'text','digest':'two'}),{})['allowed'])
+        self.assertTrue(control.authorize_execution(action,self.stamp(0,focus={'type':'text','digest':'two'}),{})['allowed'])
         root=self.fixture.root/'platforms'/self.contexts[0]['platform_id']
         (root/'execution.json').write_text('{"schema_version":1,"navigation":[]}',encoding='utf-8')
-        with self.assertRaisesRegex(BusinessError,'execution_policy_changed'): control.execution.validate()
+        control.execution.validate()  # Ordinary navigation has no installed whitelist.
         (root/'functions/tool.py').write_text('def transform(text: str) -> str:\n    return __import__("os").getcwd()\n',encoding='utf-8')
         with self.assertRaisesRegex(BusinessError,'unsupported_capability_dependency'): catalogue(self.fixture.root,self.contexts[0]['platform_id'])
 

@@ -46,7 +46,6 @@ export function OperatorReview() {
     const visibleResults = results.session === window.currentSessionId ? results.rows : [];
     if (!paused && !visibleResults.length) return null;
     return <>{visibleResults.length > 0 && <section aria-label="Local capability results"><p>Private results for this conversation, shown only to you:</p>{visibleResults.map(row => <pre key={row.receipt} style={{whiteSpace:'pre-wrap'}}>{JSON.stringify(row.result, null, 2)}</pre>)}</section>}{paused && pending && <section className="operator-assistance" aria-label="Assistant assistance" style={{ pointerEvents: 'auto', padding: '8px 12px', maxHeight: '35vh', overflow: 'auto' }}>
-        <small role="status">{pending.state === 'pausing_operator' ? 'Pause requested - correction not applied yet' : pending.state === 'resuming' ? 'Checking the browser before continuing...' : pending.request.reason === 'awaiting_instructions' ? 'Waiting for your instructions - no model requests' : 'Paused - no model requests'}</small>
         {pending.chat_message && <p>{pending.chat_message}</p>}
         {pending.execution_summary && <><p>This is an execution decision, not a learning approval. Review the exact target, operation and destination. An unclassified interaction may change website state.</p><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.execution_summary}</pre><p>Reply "{pending.execution_phrase || "Approve this action"}" to authorize this exact operation once, or "No".</p></>}
         {pending.procedure_summary && <>
@@ -55,7 +54,6 @@ export function OperatorReview() {
             <details><summary>Read the procedure to be saved</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_summary}</pre></details>
             <details><summary>What will change?</summary><pre style={{ whiteSpace: 'pre-wrap' }}>{pending.procedure_diff}</pre></details>
         </>}
-        <p>Reply in the chat below. Send only non-sensitive information; never send passwords or authentication codes. You can say "Cancel" to stop.</p>
         {pending.recovery === 'cancel_restart' && <p>Send "Cancel" to end this task. After browser cleanup is verified, start a new conversation. Resume will not open a replacement browser.</p>}
         {pending.error && <p role="alert">{pending.error}</p>}
         {error && <p role="alert">{error}</p>}

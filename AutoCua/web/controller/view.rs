@@ -250,23 +250,97 @@ impl ControllerView {
         let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
         let Some(control) = control else { return Ok(None) };
         let observed = self.state.lock().unwrap().elements.clone();
-        let refresh = matches!(kind, "click" | "hold_click" | "input" | "keyboard" | "dialog" | "download");
-        let (elements, stamp) = super::service::scan_op(py, &self.scanner, |scanner| {
-            if refresh { scanner.scan_core()?; }
-            let mut stamp = scanner.platform_learning_stamp()?;
-            if kind == "keyboard" { stamp["focus"] = scanner.bridge_call(json!({"type":"execution_focus"}))?; }
-            if kind == "dialog" { stamp["dialog"] = scanner.open_dialog().unwrap_or(Value::Null); }
+        let refresh = matches!(kind, "click" | "hold_click" | "input" | "keyboard" | "dialog" | "download") || (kind == "call_function" && action["name"] == "dext.scribe_pdf");
+        
+        let (elements, stamp, surface_changed) =
+            super::service::scan_op(py, &self.scanner, |scanner| {
+                let previous_stamp = scanner.platform_learning_stamp()?;
+                let previous_url = scanner.url.clone();
 
-            let page = ring::digest::digest(&ring::digest::SHA256, scanner.url.as_bytes());
-            stamp["page"] = json!(page.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>());
-            Ok((scanner.mapping.clone(), stamp))
-        })
-            .map_err(|e| match e { ActErr::Py(e) => e, ActErr::Msg(s) => pyo3::exceptions::PyValueError::new_err(s) })?;
-        if refresh && observed != elements {
-            return Ok(Some(json!({"status":"waiting_operator","tool":kind,"executed":false,
-                "intervention":{"category":"confirmation","reason":"condition_confirmation",
-                "request":"The page changed before the action could run. May I reobserve it and select the correct target again? No action was executed."}})));
+                if refresh {
+                    scanner.scan_core()?;
+                }
+
+                let mut stamp = scanner.platform_learning_stamp()?;
+
+                let surface_changed = previous_url != scanner.url
+                    || ["session", "tab", "profile", "config_revision", "platform_id"]
+                        .iter()
+                        .any(|key| previous_stamp.get(*key) != stamp.get(*key));
+
+                if kind == "keyboard" {
+                    stamp["focus"] =
+                        scanner.bridge_call(json!({"type":"execution_focus"}))?;
+                }
+
+                if kind == "dialog" {
+                    stamp["dialog"] =
+                        scanner.open_dialog().unwrap_or(Value::Null);
+                }
+
+                let page = ring::digest::digest(
+                    &ring::digest::SHA256,
+                    scanner.url.as_bytes(),
+                );
+
+                stamp["page"] = json!(
+                    page.as_ref()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                );
+
+                Ok((scanner.mapping.clone(), stamp, surface_changed))
+            })
+            .map_err(|e| match e {
+                ActErr::Py(e) => e,
+                ActErr::Msg(s) => pyo3::exceptions::PyValueError::new_err(s),
+            })?;
+
+        // Check the intended target, not every unrelated element on the page.
+        let target_changed = if matches!(
+            kind,
+            "click" | "hold_click" | "input" | "download"
+        ) {
+            let id = if kind == "download" {
+                action.get("target_id")
+            } else {
+                action.get("id")
+            };
+
+            let key = id
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+                .map(|id| id.to_string());
+
+            match key {
+                Some(key) => match (observed.get(&key), elements.get(&key)) {
+                    (Some(before), Some(after)) => {
+                        before != after
+                            || elements
+                                .values()
+                                .filter(|candidate| *candidate == after)
+                                .count() != 1
+                    }
+                    _ => true,
+                },
+                None => true,
+            }
+        } else {
+            // Actions without a numeric target keep the stricter check.
+            observed != elements
+        };
+
+        if refresh && (surface_changed || target_changed) {
+            return Ok(Some(json!({
+                "status": "reobserve",
+                "tool": kind,
+                "code": "target_changed_before_dispatch",
+                "executed": false,
+                "message": "No action was executed. The browser surface or the intended target changed. Observe the current page again and choose a fresh target ID. Do not reuse the previous ID."
+            })));
         }
+
         let decision = control.bind(py).call_method1("authorize_execution", (pythonize::pythonize(py, action)?,
             pythonize::pythonize(py, &stamp)?, pythonize::pythonize(py, &elements)?))?;
         let decision: Value = pythonize::depythonize(&decision)?;
@@ -538,7 +612,10 @@ impl ControllerView {
         let execution = match self.operator_execution(py, action) {
             Ok(result) => result,
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => return Err(error),
-            Err(_) => {
+            Err(error) => {
+                let detail = error.value(py).to_string();
+                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download"];
+                let code = codes.iter().copied().find(|code| detail.contains(code)).unwrap_or("execution_not_verified");
                 // Preserve the owned browser for a supported alternative. A
                 // lost security boundary still takes the existing hard-failure
                 // path; an unsupported download must never become success.
@@ -546,9 +623,9 @@ impl ControllerView {
                 if let Some(control) = self.learning_control.lock().unwrap().as_ref() {
                     control.bind(py).call_method0("fail_execution")?;
                 }
-                return Ok((json!({"status":"waiting_operator", "tool":action["type"], "code":"execution_not_verified",
+                return Ok((json!({"status":"waiting_operator", "tool":action["type"], "code":code,
                     "intervention":{"category":"blocked", "reason":"unsafe_or_blocked",
-                    "request":"I could not verify this operation under the current authorization and document rules. No successful effect is claimed. Please choose a supported alternative or cancel; an uncertain effect must not be replayed."}}), false));
+                    "request":format!("Operation blocked: {code}. Review the document, client, direction or download response before choosing a supported alternative. No successful effect is claimed; do not replay an uncertain effect.")}}), false));
             }
         };
         let operator_authorized = execution.as_ref().is_some_and(|v| v["operator_authorized"] == true);
@@ -609,7 +686,45 @@ impl ControllerView {
             let message = format!("{WEB_STORE_BLOCKED}. Leave it with navigate_tab back, update_tab or new_tab");
             return Ok((json!({"status": "error", "tool": kind, "message": message}), false));
         }
-        let mut result = self.one_inner(py, action)?;
+        
+        let scoped_gesture = operator_authorized
+            && matches!(
+                kind.as_str(),
+                "click" | "hold_click" | "input" | "keyboard" | "dialog"
+            );
+
+        if scoped_gesture {
+            super::service::scan_op(py, &self.scanner, |scanner| {
+                scanner.arm_scoped_gesture(&kind)
+            })
+            .map_err(|error| match error {
+                ActErr::Py(error) => error,
+                ActErr::Msg(message) =>
+                    pyo3::exceptions::PyValueError::new_err(message),
+            })?;
+        }
+
+        // Use the existing AutoCua native action dispatcher.
+        let dispatched = self.one_inner(py, action);
+
+        // Always clear the temporary authority, even if the action failed.
+        let cleanup = super::service::scan_op(
+            py,
+            &self.scanner,
+            |scanner| {
+                scanner.clear_scoped_gesture();
+                Ok(())
+            },
+        );
+
+        cleanup.map_err(|error| match error {
+            ActErr::Py(error) => error,
+            ActErr::Msg(message) =>
+                pyo3::exceptions::PyValueError::new_err(message),
+        })?;
+
+        let mut result = dispatched?;
+
         // Where the tabs are now, in case the browser goes away before the
         // next scan (ScannerInner::revive reopens them).
         super::service::scan_op(py, &self.scanner, |s| {
@@ -970,8 +1085,9 @@ mod platform_tests {
                         json!({"type": "navigate", "url": "https://app.dext.com.evil.test/"}),
                         json!({"type": "reload"})] {
             let fixture = Fixture::new();
+            let foreign_navigation = request["type"] == "navigate";
             assert!(fixture.scanner.lock().unwrap().bridge_request(request).is_err());
-            assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+            assert_eq!(fixture.scanner.lock().unwrap().platform_violation().is_some(), foreign_navigation);
         }
         let root = std::env::temp_dir();
         let mut generic = ScannerInner::new(&root, 0, None, false);

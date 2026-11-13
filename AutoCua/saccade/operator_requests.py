@@ -177,6 +177,8 @@ class OperatorRequests:
             item['execution_summary'] = decision['summary']
             item['execution_id'] = decision['id']
             item['execution_phrase'] = {'interaction':'Approve this interaction','disclosure':'Approve this disclosure','mutation':'Approve this state change','delete':'Approve this deletion'}.get(decision['binding']['effect'], 'Approve this action')
+            if decision['binding']['target'].get('scribe'):
+                item['execution_phrase'] = 'Confirm document identity and approve Gemini disclosure'
             item['presentation_digest'] = digest([session, item['run_id'], item['revision'], decision['id'], decision['identity'], decision['origin_run']])
 
     def present_procedure(self, session, control):
@@ -264,6 +266,8 @@ class OperatorRequests:
                     return 'waiting', None
                 effect = control.execution.pending['binding']['effect']
                 phrases = {'interaction':('approve this interaction','autorise cette interaction'), 'disclosure': ('approve this disclosure', 'autorise cette divulgation'), 'mutation': ('approve this state change', 'autorise cette modification'), 'delete': ('approve this deletion', 'autorise cette suppression')}
+                if control.execution.pending['binding']['target'].get('scribe'):
+                    phrases['disclosure'] = ('confirm document identity and approve gemini disclosure',)
                 approve = normalized(answer) in phrases.get(effect, ('approve this action', 'approve this interaction', 'approve execution', 'autorise cette action', 'confirme cette action'))
                 decline = intent in ('negative', 'reject')
                 if not approve and not decline:
@@ -317,11 +321,46 @@ class OperatorRequests:
             if intent in ('negative', 'reject', 'uncertain'):
                 self._rotate(item, 'Take your time. Tell me when the manual step is complete, or clarify what is still missing. You can also cancel the task.')
                 return 'waiting', None
+            
+            # A genuine new instruction is not manual-step completion.
+            # Preserve the original browser/session and pass the instruction
+            # to the existing agent continuation without granting permission.
+            if category in ('manual_action', 'confirmation') and intent == 'ambiguous':
+                item['request'] = {
+                    **item['request'],
+                    'category': 'question',
+                    'reason': 'missing_information',
+                }
+
+                data = self.consume(
+                    session,
+                    {**base, 'action': 'resume'},
+                )
+
+                data['task'] += (
+                    "\n\nThe operator supplied a new instruction, "
+                    "not confirmation of a completed manual action. "
+                    "Reobserve the retained browser and follow the "
+                    "new instruction within existing permissions."
+                )
+
+                return 'resume', data
+
             if category in ('authentication', 'manual_action', 'confirmation'):
                 if intent != 'affirmative':
-                    self._rotate(item, 'Is the requested manual step complete? Please confirm when it is done; never send credentials or authentication codes.')
+                    self._rotate(
+                        item,
+                        'Is the requested manual step complete? '
+                        'Please confirm when it is done; never send '
+                        'credentials or authentication codes.',
+                    )
                     return 'waiting', None
-                return 'resume', self.consume(session, {**base, 'action': 'resume', 'answer': ''})
+
+                return 'resume', self.consume(
+                    session,
+                    {**base, 'action': 'resume', 'answer': ''},
+                )
+
             routes = None
             try:
                 routes = correction_routes(answer, control.store.adapter) if control else None
@@ -461,7 +500,7 @@ class OperatorRequests:
             data = copy.deepcopy(item['data'])
             data['session_id'] = session
             claim = ('Operator claims authentication is complete; login is not verified. Reobserve the same browser and check visible authentication state. '
-                     if item['request']['category'] == 'authentication' else 'Operator intervention completed. Reobserve the environment before acting. ')
+                     if item['request']['category'] == 'authentication' else 'Operator response received. Reobserve the environment before acting. ')
             data['task'] = (item['data']['task'] + '\n\n' + claim +
                             'This response grants no permissions. Informational answer: ' + (answer or '[manual completion confirmed]'))
             return data
