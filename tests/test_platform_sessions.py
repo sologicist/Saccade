@@ -268,11 +268,17 @@ class PlatformSessionAPI(SessionFixtures):
         self.release.set()
         self.started = threading.Event()
         self.created = []
+        self.outcomes = []
+        self.fail_reattachment = False
+        self.fail_cleanup = False
         test = self
 
         class FakeWebAgent:
             def __init__(self, **kwargs):
+                if test.fail_reattachment and kwargs.get('operator_session'):
+                    raise RuntimeError('Synthetic reattachment refused before model call.')
                 self.kwargs = kwargs
+                self.closed = False
                 self.assistant_messages = ["Synthetic step"]
                 self.tool_responses = ["Synthetic result"]
                 test.created.append(self)
@@ -281,7 +287,12 @@ class PlatformSessionAPI(SessionFixtures):
                 test.started.set()
                 if not test.release.wait(10):
                     raise RuntimeError("Synthetic test release timed out.")
-                return {"status": "success", "message": "Synthetic completion"}
+                return test.outcomes.pop(0) if test.outcomes else {"status": "success", "message": "Synthetic completion"}
+
+            def close_operator_session(self):
+                if test.fail_cleanup:
+                    raise RuntimeError('Synthetic ownership release is unverified.')
+                self.closed = True
 
         original_import = importlib.import_module
 
@@ -465,10 +476,7 @@ class PlatformSessionAPI(SessionFixtures):
 
     def test_generic_operator_resume_reuses_chat_and_revalidates_launcher(self):
         from AutoCua.saccade.operator_requests import operator_requests
-        response = self.post(platform_id="dext")
-        self.finish_run()
-        sid = response.json['session_id']
-        self.addCleanup(lambda: operator_requests.pending.pop(sid, None))
+        sid, _, _ = self.pause_browser()
         data = {'provider':'openai','model':'synthetic','mode':'web','speed':'quality','platform_id':'dext','task':'Original synthetic objective'}
         operator_requests.suspend(sid, 'originating-run', data, {'category':'question','reason':'missing_information','request':'Which invented option?'})
         url = '/api/operator?session_id=' + sid
@@ -486,6 +494,119 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertIsNotNone(self.created[-1].kwargs['prior_history'])
         self.assertEqual(self.created[-1].kwargs['browser_profile'],'saccade-dext')
         self.assertEqual(self.client.post(url,json=event,headers=headers,base_url=self.base_url).status_code,409)
+
+    def pause_browser(self):
+        from AutoCua.saccade.operator_requests import operator_requests
+        self.outcomes.append({'status': 'waiting_operator', 'message': json.dumps({
+            'category': 'authentication', 'reason': 'authentication_required',
+            'request': 'Complete private authentication.'})})
+        response = self.post(platform_id='dext')
+        self.assertEqual(response.status_code, 200, response.json)
+        self.finish_run()
+        sid = response.json['session_id']
+        self.addCleanup(lambda: operator_requests.pending.pop(sid, None))
+        self.addCleanup(lambda: operator_requests.close_browser(sid))
+        return sid, self.created[-1], operator_requests
+
+    def operator_event(self, sid, broker, action='resume'):
+        item = broker.status(sid)
+        return {**{k: item[k] for k in ('run_id', 'intervention_id', 'revision', 'token')},
+                'action': action, 'answer': '', 'non_sensitive': False}
+
+    def respond_operator(self, sid, event):
+        return self.client.post('/api/operator?session_id=' + sid, json=event,
+                                headers={**self.headers, 'Origin': self.base_url}, base_url=self.base_url)
+
+    def test_authentication_handoff_retains_lease_same_chat_and_platform_without_model_polling(self):
+        with patch.object(self.service, 'webview_window') as window:
+            sid, previous, broker = self.pause_browser()
+            scripts = '\n'.join(call.args[0] for call in window.evaluate_js.call_args_list)
+            self.assertIn('window.agentPaused', scripts)
+            self.assertNotIn('Stopped without completing', scripts)
+        lease = previous.kwargs['profile_lease']
+        self.assertTrue(broker.owns_lease(sid, lease))
+        with self.assertRaises(profile_lease.ProfileBusyError): self.acquire('saccade-dext')
+        for _ in range(12):
+            self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+        self.assertEqual(len(self.created), 1)
+        saved = self.conversation.get_session(sid)
+        self.assertIn('Paused for operator', saved['exchanges'][-1]['done_message'])
+        event = self.operator_event(sid, broker)
+        resumed = self.respond_operator(sid, event)
+        self.assertEqual(resumed.status_code, 200, resumed.json)
+        self.finish_run()
+        current = self.created[-1]
+        self.assertEqual(resumed.json['session_id'], sid)
+        self.assertEqual(resumed.json['platform_context'], self.context())
+        self.assertIs(current.kwargs['operator_session'], previous)
+        self.assertIs(current.kwargs['profile_lease'], lease)
+        self.assertIsNotNone(current.kwargs['prior_history'])
+        self.assertTrue(current.closed)
+        self.assertFalse(broker.owns_lease(sid, lease))
+        self.acquire('saccade-dext')
+        self.assertEqual(self.respond_operator(sid, event).status_code, 409)
+
+    def test_failed_reattachment_keeps_browser_and_rotates_resume_token_without_fresh_launch(self):
+        sid, previous, broker = self.pause_browser()
+        event = self.operator_event(sid, broker)
+        self.fail_reattachment = True
+        response = self.respond_operator(sid, event)
+        self.assertEqual(response.status_code, 200, response.json)
+        self.finish_run()
+        self.assertEqual(len(self.created), 1)
+        self.assertFalse(previous.closed)
+        self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
+        self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+        self.assertNotEqual(broker.status(sid)['revision'], event['revision'])
+        self.assertEqual(self.respond_operator(sid, event).status_code, 409)
+        cancelled = self.respond_operator(sid, self.operator_event(sid, broker, 'cancel'))
+        self.assertEqual(cancelled.status_code, 200, cancelled.json)
+        self.assertTrue(previous.closed)
+        self.acquire('saccade-dext')
+
+    def test_cancel_resuming_defers_transport_cleanup_until_worker_exits(self):
+        sid, previous, broker = self.pause_browser()
+        self.release.clear()
+        self.started.clear()
+        event = self.operator_event(sid, broker)
+        self.assertEqual(self.respond_operator(sid, event).status_code, 200)
+        self.assertTrue(self.started.wait(5))
+        cancelled = self.respond_operator(sid, {**event, 'action': 'cancel'})
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertTrue(self.service.active_agent_stop_event.is_set())
+        self.assertFalse(previous.closed)
+        self.finish_run()
+        self.assertTrue(self.created[-1].closed)
+        self.assertEqual(broker.status(sid)['state'], 'cancelled')
+
+    def test_failed_cancel_cleanup_reserves_ownership_and_disables_resume(self):
+        sid, previous, broker = self.pause_browser()
+        self.fail_cleanup = True
+        self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker, 'cancel')).status_code, 409)
+        self.assertFalse(previous.closed)
+        self.assertTrue(broker.owns_lease(sid, previous.kwargs['profile_lease']))
+        self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
+        self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker)).status_code, 409)
+        self.assertEqual(len(self.created), 1)
+        self.fail_cleanup = False
+        self.assertEqual(self.respond_operator(sid, self.operator_event(sid, broker, 'cancel')).status_code, 200)
+        self.assertTrue(previous.closed)
+
+    def test_missing_suspended_browser_cannot_fall_back_to_a_fresh_chrome(self):
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        response = self.post(platform_id='dext')
+        self.finish_run()
+        sid = response.json['session_id']
+        self.addCleanup(lambda: broker.pending.pop(sid, None))
+        broker.suspend(sid, 'orphaned-run', {
+            'provider': 'openai', 'model': 'synthetic', 'mode': 'web',
+            'platform_id': 'dext', 'task': 'Original synthetic objective'
+        }, {'category': 'manual_action', 'reason': 'manual_intervention', 'request': 'Review the environment.'})
+        result = self.respond_operator(sid, self.operator_event(sid, broker))
+        self.assertEqual(result.status_code, 400, result.json)
+        self.assertIn('fresh Chrome cannot replace', result.json['error'])
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(broker.status(sid)['state'], 'waiting_operator')
 
     def test_generic_chat_has_no_dext_operator_control(self):
         response = self.post()

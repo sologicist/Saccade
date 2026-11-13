@@ -693,6 +693,14 @@ impl Bridge {
         Ok(())
     }
 
+    /// Explicit terminal cleanup only. Closing this pipe can terminate Chrome;
+    /// a manual handoff must retain the same browser-level connection.
+    #[cfg(windows)]
+    pub fn close_operator_transport(&mut self) -> SResult<()> {
+        if self.scoped_download_transport.is_some() { self.finish_scoped_download_session()?; }
+        Ok(())
+    }
+
 
     #[cfg(windows)]
     pub fn start_scoped_protected_chrome(
@@ -1219,6 +1227,138 @@ mod scoped_profile_tests {
         assert!(!handshake(first.origin.clone(), first.token.clone(), &second.origin, first.token()));
         assert!(!handshake(first.origin.clone(), first.token.clone(), &first.origin, second.token()));
         assert!(handshake(first.origin.clone(), first.token.clone(), &first.origin, first.token()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn operator_handoff_retains_private_pipe_and_revalidates_the_same_page() {
+        operator_handoff_case(true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_operator_reattachment_retains_pipe_until_explicit_cleanup() {
+        operator_handoff_case(false);
+    }
+
+    #[cfg(windows)]
+    fn operator_handoff_case(valid_page: bool) {
+        Python::initialize();
+        let fixture = Fixture::new();
+        let mut bridge = fixture.bridge("operator-profile");
+        let (transport, policy_peer) = crate::chrome_pipe::synthetic_policy_transport();
+        bridge.scoped_download_transport = Some(transport);
+        let address = format!("127.0.0.1:{}", bridge.port());
+        let origin = bridge.origin.clone();
+        let token = bridge.token.clone();
+        let extension_peer = std::thread::spawn(move || {
+            let stream = TcpStream::connect(&address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = format!("ws://{address}/bridge?token={token}").into_client_request().unwrap();
+            request.headers_mut().insert("origin", origin.parse().unwrap());
+            let (mut ws, _) = tungstenite::client(request, stream).unwrap();
+            let mut observers = Vec::new();
+            let kinds = if valid_page {
+                vec!["platform_scope_end", "release", "platform_scope_begin", "platform_scope_protect_tab", "platform_scope_observe", "activate", "platform_scope_end"]
+            } else {
+                vec!["platform_scope_end", "release", "platform_scope_begin", "platform_scope_end"]
+            };
+            for kind in kinds {
+                let message: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(message["type"], kind);
+                let observer = message["observer_id"].clone();
+                let result = match kind {
+                    "platform_scope_end" => {
+                        observers.push(observer.clone());
+                        json!({"schema_version":1,"observer_id":observer,"ended":true,"browser_released":true,"cleanup_failure":""})
+                    },
+                    "platform_scope_begin" | "platform_scope_observe" => json!({
+                        "schema_version":1,"observer_id":observer,
+                        "tabs": if valid_page { json!([{"id":7,"url":"https://app.dext.com/after-manual-auth","pendingUrl":""}]) }
+                            else { json!([{"id":7,"url":"https://app.dext.com/one"}, {"id":8,"url":"https://app.dext.com/two"}]) },
+                        "failure":"","events":[],"overflow":false
+                    }),
+                    "platform_scope_protect_tab" => {
+                        assert_eq!(message["tabId"], 7);
+                        json!({"observed":true})
+                    },
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(json!({"id":message["id"],"result":result}).to_string())).unwrap();
+            }
+            assert_ne!(observers[0], observers[1], "Resume must establish a fresh observer.");
+        });
+        let bridge = Arc::new(Mutex::new(bridge));
+        let mut scanner = crate::browser::ScannerInner::new(&fixture.0, 0, None, false);
+        scanner.set_bridge(bridge.clone());
+        let context = json!({"schema_version":1,"platform_id":"dext","execution_mode":"supervised",
+            "browser_profile":"saccade-dext","start_url":"https://app.dext.com/login",
+            "allowed_hosts":["app.dext.com"],"max_steps":45,"config_revision":"a".repeat(64)});
+        scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&context).unwrap());
+        scanner.operator_handoff = true;
+        assert!(scanner.end_platform_scope().is_ok());
+        scanner.stop();
+        assert!(bridge.lock().unwrap().scoped_download_transport.is_some());
+        scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&context).unwrap());
+        if valid_page {
+            assert!(scanner.initialize_platform_scope(true).is_ok());
+            assert_eq!(scanner.current_target_id().ok().as_deref(), Some("7"));
+            assert!(!scanner.operator_handoff);
+        } else {
+            assert!(scanner.initialize_platform_scope(true).is_err());
+            assert!(scanner.platform_violation().unwrap().contains("exactly one authorized page"));
+            assert!(scanner.operator_handoff);
+        }
+        assert!(scanner.end_platform_scope().is_ok());
+        assert_eq!(bridge.lock().unwrap().scoped_download_transport.is_none(), valid_page);
+        // Closing twice is safe; no extra tab request or policy relaxation occurs.
+        assert!(scanner.close_operator_handoff().is_ok());
+        extension_peer.join().unwrap();
+        let policies = policy_peer.join().unwrap();
+        assert_eq!(policies, if valid_page { vec!["deny", "deny", "deny", "default"] } else { vec!["deny", "deny", "default"] });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unverified_operator_release_cannot_relax_policy_or_close_the_owned_transport() {
+        Python::initialize();
+        let fixture = Fixture::new();
+        let mut bridge = fixture.bridge("failed-release-profile");
+        let (transport, peer) = crate::chrome_pipe::synthetic_policy_transport();
+        bridge.scoped_download_transport = Some(transport);
+        assert!(bridge.ensure_scoped_downloads_denied().is_ok());
+        let address = format!("127.0.0.1:{}", bridge.port());
+        let origin = bridge.origin.clone();
+        let token = bridge.token.clone();
+        let extension = std::thread::spawn(move || {
+            let stream = TcpStream::connect(&address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = format!("ws://{address}/bridge?token={token}").into_client_request().unwrap();
+            request.headers_mut().insert("origin", origin.parse().unwrap());
+            let (mut ws, _) = tungstenite::client(request, stream).unwrap();
+            let message: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            ws.send(Message::Text(json!({"id":message["id"],"result":{
+                "schema_version":1,"observer_id":message["observer_id"],"ended":true,
+                "browser_released":false,"cleanup_failure":"Synthetic release refused."
+            }}).to_string())).unwrap();
+        });
+        let bridge = Arc::new(Mutex::new(bridge));
+        let mut scanner = crate::browser::ScannerInner::new(&fixture.0, 0, None, false);
+        scanner.set_bridge(bridge.clone());
+        scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&json!({
+            "schema_version":1,"platform_id":"dext","execution_mode":"supervised",
+            "browser_profile":"saccade-dext","start_url":"https://app.dext.com/login",
+            "allowed_hosts":["app.dext.com"],"max_steps":45,"config_revision":"a".repeat(64)
+        })).unwrap());
+        scanner.operator_handoff = true;
+        assert!(scanner.end_platform_scope().is_err());
+        assert!(scanner.close_operator_handoff().is_err());
+        assert!(bridge.lock().unwrap().scoped_download_transport.is_some());
+        extension.join().unwrap();
+        // Test fixture shutdown, not successful operator cleanup. No default ACK.
+        drop(scanner);
+        drop(bridge);
+        assert_eq!(peer.join().unwrap(), ["deny"]);
     }
 
     #[cfg(windows)]

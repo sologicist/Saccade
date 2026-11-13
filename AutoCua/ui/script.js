@@ -1042,7 +1042,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (el) el.classList.add('hidden');
     };
 
-    window.agentComplete = () => {
+    window.agentComplete = (paused = false) => {
         const stopBtnFrame = document.getElementById('stopBtnFrame');
         const agentStrip = document.getElementById('agentResponseStrip');
         const chatInput = document.querySelector('.chat-input');
@@ -1069,7 +1069,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // spinner doesn't rotate forever. Delayed briefly so the run's FINAL todo
         // update (an all-done state pushed right as it ends) can land first — if
         // every task ends up done, markTodoInterrupted no-ops.
-        setTimeout(function () {
+        if (!paused) setTimeout(function () {
             if (window.markTodoInterrupted) window.markTodoInterrupted();
         }, 500);
 
@@ -1093,6 +1093,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // pick up the new title / last-done message (and surface a brand-new chat).
         document.dispatchEvent(new CustomEvent('chats:refresh'));
     };
+
+    // An operator checkpoint is a normal pause. Keep pending milestones intact.
+    window.agentPaused = () => window.agentComplete(true);
 
     // Agent failure handler (called from Python when the run ends in error or
     // stops without completing). Surfaces the reason in the persistent

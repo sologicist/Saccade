@@ -133,6 +133,35 @@ pub struct ChromeHandleList {
     handles: Box<[windows_sys::Win32::Foundation::HANDLE; 2]>,
 }
 
+/// In-process CDP peer for lifecycle regression tests. No Chrome is launched.
+#[cfg(all(test, windows))]
+pub(crate) fn synthetic_policy_transport() -> (ChromePipeTransport, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let pipes = ChromePipes::new().unwrap();
+    let mut input = std::fs::File::from(pipes.child_read.try_clone().unwrap());
+    let mut output = std::fs::File::from(pipes.child_write.try_clone().unwrap());
+    let peer = std::thread::spawn(move || {
+        let mut policies = Vec::new();
+        loop {
+            let mut frame = Vec::new();
+            loop {
+                let mut byte = [0];
+                if input.read_exact(&mut byte).is_err() { return policies; }
+                if byte[0] == 0 { break; }
+                frame.push(byte[0]);
+            }
+            let message: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(message["method"], "Browser.setDownloadBehavior");
+            policies.push(message["params"]["behavior"].as_str().unwrap().to_string());
+            let mut reply = json!({"id": message["id"], "result": {}}).to_string().into_bytes();
+            reply.push(0);
+            output.write_all(&reply).unwrap();
+            output.flush().unwrap();
+        }
+    });
+    (ChromePipeTransport::new(pipes), peer)
+}
+
 #[cfg(windows)]
 impl ChromeHandleList {
     pub fn new(pipes: &ChromePipes) -> std::io::Result<Self> {

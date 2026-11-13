@@ -2425,6 +2425,9 @@ pub struct ScannerInner {
     pub all_tabs: String,
     pub url: String,
     pub mapping: serde_json::Map<String, Value>,
+    /// The host broker owns this passive browser; keep its private pipe alive.
+    pub operator_handoff: bool,
+    scope_cleanup_verified: bool,
     /// device px per CSS px, from the most recent scan.
     pub dpr: f64,
     /// Wall time of the most recent scan_elements(), in seconds.
@@ -2554,6 +2557,8 @@ impl ScannerInner {
             all_tabs: String::new(),
             url: String::new(),
             mapping: serde_json::Map::new(),
+            operator_handoff: false,
+            scope_cleanup_verified: false,
             dpr: 1.0,
             last_scan_seconds: 0.0,
             keep_requests: false,
@@ -2578,6 +2583,7 @@ impl ScannerInner {
     }
 
     pub fn set_platform_scope(&mut self, scope: crate::platform_scope::PlatformScope) {
+        self.scope_cleanup_verified = false;
         self.platform_scope = Some(scope);
         self.scope_initialized = false;
         self.scope_observer_id = format!("{}-{}", std::process::id(),
@@ -2612,6 +2618,7 @@ impl ScannerInner {
             || reply.get("cleanup_failure").and_then(Value::as_str) != Some("") {
             return Err(self.platform_failure("Platform cleanup is unverified; operator review is required before using this profile again."));
         }
+        self.scope_cleanup_verified = true;
         #[cfg(windows)]
         {
             let Some(bridge) = self.bridge.clone() else {
@@ -2621,7 +2628,13 @@ impl ScannerInner {
             };
 
             let restored = match bridge.lock() {
-                Ok(mut guard) => guard.finish_scoped_download_session(),
+                Ok(mut guard) => {
+                    if self.operator_handoff {
+                        guard.ensure_scoped_downloads_denied()
+                    } else {
+                        guard.finish_scoped_download_session()
+                    }
+                },
                 Err(_) => Err(ScanErr::s(
                     "The protected Chrome bridge lock is unavailable."
                 )),
@@ -2735,6 +2748,7 @@ impl ScannerInner {
         }
         self.scope_initialized = true;
         self.check_platform_scope()?;
+        self.operator_handoff = false;
         self.show_tab(!resumed);
         Ok(())
     }
@@ -3409,7 +3423,7 @@ impl ScannerInner {
     /// holding the profile) and only reopen their own tab. The model is told
     /// on its next action's result.
     fn revive(&mut self) -> SResult<()> {
-        if self.platform_scope.is_some() {
+        if self.platform_scope.is_some() || self.operator_handoff {
             return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
         }
         let Some((headless, profile)) = self.relaunch.clone() else {
@@ -3527,7 +3541,7 @@ impl ScannerInner {
     /// last listing had them. A tab Chrome brought back by itself (a launch that
     /// restores the last session) is taken as it is rather than opened twice.
     fn revive_bridged(&mut self) -> SResult<()> {
-        if self.platform_scope.is_some() {
+        if self.platform_scope.is_some() || self.operator_handoff {
             return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
         }
         let Some(bridge) = self.bridge.clone() else {
@@ -3702,6 +3716,21 @@ impl ScannerInner {
         }
         self.prepared.clear();
         self.cdp.drop_conn();
+    }
+
+    pub fn close_operator_handoff(&mut self) -> SResult<()> {
+        self.operator_handoff = false;
+        self.end_platform_scope()?;
+        if self.platform_scope.is_some() && !self.scope_cleanup_verified {
+            return Err(ScanErr::s("Browser ownership release is unverified; retaining protected transport and profile lease for operator review."));
+        }
+        // The pause already released tab ownership. Do not send another tab
+        // request after closing the pipe (Chrome may exit on that EOF).
+        #[cfg(windows)]
+        if let Some(bridge) = self.bridge.clone() {
+            bridge.lock().map_err(|_| ScanErr::s("Protected bridge lock unavailable."))?.close_operator_transport()?;
+        }
+        Ok(())
     }
 
     /// Reload tree/element.config.json over the embedded defaults.

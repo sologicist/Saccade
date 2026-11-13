@@ -1,5 +1,6 @@
 """Synthetic same-process checkpoints; no model, browser or secret input."""
 import unittest
+from unittest.mock import Mock
 from AutoCua.saccade.operator_requests import OperatorRequests, validate_request
 from AutoCua.saccade.business_contract import BusinessError
 
@@ -65,6 +66,34 @@ class OperatorRequestContracts(unittest.TestCase):
         data = self.broker.consume('chat', self.event())
         self.broker.suspend('chat','next-run',data,{'category':'blocked','reason':'unsafe_or_blocked','request':'Review the external environment.'})
         self.assertEqual(self.broker.pending['chat']['data']['task'],self.data['task'])
+
+    def test_passive_browser_is_private_and_cleanup_precedes_lease_release(self):
+        events = []
+        agent, lease = Mock(), Mock()
+        agent.close_operator_session.side_effect = lambda: events.append('close')
+        lease.release.side_effect = lambda: events.append('release')
+        self.broker.retain_browser('chat', agent, lease)
+        self.assertIsNone(self.broker.browser_for_resume('chat'))
+        self.assertNotIn('browser', str(self.broker.status('chat')))
+        self.broker.consume('chat', self.event())
+        self.assertEqual(self.broker.browser_for_resume('chat'), (agent, lease))
+        self.broker.close_browser('chat')
+        self.assertEqual(events, ['close', 'release'])
+        self.broker.close_browser('chat')
+        self.assertEqual(events, ['close', 'release'])
+
+    def test_unverified_cleanup_retains_lease_and_rejects_different_owner(self):
+        agent, lease = Mock(), Mock()
+        self.broker.retain_browser('chat', agent, lease)
+        with self.assertRaises(BusinessError): self.broker.retain_browser('chat', Mock(), Mock())
+        agent.close_operator_session.side_effect = RuntimeError('unverified cleanup')
+        with self.assertRaises(RuntimeError): self.broker.close_browser('chat')
+        lease.release.assert_not_called()
+        self.assertTrue(self.broker.owns_lease('chat', lease))
+        with self.assertRaises(BusinessError): self.broker.consume('chat', self.event())
+        agent.close_operator_session.side_effect = None
+        self.broker.close_all_browsers()
+        lease.release.assert_called_once()
 
 
 if __name__ == '__main__': unittest.main()

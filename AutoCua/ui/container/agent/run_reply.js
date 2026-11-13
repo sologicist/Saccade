@@ -25,7 +25,7 @@
         if (window.subAgents) window.subAgents.clear();
         var bot = window.chainBot ? window.chainBot.toReply() : null;   // the run's bot goes beside it
         el.innerHTML = String(html == null ? '' : html);
-        el.classList.toggle('is-ended', status !== 'success');
+        el.classList.toggle('is-ended', status !== 'success' && status !== 'waiting_operator');
         z.classList.add('show-reply');
         // A Web use or iOS run is not recorded: once it is over its screen box
         // goes, the turn is the message and the reply (chat_scroll.js).

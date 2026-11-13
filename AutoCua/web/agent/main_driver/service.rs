@@ -9,7 +9,7 @@
 //! last_messages) for the conversation service to persist.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError, PyValueError};
@@ -402,7 +402,8 @@ struct RunState {
 
 #[pyclass(frozen)]
 pub struct AgentService {
-    active_run: Mutex<()>,
+    // Shared across continuation wrappers that borrow the same browser.
+    active_run: Arc<Mutex<()>>,
     platform_context: Option<Py<PyAny>>,
     context_provider: String,
     context_model: String,
@@ -806,7 +807,7 @@ impl AgentService {
         tool_callback=None, token_callback=None, api_key=None, stop_event=None,
         prior_history=None, speed=None, headless=false, browser_port=None,
         session_id=None, single_tab=false, browser_profile=None, platform_context=None,
-        profile_lease=None, dext_control=None, **_extra))]
+        profile_lease=None, dext_control=None, operator_session=None, **_extra))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -832,6 +833,7 @@ impl AgentService {
         platform_context: Option<Bound<'_, PyAny>>,
         profile_lease: Option<Bound<'_, PyAny>>,
         dext_control: Option<Bound<'_, PyAny>>,
+        operator_session: Option<Bound<'_, PyAny>>,
         _extra: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let _ = cli_callback;
@@ -872,6 +874,13 @@ impl AgentService {
             ))?
         };
         let mut startup_lease = OwnedLeaseGuard { lease: lease.clone(), release: owns_profile_lease };
+        let continuation_owner = operator_session.as_ref().filter(|value| !value.is_none())
+            .map(|value| value.extract::<PyRef<'_, AgentService>>().map(|previous| previous.active_run.clone()))
+            .transpose()?;
+        // Keep the shared owner locked throughout construction, including scope
+        // installation and fresh controller creation, not only scanner borrowing.
+        let _continuation_guard = continuation_owner.as_ref().map(|owner| owner.try_lock()
+            .map_err(|_| PyValueError::new_err("Suspended browser still has an active execution owner."))).transpose()?;
         let agent_dir = crate::agent_dir(py)?;
 
         // Parallel runs hand each agent a session id (scopes the shared
@@ -940,7 +949,30 @@ impl AgentService {
         let browser_dir = crate::browser_dir(py)?;
         // Chrome itself, installed now if it is missing (utils/chrome.py).
         crate::ensure_chrome(py);
-        let scanner = if !headless_flag {
+        let active_run = continuation_owner.clone().unwrap_or_else(|| Arc::new(Mutex::new(())));
+        let scanner = if let Some(retained) = operator_session.as_ref().filter(|s| !s.is_none()) {
+            let previous: PyRef<'_, AgentService> = retained.extract()?;
+            if previous.owns_profile_lease || !previous.profile_lease.bind(py).is(&lease) {
+                return Err(PyValueError::new_err("Continuation must retain the exact browser profile lease."));
+            }
+            previous.profile_lease.bind(py).call_method0("ensure_held")?;
+            let same_context = match (&previous.platform_context, &context) {
+                (Some(a), Some(b)) => a.bind(py).eq(b.bind(py))?, (None, None) => true, _ => false,
+            };
+            if previous.profile_name != browser_profile || !same_context || previous.headless != headless_flag {
+                return Err(PyValueError::new_err("Suspended browser context does not match this continuation."));
+            }
+            let inner = previous.scanner.get().inner.clone();
+            {
+                let held = inner.lock().map_err(|_| PyValueError::new_err("Suspended browser state unavailable."))?;
+                if !held.operator_handoff || held.platform_violation().is_some() {
+                    return Err(PyValueError::new_err("Suspended browser is not available for verified reattachment; cancel and restart after operator review."));
+                }
+            }
+            let mut scanner = BrowserScanner::create(&browser_dir, 0, frontend_callback, None, single_tab);
+            scanner.inner = inner;
+            Py::new(py, scanner)?
+        } else if !headless_flag {
             // A named profile (tests) is a user data folder of the agent's own; none
             // names the person's Chrome. Resolved on the PYTHON side: AutoCua/__init__.py
             // alone knows where AutoCua_data lives.
@@ -1151,7 +1183,7 @@ impl AgentService {
         )?;
 
         let service = AgentService {
-            active_run: Mutex::new(()),
+            active_run,
             platform_context: context,
             context_provider: provider.clone(),
             context_model: model.clone(),
@@ -1723,7 +1755,11 @@ impl AgentService {
             }
         }
 
-        // Cleanup: close the scanner subprocess. Chrome deliberately stays up.
+        // Suspend tab ownership while retaining the protected Chrome process.
+        // The host broker retains this scanner and its exact profile lease.
+        if final_status == "waiting_operator" {
+            self.scanner.get().inner.lock().map_err(|_| PyValueError::new_err("Browser handoff state unavailable."))?.operator_handoff = true;
+        }
         if final_status == "waiting_operator" && self.release_all_inputs().is_err() {
             final_message = blocked_intervention("Input release could not be verified. Review and restart the external environment before resuming.");
         }
@@ -1754,6 +1790,11 @@ impl AgentService {
         out.set_item("status", final_status)?;
         out.set_item("message", final_message)?;
         Ok(out.unbind())
+    }
+
+    fn close_operator_session(&self, py: Python<'_>) -> PyResult<()> {
+        let _inactive = self.active_run.try_lock().map_err(|_| PyValueError::new_err("Cannot close an executing operator session."))?;
+        self.scanner.get().locked(py, |scanner| scanner.close_operator_handoff())
     }
 }
 
@@ -2691,7 +2732,7 @@ compression = types.SimpleNamespace(reset=lambda:None, apply_pending=lambda *arg
             browser.inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 128]));
             let controller = crate::controller::view::ControllerView::new(&PathBuf::from(&root).join("full-loop"), None, false, browser.inner.clone(), None).unwrap();
             let service = AgentService {
-                active_run: Mutex::new(()), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
+                active_run: Arc::new(Mutex::new(())), platform_context: Some(pythonize::pythonize(py, &context).unwrap().unbind()),
                 context_provider: "openai".into(), context_model: "synthetic".into(), profile_name: Some("saccade-dext".into()),
                 profile_lease: locals.get_item("fake_lease").unwrap().unwrap().unbind(), owns_profile_lease: false,
                 max_steps: 4, speed: "quality".into(), headless: false, save_conversation: false, browser_port: 0,
@@ -2786,6 +2827,15 @@ operator_thread.start()
             let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
             assert_eq!(outcome["status"], "waiting_operator");
             assert!(outcome["message"].as_str().unwrap().contains("missing_information"));
+            assert!(service.scanner.get().inner.lock().unwrap().operator_handoff);
+            // The retained execution owner cannot be resumed or closed by a
+            // competing wrapper while its shared run guard is held.
+            {
+                let shared_owner = service.active_run.clone();
+                let _running = shared_owner.lock().unwrap();
+                assert!(service.close_operator_session(py).is_err());
+                assert!(service.process_request(py, PyString::new(py, "Competing continuation").into_any()).is_err());
+            }
             let state = service.state.lock().unwrap();
             let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
             assert_eq!(turns.len(), 1);

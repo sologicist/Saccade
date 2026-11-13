@@ -2,6 +2,10 @@
 
 Date: 2026-11-13. Branch: `feat/dext-live-navigation-learning`.
 
+The browser lifetime correction and current validation results are documented in
+[Operator browser handoff](ask_operator_browser_handoff.md). The initial
+validation record below is historical; its original cleanup behavior is superseded.
+
 ## Architecture and state machine
 
 `ask_operator(category, reason, request)` is a native tool in quality, fast,
@@ -13,9 +17,10 @@ The pre-existing local Gemini schema normalization edit was preserved.
 The existing controller preempts the entire batch when an intervention is present:
 other calls receive correlated not-run results. The existing agent records all
 call/result IDs and returns `waiting_operator` immediately without another model
-turn. This is not success. Cleanup releases held input, ends observation and
-closes the scanner using the existing ownership/lease lifecycle. Failed cleanup
-requires operator review. Chrome may remain visible for private manual work.
+turn. This is not success. Cleanup releases held input, ends the old observer and
+detaches tab control. The host broker retains the same scanner, private CDP pipe
+and profile lease so the dedicated window stays available for manual work.
+Browser-level download denial remains active. Failed cleanup requires review.
 
 The UI host saves the normal conversation checkpoint and retains a minimal
 in-memory continuation bound to conversation, originating run, intervention ID,
@@ -31,8 +36,10 @@ An unavailable conversation checkpoint cannot resume.
 Resume invokes the existing launcher with fixed saved settings and the same chat
 ID, original task and saved history. It creates a fresh native execution instance
 as a controlled checkpoint restart, not a second orchestrator or parallel agent.
-Normal platform-context validation, profile acquisition, protected Chrome startup,
-native scope initialization and fresh observation precede the next model call.
+Normal platform-context validation, exact retained-lease validation, shared native
+execution ownership, fresh scope initialization and fresh observation precede the
+next model call. Resume borrows the existing protected scanner and transport;
+it cannot replace a missing browser with a fresh launch or another private pipe.
 No pending action queue is replayed. Informational answers are explicitly labeled
 as granting no permissions. Approval/effect systems remain independent.
 
@@ -78,11 +85,11 @@ tokens and answers are not written to a new journal or telemetry sink.
 
 No private account, Dext data, external authentication or live model was used in
 testing. This mechanism does not enable real Dext gestures, downloads, provider
-disclosure or accounting writes. In particular a protected Chrome process may
-need to be closed cleanly after manual authentication so the existing private-pipe
-launcher can regain ownership; resume must fail closed if it cannot.
+disclosure or accounting writes. Keep the dedicated Chrome window open during
+manual authentication. Closing it loses the private transport; automatic browser
+replacement is forbidden and the task remains blocked for operator review.
 
-## Changed files in this task
+## Initial implementation changed files (historical)
 
 - `AutoCua/saccade/operator_requests.py`
 - `AutoCua/ui/platform_session/operator_review.tsx`
@@ -100,7 +107,7 @@ launcher can regain ownership; resume must fail closed if it cannot.
 No desktop/mobile engine, browser transport, host allowlist, download policy,
 dependency or lockfile changed. No Git staging/publication was performed.
 
-## Verification and readiness
+## Initial verification and readiness (historical)
 
 Final results: Python 178 total, 168 passed and 10 Windows symlink-privilege skips;
 Rust 49 total, 47 passed and two intentional ignores (internal pipe child helper

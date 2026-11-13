@@ -26,12 +26,68 @@ def validate_request(value):
 class OperatorRequests:
     """No waiting execution thread, timers, model polling or persisted answers.
 
-    Continuation uses the existing launcher/conversation, fresh resource ownership
-    and fresh native scanning. Process restart recovery is intentionally absent.
+    Continuation uses the existing launcher/conversation and fresh native scanning.
+    Passive browser ownership stays here until resume or explicit cleanup. No
+    execution thread or model client is running while waiting. Process restart
+    recovery is intentionally absent.
     """
     def __init__(self):
         self.lock = threading.RLock()
         self.pending = {}
+        self._browsers = {}
+
+    def retain_browser(self, session, agent, lease):
+        """Host-only ownership transfer; native objects never enter JSON checkpoints."""
+        with self.lock:
+            previous = self._browsers.get(session)
+            if previous and previous[1] is not lease:
+                reject('operator_browser_ownership_conflict')
+            self._browsers[session] = (agent, lease)
+
+    def browser_for_resume(self, session):
+        with self.lock:
+            item = self.pending.get(session)
+            if not item or item['state'] != 'resuming':
+                return None
+            return self._browsers.get(session)
+
+    def owns_lease(self, session, lease):
+        with self.lock:
+            value = self._browsers.get(session)
+            return value is not None and value[1] is lease
+
+    def close_browser(self, session):
+        """Close the native transport before releasing its exclusive profile lease.
+
+        A failed native cleanup retains ownership for explicit operator review.
+        Never call while the corresponding agent is executing.
+        """
+        with self.lock:
+            value = self._browsers.get(session)
+            if value:
+                try:
+                    value[0].close_operator_session()
+                    value[1].release()
+                except Exception:
+                    item = self.pending.get(session)
+                    if item:
+                        item.update(state='waiting_operator', revision=secrets.token_hex(32), token=secrets.token_urlsafe(32),
+                                    error='Browser cleanup could not be verified. Ownership remains reserved. Review the environment and retry Cancel.',
+                                    request={'category': 'blocked', 'reason': 'unsafe_or_blocked', 'request': 'Verify browser ownership before retrying cleanup.'})
+                        item['data']['_checkpoint_unavailable'] = True
+                    raise
+                del self._browsers[session]
+
+    def close_all_browsers(self):
+        with self.lock:
+            failure = None
+            for session in list(self._browsers):
+                try:
+                    self.close_browser(session)
+                except Exception as error:
+                    failure = error
+            if failure:
+                raise failure
 
     def suspend(self, session, run, data, request):
         request = validate_request(request)

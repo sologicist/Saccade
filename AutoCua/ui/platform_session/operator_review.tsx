@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { operatorResumePayload } from './operator_resume';
 
 declare global { interface Window { remoteRunStarted?: (payload: string) => void; } }
 
@@ -44,8 +45,7 @@ export function OperatorReview() {
             if (!response.ok) throw new Error(value.error || 'Resume failed. The task remains suspended.');
             if (value.status === 'started') {
                 document.dispatchEvent(new CustomEvent('platformsession:busy'));
-                window.remoteRunStarted?.(JSON.stringify({ task: 'Continue the original task after operator intervention.',
-                    mode: 'web', session_id: pending.session_id, run_id: value.run_id, via: 'operator' }));
+                window.remoteRunStarted?.(JSON.stringify(operatorResumePayload(value, pending.session_id)));
             }
             setPending(null); setAnswer('');
         } catch (e) { setError(e instanceof Error ? e.message : 'Resume failed.'); }

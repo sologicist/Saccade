@@ -503,6 +503,8 @@ class ConversationService:
         message = message or ""
         if status == "success":
             return f"Task completed: {message}".strip().rstrip(":")
+        if status == "waiting_operator":
+            return "Paused for operator intervention. Use the operator panel to Resume or Cancel. No model requests are running."
         if status == "error":
             return f"Agent terminated (error / provider): {message}".strip().rstrip(":")
         return f"Agent stopped before completing: {message}".strip().rstrip(":")

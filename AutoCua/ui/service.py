@@ -70,6 +70,7 @@ from AutoCua.saccade.session_context import (
 )
 from AutoCua.saccade.profile_lease import ProfileBusyError, acquire_web_profile
 from AutoCua.saccade.operator_requests import operator_requests, validate_request as validate_operator_request
+atexit.register(operator_requests.close_all_browsers)
 from AutoCua.memory_compression.memory_tracker import MemoryTracker
 
 # Markdown -> HTML for everything the agent writes to the user (scratchpad
@@ -2312,6 +2313,8 @@ def operator_intervention_route():
             if data is None:
                 if was_resuming and active_agent_stop_event:
                     active_agent_stop_event.set()
+                if not was_resuming:
+                    operator_requests.close_browser(session)
                 return jsonify({'status': 'cancelled'})
             response = _start_agent_run_locked(data)
             body, code = response if isinstance(response, tuple) else (response, 200)
@@ -2337,6 +2340,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
     global active_agent_stop_event, active_agent_session_id, _latest_run_id, _run_thread, _dext_control
 
     profile_lease = None
+    retained_browser = None
     thread_started = False
     run_dext_control = None
     try:
@@ -2436,7 +2440,14 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     platform_context, provider, model, data.get('speed', 'quality'),
                     data.get('headless', False), browser_profile,
                 )
-            profile_lease = acquire_web_profile(browser_profile)
+            retained_browser = operator_requests.browser_for_resume(chat_session_id)
+            if pending_operator and pending_operator['state'] == 'resuming' and not retained_browser:
+                raise SessionContextError('The suspended browser is unavailable. Cancel and review the task; a fresh Chrome cannot replace the operator session.')
+            if retained_browser:
+                profile_lease = retained_browser[1]
+                profile_lease.ensure_held()
+            else:
+                profile_lease = acquire_web_profile(browser_profile)
             conversation.bind_platform_context(chat_session_id, platform_context)
 
         token_tracker = MemoryTracker(initial_context=_sess.get("context_tokens", 0))
@@ -2651,9 +2662,14 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     speed=speed,                   # ⚡ fast / ✨ quality (all platforms)
                     **({'platform_context': platform_context, 'browser_profile': browser_profile,
                         'profile_lease': profile_lease,
+                        'operator_session': retained_browser[0] if retained_browser else None,
                         'dext_control': run_dext_control} if run_pkg == 'web' else {}),
                     **daisy,
                 )
+                if retained_browser:
+                    # Transfer the passive reference to the current execution
+                    # owner, including its active-run cleanup guard.
+                    operator_requests.retain_browser(chat_session_id, agent, profile_lease)
                 # The page shows the phone in the iOS agent's box: no phone window
                 if run_pkg == 'mac':
                     agent.phone_window = False
@@ -2682,6 +2698,10 @@ def _start_agent_run_locked(data, via=None, hooks=None):
             except Exception as agent_exc:
                 debug_exception("run_agent")
                 run_outcome = {"status": "error", "message": str(agent_exc)}
+                if retained_browser:
+                    run_outcome = {'status': 'waiting_operator', 'message': json.dumps({
+                        'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                        'request': 'Browser reattachment could not be verified. Review the retained window and profile. Cancel if browser ownership was lost.'})}
             finally:
                 data_extraction.chat_id = None
                 stop_event.set()
@@ -2689,56 +2709,78 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     run_dext_control.close()
                 agent_glow.stop()   # desktop back to normal, whatever happened
 
-                # ── Persist this run via the conversation service ───────────
-                # Runs for BOTH completion and stop, and BEFORE the window guard,
-                # so memory is saved even if the window closed or a newer run
-                # superseded this one. agent may be None if construction failed.
-                # A run that made no steps of its own (its start failed: no
-                # agent, or none kept) saves the chat's earlier steps back, so
-                # a reopened chat keeps its memory, not just the ending note.
-                steps = getattr(agent, "assistant_messages", None)
-                results = getattr(agent, "tool_responses", None)
-                if not steps and isinstance(prior_history, dict):
-                    steps = prior_history.get("assistant_messages")
-                    results = prior_history.get("tool_responses")
-                checkpoint_saved = False
-                try:
-                    conversation.save_run(
-                        chat_session_id,
-                        steps,
-                        results,
-                        run_outcome.get("status", "success"),
-                        run_outcome.get("message", "") or "",
-                        task,
-                        getattr(agent, "last_messages", None),  # exact payload -> true memory log
-                        context_tokens=token_tracker.current,   # latest context size for the bar
-                        context_cap=token_tracker.cap,          # fixed 300k memory budget
-                        run_pkg=run_pkg,                        # which agent produced this memory
-                        agent_mode=agent_mode_for(run_pkg),     # per-chat lock
-                        sub_agent_last_id=getattr(agent, "sub_agent_last_id", None),  # ids keep counting
-                        recording=recorder.path.name if recorder else None,  # its video, for reopen
-                    )
-                    checkpoint_saved = True
-                except Exception:
-                    debug_exception("persist chat session on finish")
+                with _agent_start_lock:
+                    cleanup_failed = False
+                    if run_pkg == 'web':
+                        cancelled = (operator_requests.status(chat_session_id) or {}).get('state') == 'cancelled'
+                        if cancelled:
+                            run_outcome = {'status': 'incomplete', 'message': 'Cancelled by operator.'}
+                        if cancelled or run_outcome.get('status') in ('success', 'incomplete'):
+                            try:
+                                operator_requests.close_browser(chat_session_id)
+                            except Exception:
+                                debug_exception('operator browser cleanup')
+                                cleanup_failed = True
+                                run_outcome = {'status': 'waiting_operator', 'message': json.dumps({
+                                    'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                                    'request': 'Browser cleanup could not be verified. Ownership remains reserved. Review the environment and retry Cancel.'})}
 
-                if run_pkg == 'web':
-                    if run_outcome.get('status') == 'waiting_operator':
-                        try:
-                            intervention = json.loads(run_outcome.get('message', ''))
-                            if not isinstance(intervention, dict):
-                                raise ValueError()
-                            intervention = validate_operator_request(intervention)
-                        except (ValueError, TypeError):
-                            intervention = {'category': 'blocked', 'reason': 'unsafe_or_blocked',
-                                            'request': 'The task requires operator review. Revalidate the environment and resource ownership before resuming.'}
-                        checkpoint = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed',
-                            'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
-                        if not checkpoint_saved:
-                            checkpoint['_checkpoint_unavailable'] = True
-                        operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
-                    else:
-                        operator_requests.finish(chat_session_id, failed=run_outcome.get('status') not in ('success', 'incomplete'))
+                    # ── Persist this run via the conversation service ───────────
+                    # Runs for BOTH completion and stop, and BEFORE the window guard,
+                    # so memory is saved even if the window closed or a newer run
+                    # superseded this one. agent may be None if construction failed.
+                    # A run that made no steps of its own (its start failed: no
+                    # agent, or none kept) saves the chat's earlier steps back, so
+                    # a reopened chat keeps its memory, not just the ending note.
+                    steps = getattr(agent, "assistant_messages", None)
+                    results = getattr(agent, "tool_responses", None)
+                    if not steps and isinstance(prior_history, dict):
+                        steps = prior_history.get("assistant_messages")
+                        results = prior_history.get("tool_responses")
+                    checkpoint_saved = False
+                    try:
+                        conversation.save_run(
+                            chat_session_id,
+                            steps,
+                            results,
+                            run_outcome.get("status", "success"),
+                            run_outcome.get("message", "") or "",
+                            task,
+                            getattr(agent, "last_messages", None),  # exact payload -> true memory log
+                            context_tokens=token_tracker.current,   # latest context size for the bar
+                            context_cap=token_tracker.cap,          # fixed 300k memory budget
+                            run_pkg=run_pkg,                        # which agent produced this memory
+                            agent_mode=agent_mode_for(run_pkg),     # per-chat lock
+                            sub_agent_last_id=getattr(agent, "sub_agent_last_id", None),  # ids keep counting
+                            recording=recorder.path.name if recorder else None,  # its video, for reopen
+                        )
+                        checkpoint_saved = True
+                    except Exception:
+                        debug_exception("persist chat session on finish")
+
+                    if run_pkg == 'web':
+                        # Serialize handoff/terminal cleanup with Resume and Cancel.
+                        # Cancel during revalidation stops execution first; only this
+                        # completed worker may then close its shared transport.
+                        cancelled = (operator_requests.status(chat_session_id) or {}).get('state') == 'cancelled'
+                        if run_outcome.get('status') == 'waiting_operator' and not cancelled:
+                            try:
+                                intervention = json.loads(run_outcome.get('message', ''))
+                                if not isinstance(intervention, dict):
+                                    raise ValueError()
+                                intervention = validate_operator_request(intervention)
+                            except (ValueError, TypeError):
+                                intervention = {'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                                                'request': 'The task requires operator review. Revalidate the environment and resource ownership before resuming.'}
+                            checkpoint = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed',
+                                'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
+                            if not checkpoint_saved or cleanup_failed:
+                                checkpoint['_checkpoint_unavailable'] = True
+                            operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
+                            if agent is not None:
+                                operator_requests.retain_browser(chat_session_id, agent, profile_lease)
+                        else:
+                            operator_requests.finish(chat_session_id, failed=run_outcome.get('status') not in ('success', 'incomplete'))
 
                 if webview_window and current_session_id == active_agent_session_id:
                     try:
@@ -2746,6 +2788,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                         message = run_outcome.get("message", "") or ""
                         if status == "success":
                             webview_window.evaluate_js("window.agentComplete()")
+                        elif status == "waiting_operator":
+                            webview_window.evaluate_js("window.agentPaused && window.agentPaused()")
                         else:
                             # Surface the real reason instead of a silent "complete".
                             prefix = "❌ Error: " if status == "error" else "⚠️ Stopped without completing: "
@@ -2764,6 +2808,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                         message = run_outcome.get("message", "") or ""
                         if status == "success":
                             reply = message or "Done."
+                        elif status == "waiting_operator":
+                            reply = "Paused for operator intervention. No model requests are running. Use Resume or Cancel in the operator panel."
                         else:
                             reply = ("Error: " if status == "error" else "Stopped without completing: ") + message
                         webview_window.evaluate_js(
@@ -2791,7 +2837,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
             try:
                 run_agent()
             finally:
-                if profile_lease is not None:
+                if profile_lease is not None and not operator_requests.owns_lease(chat_session_id, profile_lease):
                     profile_lease.release()
 
         thread = threading.Thread(target=run_agent_with_lease)
@@ -2822,7 +2868,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         debug_exception("start_agent API")
         return jsonify({'error': error_text(e)}), 500
     finally:
-        if not thread_started and profile_lease is not None:
+        if not thread_started and profile_lease is not None and retained_browser is None:
             profile_lease.release()
         if not thread_started and run_dext_control is not None:
             run_dext_control.close()
