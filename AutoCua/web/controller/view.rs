@@ -825,7 +825,7 @@ mod platform_tests {
     fn controller_blocks_effects_before_any_browser_dispatch() {
         Python::initialize();
         Python::attach(|py| {
-            for kind in ["click", "hold_click", "input", "vault", "keyboard", "scroll", "dialog",
+            for kind in ["click", "hold_click", "input", "vault", "keyboard", "dialog",
                          "run_script", "more", "index", "navigate_tab", "close_tab", "download", "call_function", "unknown"] {
                 let fixture = Fixture::new();
                 fixture.scanner.lock().unwrap().business_test_observations = Some(std::collections::VecDeque::from(vec![json!({

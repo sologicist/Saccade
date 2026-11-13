@@ -15,17 +15,17 @@ LANDMARKS = [
 ]
 
 
-def install_synthetic(root, *, learning=True):
-    directory = root / 'platforms' / PLATFORM
+def install_synthetic(root, *, learning=True, platform_id=PLATFORM, host=HOST, landmarks=None):
+    directory = root / 'platforms' / platform_id
     directory.mkdir(parents=True)
     source = json.loads((root / 'platforms/dext/platform.json').read_text(encoding='utf-8'))
-    source.update(id=PLATFORM, name='Synthetic Portal', start_url=f'https://{HOST}/login', allowed_hosts=[HOST])
+    source.update(id=platform_id, name='Synthetic Portal', start_url=f'https://{host}/login', allowed_hosts=[host])
     (directory / 'platform.json').write_text(json.dumps(source), encoding='utf-8')
     if learning:
-        (directory / 'learning.json').write_text(json.dumps({'schema_version': 1, 'platform_id': PLATFORM, 'landmarks': LANDMARKS}), encoding='utf-8')
+        (directory / 'learning.json').write_text(json.dumps({'schema_version': 1, 'platform_id': platform_id, 'landmarks': LANDMARKS if landmarks is None else landmarks}), encoding='utf-8')
     domain = root / 'AutoCua/default_skills/web/domain_skill'
     manifest = json.loads((domain / 'skills.json').read_text(encoding='utf-8'))
-    manifest[HOST] = PLATFORM + '.md'
+    manifest[host] = platform_id + '.md'
     (domain / 'skills.json').write_text(json.dumps(manifest), encoding='utf-8')
-    (domain / (PLATFORM + '.md')).write_text(BASELINE, encoding='utf-8')
-    return build_platform_context(PLATFORM, root=root)
+    (domain / (platform_id + '.md')).write_text(BASELINE, encoding='utf-8')
+    return build_platform_context(platform_id, root=root)

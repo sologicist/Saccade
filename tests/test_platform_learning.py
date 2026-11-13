@@ -21,6 +21,24 @@ from tests.platform_learning_fixtures import install_synthetic, PLATFORM
 
 
 class SharedPlatformLearning(unittest.TestCase):
+    def test_three_registered_platforms_share_store_and_loader_without_core_changes(self):
+        fixture = BusinessFixture()
+        self.addCleanup(fixture.close)
+        revisions = []
+        for index in range(3):
+            platform = 'portal_' + str(index)
+            context = install_synthetic(fixture.root, platform_id=platform,
+                host=platform.replace('_', '-') + '.example.test',
+                landmarks=[{'id':'section', 'label':'Public Section ' + str(index), 'aliases':[]}])
+            control = PlatformLearningControl(context, 'shared-chat', project_root=fixture.root)
+            proposal = control.store.propose_steps(control.store.adapter.steps(['section']), control.run_id)
+            control.store.review(proposal['proposal_id'], proposal['base_revision'], proposal['candidate_revision'], True)
+            future = PlatformLearningControl(context, 'future-chat', project_root=fixture.root)
+            self.assertIn('Public Section ' + str(index), future.overlay())
+            self.assertEqual(control.overlay(), '')
+            revisions.append(future.pin_revision)
+        self.assertEqual(len(set(revisions)), 3)
+
     def setUp(self):
         self.fixture = BusinessFixture()
         self.addCleanup(self.fixture.close)
