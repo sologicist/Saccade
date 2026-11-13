@@ -717,6 +717,24 @@ fn business_review_required(result: &Value) -> bool {
         && value.get("operator_review_required").and_then(Value::as_bool) == Some(true))
 }
 
+fn operator_intervention(result: &Value) -> Option<Value> {
+    if let Some(value) = result.get("intervention") { return Some(value.clone()); }
+    result.get("results").and_then(Value::as_array).and_then(|rows| rows.iter().find_map(operator_intervention))
+}
+
+fn blocked_intervention(reason: &str) -> String {
+    json!({"category":"blocked","reason":"no_progress","request":reason}).to_string()
+}
+
+#[derive(Default)]
+struct NoProgress { signature: String, repeats: usize }
+impl NoProgress {
+    fn observe(&mut self, signature: String) -> bool {
+        if self.signature == signature { self.repeats += 1; } else { self.signature = signature; self.repeats = 1; }
+        self.repeats >= 3
+    }
+}
+
 fn whole_envelope(calls: &[Value], compacted: &Value) -> Vec<Value> {
     let envelope = view::dumps_pretty(compacted);
     let mut paired = vec![json!({
@@ -1260,6 +1278,7 @@ impl AgentService {
         let mut json_fail_count = 0i32;
         // Consecutive `reasoning`-only steps (a reminder rides on the third).
         let mut reasoning_only_count = 0i32;
+        let mut no_progress = NoProgress::default();
         let mut final_status = "incomplete".to_string();
         let mut final_message = "Agent stopped before completing the task".to_string();
 
@@ -1670,6 +1689,7 @@ impl AgentService {
                 &mut is_first_iteration,
                 &mut json_fail_count,
                 &mut reasoning_only_count,
+                &mut no_progress,
                 image_sent,
                 annotated_image_base64.as_deref(),
                 &mut step_ctx,
@@ -1704,6 +1724,9 @@ impl AgentService {
         }
 
         // Cleanup: close the scanner subprocess. Chrome deliberately stays up.
+        if final_status == "waiting_operator" && self.release_all_inputs().is_err() {
+            final_message = blocked_intervention("Input release could not be verified. Review and restart the external environment before resuming.");
+        }
         if let Err(error) = self.scanner.get().locked(py, |scanner| scanner.end_platform_scope()) {
             final_status = "waiting_operator".into();
             final_message = format!("Platform cleanup requires operator review: {}", py_err_str(py, &error));
@@ -1749,6 +1772,7 @@ impl AgentService {
         is_first_iteration: &mut bool,
         json_fail_count: &mut i32,
         reasoning_only_count: &mut i32,
+        no_progress: &mut NoProgress,
         image_sent: bool,
         annotated_image_base64: Option<&str>,
         step_ctx: &mut Option<StepCtx>,
@@ -1838,11 +1862,10 @@ impl AgentService {
         // Not from inside scrape mode: the mode's steps leave the history at
         // the exit (retire_scrape_mode), and a splice there would move the
         // mode's start.
-        if !self.state.lock().map(|st| st.scrape_mode).unwrap_or(false) {
-            self.compression
-                .bind(py)
-                .call_method1("maybe_trigger", (am, tr, original_task))?;
-        }
+        // Web suspension cannot safely cancel this compressor's independent
+        // provider retries. Do not start background model work in this engine.
+        // Existing context limits remain; cancellable compression is future work.
+        let _ = original_task;
 
         println!("LLM response received");
 
@@ -1971,23 +1994,13 @@ impl AgentService {
         };
 
         if actions_val.is_empty() && rejects.is_empty() && !note_ids.is_empty() {
+            let signature = self.scanner.get().inner.lock().map(|s| format!("notes:{}:{}", s.url, s.tree_text)).unwrap_or_default();
+            let stalled = no_progress.observe(signature);
             // A reasoning-only step: the model chose to think before acting.
             // Accepted as a normal step (it costs a fresh scan, so only a RUN
             // of them is bounded: from the third in a row the result carries
             // a reminder).
             *reasoning_only_count += 1;
-            // An `async_tools` model that never acts is the route having
-            // dropped the async flags (one call per turn again): the
-            // reminder cannot help it, so the run stops at six instead of
-            // scanning to the step cap.
-            if self.llm_manager.get().async_tools() && *reasoning_only_count >= 6 {
-                *final_status = "incomplete".into();
-                *final_message = format!(
-                    "{} steps in a row without an action on an async-tools model: the route dropped the async tool flags (see the raw responses), so the model can only emit one call per turn.",
-                    reasoning_only_count
-                );
-                return Ok(Flow::Break);
-            }
             if *reasoning_only_count >= 3 {
                 let reminder = view::dumps_pretty(&json!({
                     "status": "success",
@@ -2042,6 +2055,11 @@ impl AgentService {
             self.save_conversation_files(py, messages, &display_payload, image_sent, *step_number);
             am.append(&normalized)?;
             tr.append(view::encode_results(&note_results))?;
+            if stalled {
+                *final_status = "waiting_operator".into();
+                *final_message = blocked_intervention("Repeated reasoning without observed environmental progress. Operator information or intervention is required.");
+                return Ok(Flow::Break);
+            }
             println!("{}", view::format_response_impl(&display_payload, true));
             if let Some(cb) = &self.text_callback {
                 cb.call1(py, (view::format_response_impl(&display_payload, false),))?;
@@ -2083,9 +2101,8 @@ impl AgentService {
             // Genuinely empty turn (no text, no calls) - retry the step.
             println!("empty response from the model - retrying ({}/3)", json_fail_count);
             if *json_fail_count >= 3 {
-                *final_status = "incomplete".into();
-                *final_message =
-                    "Could not get a valid model response (3 consecutive failures)".into();
+                *final_status = "waiting_operator".into();
+                *final_message = blocked_intervention("Repeated unsupported model responses prevented progress. Review the model configuration and environment before resuming.");
                 return Ok(Flow::Break);
             }
             *step_number -= 1;
@@ -2226,9 +2243,8 @@ impl AgentService {
                 tr.set_item(tr.len() - 1, view::encode_results(&only_rejects))?;
                 println!("no valid tool call this turn ({}/3)", json_fail_count);
                 if *json_fail_count >= 3 {
-                    *final_status = "incomplete".into();
-                    *final_message =
-                        "Model kept sending invalid tool calls (3 consecutive turns)".into();
+                    *final_status = "waiting_operator".into();
+                *final_message = blocked_intervention("Repeated unsupported model responses prevented progress. Review the model configuration and environment before resuming.");
                     return Ok(Flow::Break);
                 }
                 *is_first_iteration = false;
@@ -2271,6 +2287,25 @@ impl AgentService {
 
             // Send action to controller.
             let action_result = route_model_actions(py, &self.controller, &actions_val, &calls, tr, &note_results, &reject_results)?;
+            if let Some(intervention) = operator_intervention(&action_result) {
+                *final_status = "waiting_operator".into();
+                *final_message = intervention.to_string();
+                return Ok(Flow::Break);
+            }
+            let rows = action_result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![action_result.clone()]);
+            if rows.iter().any(|row| row["status"] == "error" || row["operator_review_required"] == true) {
+                *final_status = "waiting_operator".into();
+                *final_message = blocked_intervention("An action failed or requires independent review. Reconcile its effects before resuming; permissions remain unchanged.");
+                return Ok(Flow::Break);
+            }
+            if rows.iter().all(|row| row["tool"] == "wait") {
+                let signature = self.scanner.get().inner.lock().map(|s| format!("wait:{}:{}", s.url, s.tree_text)).unwrap_or_default();
+                if no_progress.observe(signature) {
+                    *final_status = "waiting_operator".into();
+                    *final_message = blocked_intervention("Repeated waiting without observed environmental progress. Complete the required manual intervention before resuming.");
+                    return Ok(Flow::Break);
+                }
+            } else { no_progress.repeats = 0; }
             if let Some(callback) = &self.text_callback {
                 for text in business_result_texts(&action_result) { callback.call1(py, (text,))?; }
             }
@@ -2465,6 +2500,18 @@ mod business_turn_tests {
     use std::ffi::CString;
     use std::sync::Arc;
 
+    #[test]
+    fn no_progress_uses_observed_state_and_resets_when_it_changes() {
+        let mut tracker = NoProgress::default();
+        assert!(!tracker.observe("notes:page-a".into()));
+        assert!(!tracker.observe("notes:page-a".into()));
+        assert!(tracker.observe("notes:page-a".into()));
+        assert!(!tracker.observe("notes:page-b".into()));
+        assert!(!tracker.observe("wait:page-b".into()));
+        assert!(!tracker.observe("wait:page-b".into()));
+        assert!(tracker.observe("wait:page-b".into()));
+    }
+
     fn observation(url: &str) -> Value {
         json!({"schema_version":1, "observer_id":"synthetic-observer", "failure":"", "overflow":false,
             "downloads_denied":true, "tabs":[{"id":"1", "url":url, "pendingUrl":""}], "events":[]})
@@ -2493,14 +2540,21 @@ previous_module = sys.modules.get(module_name)
 fake_llm = types.ModuleType(module_name)
 fake_llm.resolve_model_info = lambda provider, model: {'api_name':'synthetic-offline', 'vision':True, 'display_name':'Synthetic'}
 full_loop = False
+provider_calls = 0
+stall_mode = None
 forced_action = None
 forced_tool_name = 'call_function'
 mutate_after_decision = False
 class Provider:
     def __init__(self, tools): self.tools, self.turn = tools, 0
     def send_request(self, messages, model, screenshot):
-        global forced_action, mutate_after_decision
+        global forced_action, mutate_after_decision, provider_calls
+        provider_calls += 1
         self.turn += 1
+        if stall_mode:
+            calls = [{'id':'stall-note-' + str(self.turn),'name':'reasoning','arguments':{'thinking':'','memory':'Synthetic unchanged observation','next_goal':'Request assistance if blocked'}}]
+            if stall_mode == 'wait': calls.append({'id':'stall-wait-' + str(self.turn),'name':'wait','arguments':{'value':'0'}})
+            return {'choices':[{'message':{'content':'','tool_calls':calls}}], 'usage':{}}
         if forced_action is not None:
             action, forced_action = forced_action, None
             if mutate_after_decision:
@@ -2725,13 +2779,46 @@ operator_thread.start()
             assert!(view::decode_results(&turns[0]).iter().any(|r| r["tool_call_id"] == "forced-call" && r["content"].as_str().unwrap_or_default().contains("verified_dext_navigation_adapter_required")));
             assert!(state.last_messages.bind(py).str().unwrap().to_string().contains("approved_navigation_guidance"));
             drop(state);
+            service.controller.configure_dext_control(py, None, None).unwrap();
+            py.run(&CString::new("before_ask = provider_calls; forced_tool_name = 'ask_operator'; forced_action = {'category':'question','reason':'missing_information','request':'Which synthetic option should be selected?'}").unwrap(), Some(&locals), None).unwrap();
+            let task = pyo3::types::PyString::new(py, "Continue the original synthetic objective.").into_any();
+            let outcome = service.process_request(py, task).unwrap();
+            let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+            assert_eq!(outcome["status"], "waiting_operator");
+            assert!(outcome["message"].as_str().unwrap().contains("missing_information"));
+            let state = service.state.lock().unwrap();
+            let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
+            assert_eq!(turns.len(), 1);
+            assert!(turns[0].contains("forced-call"));
+            drop(state);
+            let result = service.controller.route_action(py, &json!([
+                {"type":"click","id":1,"times":1},
+                {"type":"ask_operator","category":"manual_action","reason":"manual_intervention","request":"Review the current environment privately."}
+            ])).unwrap();
+            assert_eq!(result["results"][0]["status"], "not_run");
+            assert_eq!(result["results"][1]["status"], "waiting_operator");
+            py.run(&CString::new("assert provider_calls == before_ask + 1").unwrap(), Some(&locals), None).unwrap();
+            for mode in ["notes", "wait"] {
+                locals.set_item("stall_mode", mode).unwrap();
+                py.run(&CString::new("before_stall = provider_calls").unwrap(), Some(&locals), None).unwrap();
+                service.scanner.get().inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://app.dext.com/login"); 128]));
+                let task = pyo3::types::PyString::new(py, "Synthetic no-progress contract.").into_any();
+                let outcome = service.process_request(py, task).unwrap();
+                let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+                assert_eq!(outcome["status"], "waiting_operator", "{mode}: {outcome}");
+                let state = service.state.lock().unwrap();
+                let turns: Vec<String> = state.tool_responses.bind(py).extract().unwrap();
+                assert_eq!(turns.len(), 3);
+                drop(state);
+                py.run(&CString::new("assert provider_calls == before_stall + 3").unwrap(), Some(&locals), None).unwrap();
+            }
             py.run(&CString::new(r#"
 operator_thread.join(5)
 assert not operator_thread.is_alive() and operator_answers[0]['executed'] is False
 assert len(loop_runs[-1].receipts) == 0
 control.close()
 next_control.close()
-assert len(loop_runs) == 7 and len(loop_runs[0].receipts) == 1
+assert len(loop_runs) == 10 and len(loop_runs[0].receipts) == 1
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root

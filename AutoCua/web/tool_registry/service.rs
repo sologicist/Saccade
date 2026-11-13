@@ -145,6 +145,7 @@ fn main_tools(track: &[(String, String)], notes: Option<&Value>) -> Vec<Value> {
     if let Some(t) = notes {
         tools.push(t.clone());
     }
+    tools.push(ask_operator_tool());
     tools.extend(vec![
         tool("new_tab", &[("value", json!({"type": "string"}))],
              r#"Open a new browser tab. ALWAYS recommended when the current tab already holds task-relevant content - never hijack an occupied tab; check <all_tabs> first.
@@ -356,6 +357,13 @@ fn main_tools(track: &[(String, String)], notes: Option<&Value>) -> Vec<Value> {
 /// run_script): `index` keeps what the task needs from a chunk, `more` reads
 /// the next three screens, `exit_scrape_mode` leaves. Defined here so every
 /// tool this crate offers a model is still in this one file.
+pub fn ask_operator_tool() -> Value {
+    tool("ask_operator", &[("category", json!({"type":"string","enum":["question","manual_action","authentication","confirmation","blocked"]})),
+        ("reason", json!({"type":"string","enum":["missing_information","manual_intervention","authentication_required","condition_confirmation","unsafe_or_blocked","no_progress"]})),
+        ("request", json!({"type":"string","minLength":1,"maxLength":1000}))],
+        "Suspend immediately for the operator. No further model calls while paused. Ask a non-sensitive question or request private manual intervention. Never request passwords, MFA codes, API keys or secrets in chat. No answer grants permissions. Use immediately for a known human-only blocker.", &[])
+}
+
 pub fn scraping_tools() -> &'static Vec<Value> {
     static T: OnceLock<Vec<Value>> = OnceLock::new();
     T.get_or_init(|| {
@@ -388,7 +396,7 @@ pub fn scrape_mode_tools() -> &'static Vec<Value> {
     T.get_or_init(|| {
         let keep: Vec<Value> = main_tools_quality()
             .iter()
-            .filter(|t| matches!(t.get("name").and_then(Value::as_str), Some("scratchpad" | "update_todo" | "skills")))
+            .filter(|t| matches!(t.get("name").and_then(Value::as_str), Some("scratchpad" | "update_todo" | "skills" | "ask_operator")))
             .cloned()
             .collect();
         scraping_tools().iter().cloned().chain(keep).collect()
@@ -557,6 +565,7 @@ pub fn main_action_defaults() -> &'static Value {
             "skills": {"type": "load", "id": 0},
             "done": {"value": ""},
             "call_function": {"version": 1, "name": "", "arguments": {}},
+            "ask_operator": {"category":"", "reason":"", "request":""},
             "dext_navigation": {"version": 1, "route": "", "target_id": 0},
         })
     })
@@ -682,21 +691,64 @@ fn tools_anthropic(registry: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+
+/// Normalize tool schemas for the Google GenAI SDK.
+/// Gemini requires string-valued enum entries.
+/// Native Rust/Python validators still enforce integer version == 1.
+fn normalize_gemini_schema(schema: &mut Value) {
+    match schema {
+        Value::Object(fields) => {
+            if fields
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|values| {
+                    values.iter().any(|value| !value.is_string())
+                })
+            {
+                fields.remove("enum");
+            }
+
+            for child in fields.values_mut() {
+                normalize_gemini_schema(child);
+            }
+        }
+
+        Value::Array(items) => {
+            for child in items {
+                normalize_gemini_schema(child);
+            }
+        }
+
+        _ => {}
+    }
+}
+
 /// Gemini function declarations.
 fn tools_gemini(registry: &[Value]) -> Vec<Value> {
     registry
         .iter()
         .map(|t| {
             let mut m = Map::new();
-            m.insert("name".into(), t.get("name").cloned().unwrap_or(Value::Null));
+
             m.insert(
-                "parameters".into(),
-                t.get("parameters").cloned().unwrap_or(Value::Null),
+                "name".into(),
+                t.get("name").cloned().unwrap_or(Value::Null),
             );
+
+            let mut parameters = t
+                .get("parameters")
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            normalize_gemini_schema(&mut parameters);
+
+            m.insert("parameters".into(), parameters);
+
             with_description(m, t)
         })
         .collect()
 }
+
 
 /// Perplexity agent API (Responses-style flat function tools).
 fn tools_perplexity(registry: &[Value]) -> Vec<Value> {
@@ -820,6 +872,10 @@ pub fn tool_calls_to_steps(
             continue;
         }
         let defaults = defaults.unwrap();
+        if name == "ask_operator" && (args.len() != 3 || !args.values().all(Value::is_string)) {
+            rejects.push(json!({"id":call_id,"name":name,"arguments":{},"error":"invalid_operator_request"}));
+            continue;
+        }
         if name == "call_function" && (args.len() != 3 || args.get("version").and_then(Value::as_u64) != Some(1)
             || args.get("name").and_then(Value::as_str).is_none()
             || args.get("arguments").and_then(Value::as_object).is_none()) {
@@ -1636,6 +1692,19 @@ pub fn _main_tools_debug<'py>(py: Python<'py>, speed: Option<String>, strict: bo
 #[cfg(test)]
 mod business_schema_tests {
     use super::*;
+
+    #[test]
+    fn operator_tool_is_generic_strict_and_available_in_provider_dialects() {
+        for tools in [main_tools_quality(), main_tools_fast(), main_tools_claude(), scrape_mode_tools()] {
+            assert!(tools.iter().any(|tool| tool["name"] == "ask_operator"));
+        }
+        let tools = vec![ask_operator_tool()];
+        assert_eq!(tools_openai_strict(&tools)[0]["function"]["strict"], true);
+        assert_eq!(tools_anthropic(&tools)[0]["name"], "ask_operator");
+        assert_eq!(tools_gemini(&tools)[0]["name"], "ask_operator");
+        assert_eq!(tools_perplexity(&tools)[0]["name"], "ask_operator");
+        assert_eq!(tools_gemini(&tools)[0]["parameters"]["properties"]["category"]["enum"][0], "question");
+    }
 
     #[test]
     fn business_schema_uses_every_native_provider_dialect_without_global_exposure() {

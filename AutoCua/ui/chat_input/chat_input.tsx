@@ -10,10 +10,12 @@
 import { AgentMode } from '../agent_mode/agent_mode.tsx';
 import { MemoryBar } from '../memory_bar/memory_bar.tsx';
 import { PlatformSessionSelector } from '../platform_session/platform_session.tsx';
+import { OperatorReview } from '../platform_session/operator_review.tsx';
 
 export function ChatInput() {
     return (
         <div className="chat-container-content">
+            <OperatorReview />
             {/* New Output Stream Area */}
             <div className="output-stream-area">
                 <div className="welcome-overlay" id="welcomeOverlay">

@@ -69,6 +69,7 @@ from AutoCua.saccade.session_context import (
     UNBOUND, SessionContextError, resolve_platform_context, validate_session_settings,
 )
 from AutoCua.saccade.profile_lease import ProfileBusyError, acquire_web_profile
+from AutoCua.saccade.operator_requests import operator_requests, validate_request as validate_operator_request
 from AutoCua.memory_compression.memory_tracker import MemoryTracker
 
 # Markdown -> HTML for everything the agent writes to the user (scratchpad
@@ -2291,6 +2292,39 @@ def dext_operator_control():
             return jsonify({'error': 'dext_control_verification_failed'}), 409
 
 
+@app.route('/api/operator', methods=['GET', 'POST'])
+def operator_intervention_route():
+    from flask import request
+    from AutoCua.saccade.business_contract import BusinessError, loads
+    session = request.args.get('session_id', '')
+    if request.method == 'GET':
+        response = jsonify(operator_requests.status(session))
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    if request.headers.get('Origin', '').lower() not in _LOCAL_ORIGINS:
+        return jsonify({'error': 'operator_origin_required'}), 403
+    try:
+        if not request.is_json or request.content_length is None or request.content_length > 8192:
+            return jsonify({'error': 'invalid_operator_response'}), 400
+        with _agent_start_lock:
+            was_resuming = (operator_requests.status(session) or {}).get('state') == 'resuming'
+            data = operator_requests.consume(session, loads(request.get_data(), 8192))
+            if data is None:
+                if was_resuming and active_agent_stop_event:
+                    active_agent_stop_event.set()
+                return jsonify({'status': 'cancelled'})
+            response = _start_agent_run_locked(data)
+            body, code = response if isinstance(response, tuple) else (response, 200)
+            if code != 200:
+                operator_requests.retry(session)
+            return body, code
+    except BusinessError as error:
+        return jsonify({'error': str(error)}), 409
+    except Exception:
+        operator_requests.retry(session)
+        return jsonify({'error': 'resume_verification_failed'}), 409
+
+
 def _start_agent_run_locked(data, via=None, hooks=None):
     """The run behind /api/start-agent, so a task from elsewhere (the Telegram
     bot) starts the same way and the page shows it as a sent message. data:
@@ -2315,6 +2349,9 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         model = data.get('model')
         task = data.get('task')
         req_session_id = data.get('session_id')   # None / "new" / existing chat id
+        pending_operator = operator_requests.status(str(req_session_id))
+        if pending_operator and pending_operator['state'] == 'waiting_operator':
+            return jsonify({'error': 'Use the pending operator Resume or Cancel controls.'}), 409
 
         if not all([provider, model, task]):
             return jsonify({'error': 'Missing provider, model, or task'}), 400
@@ -2356,6 +2393,8 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         # memory-compression system). Seed from the chat's last saved context size
         # so a reopened chat restores where memory was.
         _sess = conversation.get_session(chat_session_id) or {}
+        if not operator_requests.status(chat_session_id) and (_sess.get('exchanges') or []) and _sess['exchanges'][-1].get('status') == 'waiting_operator':
+            return jsonify({'error': 'The in-memory continuation is unavailable. Reopen and review the task manually; automatic restart recovery is unsupported.'}), 409
 
         # Per-chat mode lock, shell axis FIRST: a chat owned by Shell use never
         # runs the main agent. run_pkg alone can't catch this — shell chats
@@ -2662,6 +2701,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                 if not steps and isinstance(prior_history, dict):
                     steps = prior_history.get("assistant_messages")
                     results = prior_history.get("tool_responses")
+                checkpoint_saved = False
                 try:
                     conversation.save_run(
                         chat_session_id,
@@ -2678,8 +2718,27 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                         sub_agent_last_id=getattr(agent, "sub_agent_last_id", None),  # ids keep counting
                         recording=recorder.path.name if recorder else None,  # its video, for reopen
                     )
+                    checkpoint_saved = True
                 except Exception:
                     debug_exception("persist chat session on finish")
+
+                if run_pkg == 'web':
+                    if run_outcome.get('status') == 'waiting_operator':
+                        try:
+                            intervention = json.loads(run_outcome.get('message', ''))
+                            if not isinstance(intervention, dict):
+                                raise ValueError()
+                            intervention = validate_operator_request(intervention)
+                        except (ValueError, TypeError):
+                            intervention = {'category': 'blocked', 'reason': 'unsafe_or_blocked',
+                                            'request': 'The task requires operator review. Revalidate the environment and resource ownership before resuming.'}
+                        checkpoint = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed',
+                            'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
+                        if not checkpoint_saved:
+                            checkpoint['_checkpoint_unavailable'] = True
+                        operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
+                    else:
+                        operator_requests.finish(chat_session_id, failed=run_outcome.get('status') not in ('success', 'incomplete'))
 
                 if webview_window and current_session_id == active_agent_session_id:
                     try:

@@ -276,6 +276,18 @@ impl ControllerView {
             return Ok(json!({"status":"error", "action":"multiple", "results": actions.iter().map(|a|
                 json!({"status":"not_run", "tool":a["type"], "code":"done_must_be_alone"})).collect::<Vec<_>>()}));
         }
+        if let Some(ask) = actions.iter().find(|a| a["type"] == "ask_operator") {
+            let mut request = ask.clone(); request.as_object_mut().unwrap().remove("type");
+            let checked = py.import("AutoCua.saccade.operator_requests")?.getattr("validate_request")?
+                .call1((pythonize::pythonize(py, &request)?,));
+            let result = match checked {
+                Ok(value) => json!({"status":"waiting_operator","tool":"ask_operator","intervention":pythonize::depythonize::<Value>(&value)?}),
+                Err(_) => json!({"status":"waiting_operator","tool":"ask_operator","intervention":{"category":"blocked","reason":"unsafe_or_blocked","request":"The intervention request could not be safely displayed. Review the task privately."}}),
+            };
+            if actions.len() == 1 { return Ok(result); }
+            return Ok(json!({"status":"waiting_operator","action":"multiple","results":actions.iter().map(|a|
+                if a["type"] == "ask_operator" { result.clone() } else { json!({"status":"not_run","tool":a["type"],"code":"operator_suspension_preempts_batch"}) }).collect::<Vec<_>>()}));
+        }
         if actions.len() == 1 {
             let (mut result, opened) = self.one(py, &actions[0])?;
             // A page frozen by the popup this action opened has nothing to settle.
