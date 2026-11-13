@@ -114,3 +114,12 @@ test('the actual reply renderer treats waiting_operator as a pause, not a failur
     window.showRunReply('Failure', 'error', true);
     assert.equal(classes.get('is-ended'), true);
 });
+
+test('the same operator continuation restores a second installed platform', () => {
+    const context = { platform_id: 'synthetic_portal', execution_mode: 'supervised' };
+    const payload = operatorResumePayload({ session_id: 'portal-chat', run_id: 'run', platform_context: context }, 'portal-chat');
+    const restored = restoreSelection(payload.platform_context, true, true);
+    assert.equal(restored.platformId, 'synthetic_portal');
+    assert.equal(payload.session_id, 'portal-chat');
+    assert.equal(restored.bound, true);
+});

@@ -12,17 +12,7 @@ from pathlib import Path
 
 from .business_contract import digest, dumps, loads, read_safe, reject
 
-ROUTES = {
-    "purchases": "Ask the operator to open Purchases manually, then reobserve and verify the section heading.",
-    "inbox": "Ask the operator to open Inbox manually, then reobserve and verify the section heading.",
-    "invoices": "Ask the operator to identify the invoices navigation control.",
-    "bank": "Ask the operator to identify the bank transactions navigation control.",
-    "workspace": "Confirm the active workspace with the operator before proceeding.",
-    "record": "Confirm the exact record with the operator; a URL is insufficient.",
-    "review": "Stop for operator review if target identity or the transition is uncertain.",
-}
-ROUTE_LABELS = {'purchases': 'Purchases', 'inbox': 'Inbox', 'invoices': 'Invoices', 'bank': 'Bank transactions',
-                'workspace': 'Workspace check', 'record': 'Record check', 'review': 'Operator review'}
+from .dext_learning import ROUTES, ROUTE_LABELS  # Legacy public contracts.
 MAX_PROCEDURE = 16_384
 _THREAD_LOCK = threading.RLock()
 
@@ -46,10 +36,18 @@ class ProcedureStore:
     Host filesystem integrity is trusted, as with the installed Python bundle.
     """
 
-    def __init__(self, project_root):
+    def __init__(self, project_root, platform_id="dext"):
         self.project = Path(project_root)
-        self.root = self.project / "platforms/dext/data/navigation"
-        self.baseline_path = self.project / "AutoCua/default_skills/web/domain_skill/dext.md"
+        from .learning_adapter import load_adapter
+        from .platform_config import load_platform
+        try:
+            platform = load_platform(platform_id, root=self.project)
+        except (OSError, ValueError):
+            reject("invalid_learning_platform")
+        self.platform_id = platform.id
+        self.adapter = load_adapter(self.project, platform.id)
+        self.root = self.project / "platforms" / platform.id / "data/navigation"
+        self.baseline_path = platform.procedure_path
         self.baseline = read_safe(self.project, self.baseline_path, MAX_PROCEDURE).decode("utf-8")
         self.baseline_digest = digest(self.baseline)
         self._directories(self.root / "snapshots")
@@ -63,11 +61,23 @@ class ProcedureStore:
                 reject("procedure_corrupt")
             initial = {"schema_version": 1, "source": "baseline", "content": self.baseline,
                        "baseline_digest": self.baseline_digest, "routes": []}
+            if self.platform_id != "dext":
+                initial.update(self._identity(), steps=[])
             revision = self._snapshot(initial)
             if not (self.root / "active.json").exists():
                 self._write("active.json", {"schema_version": 1, "current": revision,
                                            "previous": None, "generation": 0}, exclusive=True)
             self._active_locked()
+
+    def _identity(self):
+        return {"schema_version": 2, "platform_id": self.platform_id, "adapter_revision": self.adapter.revision}
+
+    def _validate_identity(self, value):
+        if value.get("schema_version") == 2:
+            if any(value.get(k) != v for k, v in self._identity().items()):
+                reject("procedure_platform_mismatch")
+        elif value.get("schema_version") != 1 or self.platform_id != "dext":
+            reject("procedure_platform_mismatch")
 
     def _directories(self, path):
         current = self.project
@@ -176,6 +186,7 @@ class ProcedureStore:
         value = self._read("snapshots/" + identifier(revision) + ".json")
         if type(value) is not dict or digest(value) != revision or value.get("baseline_digest") != self.baseline_digest:
             reject("procedure_corrupt")
+        self._validate_identity(value)
         if value.get("source") == "operator":
             if value.get("content") != self._candidate_content(value):
                 reject("procedure_corrupt")
@@ -188,6 +199,9 @@ class ProcedureStore:
         return value
 
     def _active_pointer(self):
+        from .learning_adapter import load_adapter
+        if load_adapter(self.project, self.platform_id) != self.adapter:
+            reject("learning_adapter_changed")
         pointer = self._read("active.json")
         if type(pointer) is not dict or set(pointer) != {"schema_version", "current", "previous", "generation"} or type(pointer["schema_version"]) is not int or pointer["schema_version"] != 1 or type(pointer["generation"]) is not int or pointer["generation"] < 0:
             reject("procedure_corrupt")
@@ -270,33 +284,59 @@ class ProcedureStore:
         # for secrets, scripts, URLs, selectors or enlarged permissions.
         return "# Dext navigation guidance\n\n" + "\n".join(f"{n}. {ROUTES[route]}" for n, route in enumerate(routes, 1)) + "\n"
 
-    @classmethod
-    def _candidate_content(cls, candidate):
+    def _candidate_content(self, candidate):
+        if candidate.get("schema_version") == 2:
+            self._validate_identity(candidate)
+            paths = candidate.get("step_paths")
+            if type(paths) is not list or not 1 <= len(paths) <= 8:
+                reject("invalid_procedure_steps")
+            content = "# Platform navigation guidance\n\nOperator-assisted paths only; no action, disclosure or download authority.\n"
+            inherited = candidate.get('legacy_revision')
+            if inherited is not None:
+                # Preserve previously approved Dext identity/review cautions
+                # without pretending they prove manual section transitions.
+                if self.platform_id != 'dext':
+                    reject('procedure_platform_mismatch')
+                legacy = self._read('snapshots/' + identifier(inherited) + '.json')
+                if legacy.get('schema_version') != 1:
+                    reject('procedure_corrupt')
+                content += '\n## Previously approved guidance\n\n' + self.snapshot(inherited)['content']
+            for index, steps in enumerate(paths, 1):
+                routes = self.adapter.routes(steps)
+                content += f"\n## Operator-assisted path {index}\n\n"
+                content += "".join(f"{n}. Ask the operator to open {self.adapter.labels[r]} manually, then reobserve and verify the section heading.\n" for n, r in enumerate(routes, 1))
+            if candidate.get("steps") != [step for path in paths for step in path] or len(content.encode()) > MAX_PROCEDURE:
+                reject("invalid_procedure_steps")
+            return content
+        if self.platform_id != "dext":
+            reject("procedure_platform_mismatch")
         paths = candidate.get('paths')
         if paths is None:
-            return cls.render(candidate.get('routes'))
+            return self.render(candidate.get('routes'))
         if type(paths) is not list or not 1 <= len(paths) <= 8:
             reject('invalid_procedure_routes')
         content = '# Dext navigation guidance\n\nOperator-assisted paths only; no action, disclosure or download authority.\n'
         for index, path in enumerate(paths, 1):
-            cls.render(path)
+            self.render(path)
             content += f'\n## Operator-assisted path {index}\n\n' + '\n'.join(f'{n}. {ROUTES[route]}' for n, route in enumerate(path, 1)) + '\n'
         if candidate.get('routes') != [route for path in paths for route in path] or len(content.encode()) > MAX_PROCEDURE:
             reject('invalid_procedure_routes')
         return content
 
-    def propose(self, routes, run_id, *, teaching_source="route_selection", observation_digest=None, incremental=False):
+    def propose(self, routes, run_id, *, teaching_source="route_selection", observation_digest=None, incremental=False, neutral=False):
         if teaching_source not in ("route_selection", "operator_chat_correction"):
             reject("invalid_teaching_source")
         if observation_digest is not None:
             identifier(observation_digest)
+        if neutral or self.platform_id != "dext":
+            return self.propose_steps(self.adapter.steps(routes), run_id, teaching_source=teaching_source, observation_digest=observation_digest, incremental=incremental)
         content = self.render(routes)
         with self.lock():
             base = self._active_locked()
             paths = None
             if incremental:
                 prior = self.snapshot(base['current'])
-                paths = prior.get('paths', [prior['routes']] if prior['routes'] else [])
+                paths = ([self.adapter.routes(path) for path in prior['step_paths']] if prior.get('step_paths') else prior.get('paths', [prior['routes']] if prior.get('routes') else []))
                 # Revise the path with the same entry section, preserve unrelated paths.
                 paths = [list(path) for path in paths if path[0] != routes[0]] + [list(routes)]
             candidate = {"schema_version": 1, "source": "operator", "content": content,
@@ -320,6 +360,47 @@ class ProcedureStore:
                     "evidence": ("Operator chat correction compiled locally to generic guidance. " if teaching_source == "operator_chat_correction" else "Operator-selected generic route. ") + ("A redacted native scope observation is referenced; record semantics remain unverified." if observation_digest else "No native source observation available; live target semantics unverified."),
                     "rationale": "Explicit operator teaching; guidance grants no action permission."}
 
+    def propose_steps(self, steps, run_id, *, teaching_source="operator_chat_correction", observation_digest=None, incremental=True):
+        routes = self.adapter.routes(steps)
+        if teaching_source not in ("route_selection", "operator_chat_correction"):
+            reject("invalid_teaching_source")
+        if observation_digest is not None:
+            identifier(observation_digest)
+        with self.lock():
+            base = self._active_locked()
+            prior = self.snapshot(base['current'])
+            paths = []
+            inherited = None
+            if incremental and prior['source'] != 'baseline':
+                paths = prior.get('step_paths')
+                inherited = prior.get('legacy_revision')
+                if paths is None:
+                    # Old Dext snapshots stay immutable. Conversion happens only
+                    # inside a new candidate requiring an independent approval.
+                    old_paths = prior.get('paths', [prior['routes']])
+                    if all(route in self.adapter.labels for path in old_paths for route in path):
+                        paths = [self.adapter.steps(path) for path in old_paths]
+                    else:
+                        paths, inherited = [], base['current']
+                paths = [path for path in paths if self.adapter.routes(path)[0] != routes[0]]
+            paths = paths + [steps]
+            candidate = {**self._identity(), "source": "operator", "baseline_digest": self.baseline_digest,
+                         "step_paths": paths, "steps": [s for path in paths for s in path],
+                         "base": base, "run_digest": digest(run_id), "utc": utc(),
+                         "teaching_source": teaching_source, "observation_digest": observation_digest,
+                         "proposal_id": secrets.token_hex(32)}
+            if inherited is not None:
+                candidate['legacy_revision'] = inherited
+            content = candidate['content'] = self._candidate_content(candidate)
+            self._write("proposals/" + candidate['proposal_id'] + ".json", candidate, exclusive=True)
+            old = prior['content']
+            return {"proposal_id": candidate['proposal_id'], "base_revision": base['current'],
+                    "candidate_revision": digest(candidate), "base_generation": base['generation'],
+                    "platform_id": self.platform_id, "adapter_revision": self.adapter.revision,
+                    "summary": '\n'.join(' -> '.join(self.adapter.labels[r] for r in self.adapter.routes(path)) for path in paths),
+                    "teaching_source": teaching_source, "observation_digest": observation_digest,
+                    "old": old, "new": content, "diff": ''.join(difflib.unified_diff(old.splitlines(True), content.splitlines(True), fromfile='approved', tofile='proposed'))}
+
     def review(self, proposal_id, base_revision, candidate_revision, approve):
         identifier(proposal_id)
         identifier(base_revision)
@@ -336,6 +417,7 @@ class ProcedureStore:
             current = self._active_locked()
             if current != candidate["base"] and approve:
                 reject("stale_procedure_proposal")
+            self._validate_identity(candidate)
             if candidate["content"] != self._candidate_content(candidate):
                 reject("procedure_corrupt")
             if approve:

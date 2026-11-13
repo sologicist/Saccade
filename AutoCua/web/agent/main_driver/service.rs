@@ -178,8 +178,8 @@ fn skills_blocks(py: Python<'_>, scanner: &crate::browser::BrowserScanner, contr
     crate::controller::skills::service::follow_url(&url);
     let selected = scanner.inner.lock().ok().and_then(|inner| inner.platform_skill_name());
     let mut domain = crate::controller::skills::service::domain_block_for(selected.as_deref());
-    if selected.as_deref() == Some("dext.md") && crate::controller::skills::service::domain_is_active("dext.md") {
-        let overlay = controller.procedure_overlay(py)?;
+    if selected.as_deref().is_some_and(crate::controller::skills::service::domain_is_active) {
+        let overlay = controller.procedure_overlay_for(py, selected.as_deref().expect("active selected skill"))?;
         if !overlay.is_empty() { domain.push_str(&format!("\n{overlay}")); }
     }
     Ok((crate::controller::skills::service::block(), domain))
@@ -808,7 +808,7 @@ impl AgentService {
         tool_callback=None, token_callback=None, api_key=None, stop_event=None,
         prior_history=None, speed=None, headless=false, browser_port=None,
         session_id=None, single_tab=false, browser_profile=None, platform_context=None,
-        profile_lease=None, dext_control=None, operator_session=None, correction_reopen=false, **_extra))]
+        profile_lease=None, dext_control=None, learning_control=None, operator_session=None, correction_reopen=false, **_extra))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -834,6 +834,7 @@ impl AgentService {
         platform_context: Option<Bound<'_, PyAny>>,
         profile_lease: Option<Bound<'_, PyAny>>,
         dext_control: Option<Bound<'_, PyAny>>,
+        learning_control: Option<Bound<'_, PyAny>>,
         operator_session: Option<Bound<'_, PyAny>>,
         correction_reopen: bool,
         _extra: Option<Bound<'_, PyDict>>,
@@ -857,9 +858,14 @@ impl AgentService {
             return Err(PyValueError::new_err("Platform sessions do not support parallel tabs or custom debugging ports."));
         }
         let max_steps = scope.as_ref().map(|scope| scope.max_steps).unwrap_or(100);
-        if correction_reopen && (scope.as_ref().is_none_or(|scope| scope.platform_id != "dext" || scope.execution_mode != "supervised")
+        if let Some(control) = learning_control.as_ref().filter(|c| !c.is_none()) {
+            py.import("AutoCua.saccade.platform_learning")?.getattr("validate_learning_control")?
+                .call1((control, &context))?;
+        }
+
+        if correction_reopen && (scope.is_none()
             || operator_session.as_ref().is_some_and(|session| !session.is_none()) || prior_history.as_ref().is_none_or(|history| history.is_none())) {
-            return Err(PyValueError::new_err("A reviewed correction restart requires a scoped Dext checkpoint and no retained browser."));
+            return Err(PyValueError::new_err("A reviewed correction restart requires a scoped platform checkpoint and no retained browser."));
         }
         if correction_reopen {
             let history: Value = pythonize::depythonize(prior_history.as_ref().expect("checked above"))?;
@@ -1068,6 +1074,10 @@ impl AgentService {
 
         controller.configure_business(py, context.as_ref().map(|value| value.bind(py)))?;
         controller.configure_dext_control(py, dext_control.as_ref(), context.as_ref().map(|value| value.bind(py)))?;
+        if learning_control.as_ref().is_some_and(|c| !c.is_none()) {
+            controller.configure_learning_control(py, learning_control.as_ref(), context.as_ref().map(|value| value.bind(py)))?;
+        }
+
 
         // Load system prompt — __init__ already downgraded the speed, so the
         // prompt and the tool schema are guaranteed to agree here.
@@ -1101,7 +1111,7 @@ impl AgentService {
         if system_prompt.contains(OS_PLACEHOLDER) {
             system_prompt = system_prompt.replace(OS_PLACEHOLDER, current_os());
         }
-        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If Dext target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect.\n");
+        system_prompt.push_str("\nOperator assistance: independently call ask_operator immediately when authentication, missing navigation knowledge, a required manual action or uncertainty prevents safe progress. Ask a specific natural-language question; the user must never need to name a tool. Authentication happens privately in the dedicated browser, never through chat secrets. Operator navigation answers are informational only. If platform target semantics or an action's safety are unverified, request manual action instead of inventing selectors or repeatedly retrying. Procedure learning approval is host-controlled and never authorizes an external effect.\n");
         if single_tab {
             // Overrides the base prompt's tab guidance without editing the
             // file: this agent has no tab tools and must never plan around
@@ -2936,6 +2946,59 @@ assert len(loop_runs) == 12 and len(loop_runs[0].receipts) == 1
 business_module.BusinessRun = original_business_class
 session_context._registered_vision_model = original_vision_check
 AutoCua.data_root = original_data_root
+if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)
+else: os.environ['AutoCua_WEB_DIR'] = original_web_override
+"#).unwrap(), Some(&locals), None).unwrap();
+            // The same real prompt composition and pre-provider checkpoint on
+            // a second installed platform, with no Dext business/control gate.
+            py.run(&CString::new(r#"
+from tests.platform_learning_fixtures import install_synthetic, PLATFORM, HOST, BASELINE
+from AutoCua.saccade.platform_learning import PlatformLearningControl
+from AutoCua.saccade import platform_config
+other_context = install_synthetic(fixture.root)
+original_project_root = platform_config.PROJECT_ROOT
+platform_config.PROJECT_ROOT = fixture.root
+session_context._registered_vision_model = lambda provider, model: True
+os.environ['AutoCua_WEB_DIR'] = str(fixture.root / 'native-web')
+(loop_domain / 'skills.json').write_text(__import__('json').dumps({'app.dext.com':'dext.md', HOST: PLATFORM + '.md'}), encoding='utf-8')
+(loop_domain / (PLATFORM + '.md')).write_text(BASELINE, encoding='utf-8')
+portal = PlatformLearningControl(other_context, 'portal-approval', project_root=fixture.root, conversational=True)
+p = portal.store.propose_steps(portal.store.adapter.steps(['billing_page']), portal.run_id)
+portal.store.review(p['proposal_id'], p['base_revision'], p['candidate_revision'], True)
+portal = PlatformLearningControl(other_context, 'portal-native-chat', project_root=fixture.root, conversational=True)
+forced_tool_name = 'ask_operator'
+forced_action = {'category':'question','reason':'missing_information','request':'Which public section should be opened?'}
+stall_mode = None
+before_portal = provider_calls
+"#).unwrap(), Some(&locals), None).unwrap();
+            let portal_context = locals.get_item("other_context").unwrap().unwrap();
+            service.platform_context = Some(portal_context.clone().unbind());
+            service.profile_name = Some("saccade-synthetic_portal".into());
+            service.controller.configure_learning_control(py, Some(&locals.get_item("portal").unwrap().unwrap()), Some(&portal_context)).unwrap();
+            service.scanner.get().inner.lock().unwrap().business_test_observations = Some(VecDeque::from(vec![observation("https://portal.example.test/login"); 128]));
+            let outcome = service.process_request(py, PyString::new(py, "Open the synthetic Billing section.").into_any()).unwrap();
+            let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+            assert_eq!(outcome["status"], "waiting_operator", "{outcome}");
+            assert!(!service.llm_manager.get().navigation_enabled());
+            let state = service.state.lock().unwrap();
+            let prompt = state.last_messages.bind(py).str().unwrap().to_string();
+            assert!(prompt.contains("Synthetic portal baseline"));
+            assert!(prompt.contains("approved_navigation_guidance"));
+            assert!(prompt.contains("open Billing manually"));
+            assert!(!prompt.contains("Dext navigation guidance"));
+            assert!(!prompt.contains("Confirm the exact record"));
+            drop(state);
+            py.run(&CString::new("assert provider_calls == before_portal + 1\nportal.attach_teaching(NavigationTeaching(['settings_page'], adapter=portal.store.adapter))\nbefore_portal_pause = provider_calls").unwrap(), Some(&locals), None).unwrap();
+            service.scanner.get().inner.lock().unwrap().mapping = json!({"1":{"name":"Settings","role":"link","rect":[1,1,40,20]}}).as_object().unwrap().clone();
+            let outcome = service.process_request(py, PyString::new(py, "Continue the same portal task.").into_any()).unwrap();
+            let outcome: Value = pythonize::depythonize(outcome.bind(py)).unwrap();
+            assert_eq!(outcome["status"], "waiting_operator");
+            assert!(outcome["message"].as_str().unwrap().contains("Settings"));
+            py.run(&CString::new(r#"
+assert provider_calls == before_portal_pause
+portal.close()
+platform_config.PROJECT_ROOT = original_project_root
+session_context._registered_vision_model = original_vision_check
 if original_web_override is None: os.environ.pop('AutoCua_WEB_DIR', None)
 else: os.environ['AutoCua_WEB_DIR'] = original_web_override
 "#).unwrap(), Some(&locals), None).unwrap();

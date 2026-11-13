@@ -297,11 +297,11 @@ class PlatformSessionAPI(SessionFixtures):
                 if getattr(self.kwargs['stop_event'], 'operator_pause', False):
                     return {'status': 'waiting_operator', 'message': json.dumps({'category': 'question',
                         'reason': 'missing_information', 'request': 'Navigation is paused for correction.'})}
-                control = self.kwargs.get('dext_control')
+                control = self.kwargs.get('learning_control')
                 if test.scan is not None and control:
                     control.freeze_decision()
                     control.observe_native(test.scan, {'observer': 'synthetic-observer', 'tab': '1',
-                        'profile': 'saccade-dext', 'config_revision': control.context['config_revision']})
+                        'platform_id': control.context['platform_id'], 'profile': control.context['browser_profile'], 'config_revision': control.context['config_revision']})
                     intervention = control.learning_intervention()
                     if intervention:
                         return {'status': 'waiting_operator', 'message': json.dumps(intervention)}
@@ -325,7 +325,11 @@ class PlatformSessionAPI(SessionFixtures):
             return original_import(name, *args, **kwargs)
 
         from AutoCua.saccade import platform_registry
+        operator_module = original_import("AutoCua.saccade.operator_requests")
+        isolated_broker = operator_module.OperatorRequests()
         patches = (
+            patch.object(operator_module, "operator_requests", isolated_broker),
+            patch.object(self.service, "operator_requests", isolated_broker),
             patch.object(self.service, "conversation", self.conversation),
             patch.object(self.service, "_run_thread", None),
             patch.object(self.service, "active_agent_session_id", None),
@@ -648,6 +652,49 @@ class PlatformSessionAPI(SessionFixtures):
         from AutoCua.saccade.operator_requests import operator_requests as broker
         self.addCleanup(lambda: broker.pending.pop(sid, None))
         self.addCleanup(lambda: broker.close_browser(sid))
+
+    def test_second_platform_uses_shared_active_handoff_chat_approval_and_native_control(self):
+        from tests.platform_learning_fixtures import install_synthetic, PLATFORM
+        from AutoCua.saccade.operator_requests import operator_requests as broker
+        from AutoCua.saccade.platform_learning import PlatformLearningControl
+        from AutoCua.saccade.procedure_store import ProcedureStore
+        context = install_synthetic(self.root)
+        self.release.clear()
+        first = self.post(platform_id=PLATFORM, task='Open Billing.')
+        self.assertEqual(first.status_code, 200, first.json)
+        self.assertTrue(self.started.wait(5))
+        sid = first.json['session_id']
+        self.clean_correction(sid)
+        agent = self.created[0]
+        self.assertIs(type(agent.kwargs['learning_control']), PlatformLearningControl)
+        self.assertIsNone(agent.kwargs['dext_control'])
+        self.assertEqual(first.json['platform_context'], context)
+        correction = self.correction(sid, 'The correct path is Settings, then Billing.')
+        self.assertEqual(correction.status_code, 200, correction.json)
+        self.assertEqual(correction.json['pending']['state'], 'pausing_operator')
+        self.finish_run()
+        self.assertEqual(self.provider_calls, 0)
+        self.assertFalse(agent.closed)
+        self.assertIn('Settings', broker.status(sid)['request']['request'])
+        self.assertTrue(broker.owns_lease(sid, agent.kwargs['profile_lease']))
+        for label, role, more in [('Settings', 'link', {}), ('Settings', 'heading', {'2': {'name':'Billing', 'role':'link', 'rect':[1,1,40,20]}}), ('Billing', 'heading', {})]:
+            self.scan = {'1': {'name': label, 'role': role, 'rect': [1,1,40,20]}, **more}
+            result = self.respond_operator(sid, self.chat_event(sid, broker, 'Continue'))
+            self.assertEqual(result.status_code, 200, result.json)
+            self.finish_run()
+            self.assertEqual(self.provider_calls, 0)
+            self.assertEqual(result.json['session_id'], sid)
+            self.assertEqual(result.json['platform_context'], context)
+            self.assertIs(self.created[-1].kwargs['operator_session'], self.created[-2])
+            self.assertIn('Open Billing.', self.created[-1].task)
+        self.assertIn('Billing', broker.status(sid)['procedure_summary'])
+        self.scan = None
+        saved = self.respond_operator(sid, self.chat_event(sid, broker, 'Yes, remember this'))
+        self.assertEqual(saved.status_code, 200, saved.json)
+        self.finish_run()
+        self.assertEqual(self.provider_calls, 1)
+        self.assertIn('Billing', (ProcedureStore(self.root, PLATFORM).root / 'learning.md').read_text(encoding='utf-8'))
+        self.assertFalse((self.root / 'platforms/dext/data/navigation/active.json').exists())
 
     def test_spontaneous_french_correction_after_end_keeps_objective_and_requires_fresh_surface_confirmation(self):
         from AutoCua.saccade.operator_requests import operator_requests as broker

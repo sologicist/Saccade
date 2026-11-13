@@ -2298,7 +2298,14 @@ def _navigation_correction_context(session):
     from AutoCua.saccade.operator_language import navigation_context
     saved = conversation.get_session(session) if session else None
     bound = saved.get('platform_context') if saved else None
-    eligible = bool(saved and (saved.get('run_pkg') == 'web' or saved.get('agent_mode') == 'web') and bound and bound['platform_id'] == 'dext' and bound['execution_mode'] == 'supervised')
+    eligible = bool(saved and (saved.get('run_pkg') == 'web' or saved.get('agent_mode') == 'web') and bound)
+    adapter = None
+    if eligible:
+        from AutoCua.saccade.platform_registry import PROJECT_ROOT
+        from AutoCua.saccade.session_context import _validate_context
+        from AutoCua.saccade.learning_adapter import load_adapter
+        verified = _validate_context(bound, root=PROJECT_ROOT)
+        adapter = load_adapter(PROJECT_ROOT, verified['platform_id'])
     record = operator_requests.run_context(session)
     history = None
     if eligible:
@@ -2312,9 +2319,9 @@ def _navigation_correction_context(session):
     # A first active run has no saved checkpoint yet. The worker must create it
     # before a queued correction becomes usable.
     available = bool(eligible and record and (paired or active))
-    signature = digest([session, bound, record['run_id'] if record else None, active,
+    signature = digest([session, bound, adapter.revision if adapter else None, record['run_id'] if record else None, active,
         digest(objective.encode()), (saved or {}).get('updated_at'), len((saved or {}).get('exchanges') or [])])
-    return {'eligible': eligible, 'active': active, 'available': available, 'navigation': navigation_context(objective, history),
+    return {'eligible': eligible, 'active': active, 'available': available, 'navigation': navigation_context(objective, history, adapter), 'adapter': adapter,
             'run_id': record['run_id'] if record else None, 'data': data, 'signature': signature}
 
 
@@ -2344,7 +2351,7 @@ def spontaneous_navigation_correction():
             if pending and (pending['state'] in ('waiting_operator', 'pausing_operator') or pending['state'] == 'resuming' and not context['active']):
                 return jsonify({'status': 'waiting_operator', 'pending': pending})
             operator_requests.consume_correction_claim(session, body['claim'], context['signature'])
-            kind, routes = spontaneous_correction(body['text'], eligible=context['eligible'], navigation=context['navigation'])
+            kind, routes = spontaneous_correction(body['text'], eligible=context['eligible'], navigation=context['navigation'], adapter=context['adapter'])
             if kind == 'ordinary':
                 if context['active']:
                     return jsonify({'status': 'busy', 'message': 'The agent is still working. Send a navigation correction or stop the current task before starting another request.'})
@@ -2364,7 +2371,7 @@ def spontaneous_navigation_correction():
                 active_agent_stop_event.set()
             else:
                 operator_requests.complete_correction_pause(session, context['run_id'], available=True,
-                    control=operator_requests.control_for(session), reopen=True)
+                    control=operator_requests.control_for(session), reopen=True, adapter=context['adapter'])
             pending = operator_requests.status(session)
             reply = pending.get('chat_message') or pending['request']['request']
             if not context['active']:
@@ -2447,6 +2454,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
     retained_browser = None
     thread_started = False
     run_dext_control = None
+    run_learning_control = None
     try:
         if not isinstance(data, dict):
             raise SessionContextError("The session request must be a JSON object.")
@@ -2572,14 +2580,22 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
             if _dext_control is not None:
                 _dext_control.close()
             _dext_control = None
-            if platform_context and platform_context['platform_id'] == 'dext' and platform_context['execution_mode'] == 'supervised':
-                from AutoCua.saccade.dext_control import DextRunControl
+            if platform_context:
+                from AutoCua.saccade.platform_learning import PlatformLearningControl
                 from AutoCua.saccade.platform_registry import PROJECT_ROOT
-                run_dext_control = DextRunControl(platform_context, chat_session_id,
+                control_class = PlatformLearningControl
+                if platform_context['platform_id'] == 'dext' and platform_context['execution_mode'] == 'supervised':
+                    from AutoCua.saccade.dext_control import DextRunControl
+                    control_class = DextRunControl
+                run_learning_control = control_class(platform_context, chat_session_id,
                     project_root=PROJECT_ROOT, stop_event=run_stop_event, conversational=True)
-                operator_requests.configure_teaching(chat_session_id, run_dext_control)
-                _dext_control = run_dext_control
+                operator_requests.configure_teaching(chat_session_id, run_learning_control)
+                if control_class is not PlatformLearningControl:
+                    run_dext_control = _dext_control = run_learning_control
                 fixed = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed', 'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
+                fixed['platform_id'] = platform_context['platform_id']
+                fixed['execution_mode'] = platform_context['execution_mode']
+                fixed['browser_profile'] = platform_context['browser_profile']
                 fixed['task'] = (prior_history or {}).get('task') or task
                 operator_requests.begin_run(chat_session_id, current_session_id, fixed)
 
@@ -2774,7 +2790,7 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                         'profile_lease': profile_lease,
                         'operator_session': retained_browser[0] if retained_browser else None,
                         'correction_reopen': correction_reopen,
-                        'dext_control': run_dext_control} if run_pkg == 'web' else {}),
+                        'dext_control': run_dext_control, 'learning_control': run_learning_control} if run_pkg == 'web' else {}),
                     **daisy,
                 )
                 if retained_browser:
@@ -2816,8 +2832,8 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
             finally:
                 data_extraction.chat_id = None
                 stop_event.set()
-                if run_dext_control is not None:
-                    run_dext_control.close()
+                if run_learning_control is not None:
+                    run_learning_control.close()
                 agent_glow.stop()   # desktop back to normal, whatever happened
 
                 with _agent_start_lock:
@@ -2892,16 +2908,18 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
                                                 'request': 'The task requires operator review. Revalidate the environment and resource ownership before resuming.'}
                             checkpoint = {key: data[key] for key in ('provider', 'model', 'task', 'mode', 'os', 'speed',
                                 'platform_id', 'execution_mode', 'browser_profile', 'headless') if key in data}
+                            if platform_context:
+                                checkpoint.update({key: platform_context[key] for key in ('platform_id', 'execution_mode', 'browser_profile')})
                             if not checkpoint_saved or cleanup_failed:
                                 checkpoint['_checkpoint_unavailable'] = True
                             operator_requests.suspend(chat_session_id, current_session_id, checkpoint, intervention)
-                            if run_dext_control is not None:
-                                operator_requests.present_procedure(chat_session_id, run_dext_control)
+                            if run_learning_control is not None:
+                                operator_requests.present_procedure(chat_session_id, run_learning_control)
                             if agent is not None:
                                 operator_requests.retain_browser(chat_session_id, agent, profile_lease)
                             if queued_correction:
                                 operator_requests.complete_correction_pause(chat_session_id, current_session_id,
-                                    available=checkpoint_saved and bool(getattr(agent, 'operator_handoff_available', False)), control=run_dext_control)
+                                    available=checkpoint_saved and bool(getattr(agent, 'operator_handoff_available', False)), control=run_learning_control)
                         else:
                             operator_requests.finish(chat_session_id, failed=run_outcome.get('status') not in ('success', 'incomplete'))
                         operator_requests.end_run(chat_session_id, current_session_id)
@@ -2996,8 +3014,8 @@ def _start_agent_run_locked(data, via=None, hooks=None, operator_reply=None, cor
     finally:
         if not thread_started and profile_lease is not None and retained_browser is None:
             profile_lease.release()
-        if not thread_started and run_dext_control is not None:
-            run_dext_control.close()
+        if not thread_started and run_learning_control is not None:
+            run_learning_control.close()
 
 
 def start_run_from_telegram(task, provider, model, session_id=None, text_callback=None, cli_callback=None,

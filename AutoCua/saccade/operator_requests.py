@@ -96,9 +96,8 @@ class OperatorRequests:
         with self.lock:
             return (self._queued_corrections.get(session) or {}).get('run_id') == run
 
-    def complete_correction_pause(self, session, run, *, available, control=None, reopen=False):
+    def complete_correction_pause(self, session, run, *, available, control=None, reopen=False, adapter=None):
         from .navigation_correction import NavigationTeaching
-        from .procedure_store import ROUTE_LABELS
         with self.lock:
             queued = self._queued_corrections.pop(session, None)
             if not queued or queued['run_id'] != run:
@@ -111,11 +110,15 @@ class OperatorRequests:
                 return
             if reopen:
                 item['correction_reopen'] = True
+            self._verify_control(session, control, item)
             routes = queued['routes']
+            adapter = control.store.adapter if control else adapter
+            if routes and (adapter is None or adapter.platform_id != item['data'].get('platform_id')):
+                reject('learning_platform_mismatch')
             if routes and not queued['clarify']:
-                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline if control else None)
+                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline if control else None, adapter=adapter)
                 item['request'] = {'category': 'confirmation', 'reason': 'condition_confirmation',
-                    'request': 'Proposed route: ' + ' → '.join(ROUTE_LABELS[route] for route in routes) +
+                    'request': 'Proposed route: ' + ' → '.join(adapter.summary_label(route) for route in routes) +
                     '. I will verify it before saving. Reply Continue to ' + ('open a dedicated browser and reobserve' if reopen else 'reobserve in the same browser') + ' and continue the original task.'}
             elif routes:
                 item['correction_intent_routes'] = routes
@@ -123,7 +126,7 @@ class OperatorRequests:
                     'request': 'Is this a correction to the previous navigation, rather than a new task? Reply Yes to verify the proposed route, or No to leave it unapplied.'}
             else:
                 item['request'] = {'category': 'question', 'reason': 'missing_information',
-                    'request': 'What is the corrected navigation path? Describe sections such as Purchases, then Inbox; unknown details cannot be inferred.'}
+                    'request': 'What is the corrected navigation path? Use only public section names supported by this platform; unknown details cannot be inferred.'}
             item['chat_message'] = item['request']['request']
 
     def correction_reopen(self, session):
@@ -131,10 +134,18 @@ class OperatorRequests:
             item = self.pending.get(session) or {}
             return item.get('state') == 'resuming' and item.get('correction_reopen') is True
 
+    def _verify_control(self, session, control, item=None):
+        if control is None:
+            return
+        if control.session_id != session or item and item["data"].get("platform_id") != control.context["platform_id"]:
+            reject("learning_platform_mismatch")
+        if item and any(item["data"].get(k, control.context[k]) != control.context[k] for k in ("execution_mode", "browser_profile")):
+            reject("learning_platform_mismatch")
+        control.overlay()
+
     def configure_teaching(self, session, control):
         with self.lock:
-            if control.session_id != session:
-                reject('operator_control_session_mismatch')
+            self._verify_control(session, control, self.pending.get(session))
             self._controls[session] = control
             if session in self._teaching:
                 control.attach_teaching(self._teaching[session])
@@ -151,11 +162,12 @@ class OperatorRequests:
                 return
             if control.proposal['teaching_source'] != 'operator_chat_correction' or control.proposal['observation_digest'] != digest(control.teaching.evidence):
                 reject('unverified_navigation_teaching')
+            self._verify_control(session, control, item)
             self._reviews[session] = (control, copy.deepcopy(control.proposal))
             item['procedure_summary'] = control.proposal['new']
             item['procedure_diff'] = control.proposal['diff']
             item['procedure_label'] = control.proposal['summary']
-            item['presentation_digest'] = digest([session, item['run_id'], item['intervention_id'], item['revision'],
+            item['presentation_digest'] = digest([session, control.context, control.store.adapter.revision, control.pin_revision, control.run_id, item['run_id'], item['intervention_id'], item['revision'],
                 {key: control.proposal[key] for key in ('proposal_id', 'base_revision', 'candidate_revision', 'new', 'diff', 'summary')}])
 
     def _rotate(self, item, message):
@@ -175,6 +187,7 @@ class OperatorRequests:
 
     def _review(self, session, approve):
         control, proposal = self._reviews[session]
+        self._verify_control(session, control, self.pending[session])
         if not control.proposal or any(control.proposal.get(key) != proposal[key] for key in ('proposal_id', 'base_revision', 'candidate_revision', 'new', 'diff', 'summary')):
             reject('proposal_identity_mismatch')
         control.operator_event({'event': 'review', 'review_token': control.review_token, 'approve': approve,
@@ -194,6 +207,7 @@ class OperatorRequests:
         from .navigation_correction import correction_routes, NavigationTeaching
         from .business_contract import BusinessError
         with self.lock:
+            control = control or self._controls.get(session)
             if type(event) is not dict or set(event) != {'run_id', 'intervention_id', 'revision', 'token', 'action', 'answer', 'non_sensitive', 'presentation_digest'} or event['action'] != 'chat':
                 reject('invalid_operator_response')
             presentation = event['presentation_digest']
@@ -232,6 +246,7 @@ class OperatorRequests:
                 data = self.consume(session, {**base, 'action': 'resume', 'answer': ''})
                 data['task'] += '\nProcedure ' + ('saved for future sessions. The current conversation retains its pinned version.' if approved else 'not saved.') + ' No external effect is authorized.'
                 return 'resume', data
+            self._verify_control(session, control, item)
             category = item['request']['category']
             if item.get('correction_intent_routes'):
                 if intent == 'negative':
@@ -241,7 +256,7 @@ class OperatorRequests:
                     self._rotate(item, item['request']['request'])
                     return 'waiting', None
                 if intent == 'affirmative':
-                    self._teaching[session] = NavigationTeaching(item.pop('correction_intent_routes'), baseline=control.teaching_baseline if control else None)
+                    self._teaching[session] = NavigationTeaching(item.pop('correction_intent_routes'), baseline=control.teaching_baseline if control else None, adapter=control.store.adapter if control else None)
             if intent in ('negative', 'reject', 'uncertain'):
                 self._rotate(item, 'Take your time. Tell me when the manual step is complete, or clarify what is still missing. You can also cancel the task.')
                 return 'waiting', None
@@ -252,7 +267,7 @@ class OperatorRequests:
                 return 'resume', self.consume(session, {**base, 'action': 'resume', 'answer': ''})
             routes = None
             try:
-                routes = correction_routes(answer)
+                routes = correction_routes(answer, control.store.adapter) if control else None
             except BusinessError:
                 pass
             if item.get('edit_second') and routes:
@@ -261,7 +276,7 @@ class OperatorRequests:
                     reject('invalid_navigation_correction')
                 routes = old.routes[:1] + routes + old.routes[2:]
             if routes and control is not None:
-                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline)
+                self._teaching[session] = NavigationTeaching(routes, baseline=control.teaching_baseline, adapter=control.store.adapter)
                 item.pop('edit_second', None)
             elif not routes and (category == 'blocked' or navigation_question(item['request']['request']) or item.get('edit_second')):
                 if category == 'blocked' and not navigation_question(item['request']['request']):
@@ -269,7 +284,7 @@ class OperatorRequests:
                         'request': 'What information has changed? Describe non-sensitive context; I will recheck it before continuing. This cannot authorize an external action.'}
                     self._rotate(item, item['request']['request'])
                 else:
-                    self._rotate(item, 'Which section should be opened next? Describe a navigation path such as Purchases, then Inbox. I cannot infer selectors, record identities or permissions.')
+                    self._rotate(item, 'Which section should be opened next? Describe public sections configured for this platform. I cannot infer selectors, record identities or permissions.')
                 return 'waiting', None
             # Existing informational continuation is the only path to the model.
             item['request'] = {**item['request'], 'category': 'question'}
@@ -363,6 +378,7 @@ class OperatorRequests:
                 reject('invalid_operator_response')
             if item['data'].get('_checkpoint_unavailable'):
                 reject('continuation_checkpoint_unavailable')
+            self._verify_control(session, self._controls.get(session), item)
             answer = event['answer']
             if type(answer) is not str or len(answer) > 2000:
                 reject('invalid_operator_answer')

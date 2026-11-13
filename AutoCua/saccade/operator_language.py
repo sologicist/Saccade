@@ -39,10 +39,12 @@ def navigation_question(text):
         re.search(r'\b(how|comment)\b.*\b(open|ouvrir|ouvre|find|trouver|invoices|factures)\b', value))
 
 
-def navigation_context(task, history):
+def navigation_context(task, history, adapter=None):
     """Use the bound objective or actual recent native calls, not page prose."""
     value = normalized(task)
-    if re.search(r'\b(open|find|navigate|reach|ouvrir|ouvre|trouver|cherche|acceder)\b', value) and re.search(r'\b(purchases|inbox|invoices|bank|achats|factures|banque|reception|dext)\b', value):
+    from .learning_adapter import dext_adapter
+    adapter = adapter or dext_adapter()
+    if re.search(r'\b(open|find|navigate|reach|ouvrir|ouvre|trouver|cherche|acceder)\b', value) and any(re.search(r"\b" + re.escape(name) + r"\b", value) for names in adapter.aliases.values() for name in names):
         return True
     import json
     for row in (history or {}).get('assistant_messages', [])[-5:]:
@@ -55,7 +57,7 @@ def navigation_context(task, history):
     return False
 
 
-def spontaneous_correction(text, *, eligible, navigation):
+def spontaneous_correction(text, *, eligible, navigation, adapter=None):
     """Return a correction/clarification only within a verified Web conversation."""
     from .navigation_correction import correction_framing, correction_routes
     from .business_contract import BusinessError
@@ -63,7 +65,7 @@ def spontaneous_correction(text, *, eligible, navigation):
         return 'ordinary', None
     _, explicit = correction_framing(text)
     try:
-        routes = correction_routes(text)
+        routes = correction_routes(text, adapter)
     except BusinessError:
         routes = None
     if routes and navigation:

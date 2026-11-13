@@ -2914,6 +2914,16 @@ impl ScannerInner {
         self.check_platform_scope()
     }
 
+    /// Scope evidence from this scanner and its enforced platform policy only.
+    /// This stamp is not a gesture, record or disclosure authorization.
+    pub fn platform_learning_stamp(&mut self) -> SResult<Value> {
+        self.check_platform_scope()?;
+        let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
+        Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
+            "platform_id": scope.platform_id, "profile": scope.browser_profile,
+            "config_revision": scope.config_revision}))
+    }
+
     /// Scope-only metadata for a local UI preview; never an input permit.
     pub fn dext_navigation_stamp(&mut self) -> SResult<Value> {
         let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
@@ -3844,9 +3854,9 @@ impl ScannerInner {
         self.check_platform_scope()?;
         #[cfg(test)]
         if self.business_test_observations.is_some() {
-            self.url = "https://app.dext.com/login".into();
-            self.tree_text = "<main><h1>Synthetic Dext fixture</h1><p>No customer records</p></main>".into();
-            self.all_tabs = "[1] Synthetic Dext fixture: https://app.dext.com/login".into();
+            self.url = self.platform_scope.as_ref().map(|scope| scope.start_url.clone()).unwrap_or_default();
+            self.tree_text = "<main><h1>Synthetic platform fixture</h1><p>No customer records</p></main>".into();
+            self.all_tabs = format!("[1] Synthetic platform fixture: {}", self.url);
             self.cursor_enabled = false;
             self.check_platform_scope()?;
             return Ok("Synthetic browser scan".into());

@@ -5,12 +5,11 @@ from __future__ import annotations
 import secrets
 import threading
 import time
-from pathlib import Path
 
 from .business_catalogue import catalogue, client_registration
-from .business_contract import digest, dumps, loads, reject
-from .procedure_store import ProcedureStore, ROUTES
-from .session_context import _validate_context
+from .business_contract import digest, reject
+from .procedure_store import ROUTES
+from .platform_learning import PlatformLearningControl
 
 NAVIGATION_TOOL = {"name": "dext_navigation", "description":
     "Request a one-step Dext navigation preview for independent operator review. "
@@ -24,7 +23,7 @@ NAVIGATION_TOOL = {"name": "dext_navigation", "description":
         "required": ["version", "route", "target_id"], "additionalProperties": False}}
 
 
-class DextRunControl:
+class DextRunControl(PlatformLearningControl):
     """One UI-owned run, separate from the model and PR4 business permissions.
 
     Current native scope proves host/profile/download denial, not the semantic
@@ -33,100 +32,29 @@ class DextRunControl:
     """
 
     def __init__(self, context, session_id, *, project_root=None, stop_event=None, conversational=False):
-        from .platform_config import PROJECT_ROOT
-        self.project = Path(project_root or PROJECT_ROOT)
-        self.context = _validate_context(context, root=self.project)
+        super().__init__(context, session_id, project_root=project_root, stop_event=stop_event, conversational=conversational)
         if self.context["platform_id"] != "dext" or self.context["execution_mode"] != "supervised":
             reject("unsupported_navigation_session")
-        if type(session_id) is not str or not 1 <= len(session_id) <= 128:
-            reject("invalid_control_session")
-        self.store = ProcedureStore(self.project)
-        self.session_id = session_id
-        self.run_id = secrets.token_hex(32)
-        self.review_token = secrets.token_urlsafe(32)
-        self.pin_revision = self.store.pin(session_id)
-        self.stop_event = stop_event
-        self.lock = threading.RLock()
-        self.closed = False
-        self.observation = None
-        self.pending = None
-        self.binding = None
-        self.proposal = None
+        self.pending = self.binding = None
         self._navigation_decided = threading.Event()
         self._navigation_result = None
-        self._source_revision = None
-        self._last_observation_digest = None
-        self.conversational = conversational
-        self.teaching = None
-        self.teaching_baseline = None
-
-    def attach_teaching(self, teaching):
-        from .navigation_correction import NavigationTeaching
-        if type(teaching) is not NavigationTeaching:
-            reject('invalid_navigation_teaching')
-        self.teaching = teaching
-
-    def learning_intervention(self):
-        """Read only by the native loop after a fresh, scope-checked observation."""
-        with self.lock:
-            if not self.teaching:
-                return None
-            self._observation(self.observation['id'] if self.observation else None)
-            request = self.teaching.intervention()
-            if request:
-                return request
-            if self.proposal is None:
-                self.proposal = self.store.propose(self.teaching.routes, self.run_id,
-                    teaching_source='operator_chat_correction', observation_digest=digest(self.teaching.evidence), incremental=True)
-            return {'category': 'confirmation', 'reason': 'condition_confirmation',
-                    'request': 'I have corroborated the manually demonstrated sections. May I remember the proposed operator-assisted navigation procedure for future sessions?'}
+        self._business_revision = None
 
     def freeze_decision(self):
-        self.validate_native(self.context)
-        self._source_revision = catalogue("dext")["revision"]
+        super().freeze_decision()
+        self._business_revision = catalogue("dext")["revision"]
 
-    def validate_native(self, context):
-        if _validate_context(context, root=self.project) != self.context or self.closed:
-            reject("control_context_changed")
-        return True
-
-    def overlay(self):
-        # Reopening verifies the persisted pin; active pointer changes cannot
-        # silently alter a run or a resumed conversation's guidance.
-        if self.store.pin(self.session_id) != self.pin_revision:
-            reject("procedure_pin_changed")
-        snapshot = self.store.snapshot(self.pin_revision)
-        if snapshot["source"] == "baseline":
-            return ""
-        return ("<approved_navigation_guidance revision=\"" + self.pin_revision + "\">\n"
-                "Operator-approved guidance only. It grants no action, disclosure or download permission.\n"
-                + self.store.markdown(self.pin_revision) + "</approved_navigation_guidance>")
+    def _invalidate_observation(self):
+        self.pending = self.binding = None
+        self._navigation_result = None
+        self._navigation_decided.set()
 
     def observe_native(self, elements, stamp):
-        with self.lock:
-            if self.closed or self.stop_event is not None and self.stop_event.is_set():
-                reject("control_stopped")
-            if type(stamp) is not dict or set(stamp) != {"observer", "tab", "profile", "config_revision"} or any(type(stamp[k]) is not str or not 1 <= len(stamp[k]) <= 128 for k in ("observer", "tab")) or stamp["profile"] != "saccade-dext" or stamp["config_revision"] != self.context["config_revision"]:
-                reject("unverified_navigation_observation")
-            if type(elements) is not dict:
-                reject("unverified_navigation_observation")
-            dumps(elements, 524_288)
-            # A fresh observation invalidates pending navigation and client claims,
-            # even at the same URL and with a visually similar record.
-            self.pending = self.binding = None
-            self._navigation_result = None
-            self._navigation_decided.set()
-            self.observation = {"id": secrets.token_hex(32), "stamp": dict(stamp),
-                                "elements": loads(dumps(elements, 524_288), 524_288),
-                                "expires": time.monotonic() + 60}
-            # Retain only a scope-evidence digest across handoff. Never save DOM
-            # text, target IDs, raw record fields or the correction in the SOP.
-            self._last_observation_digest = digest([self.run_id, self.observation["id"], stamp])
-            from .navigation_correction import landmarks
-            controls, headings = landmarks(elements)
-            self.teaching_baseline = (controls, headings, self._last_observation_digest, stamp['tab'])
-            if self.teaching:
-                self.teaching.observe(controls, headings, self._last_observation_digest, stamp['tab'])
+        # Compatibility with the existing Dext preview stamp. The shared native
+        # checkpoint supplies an explicit platform identity for every platform.
+        if type(stamp) is dict and set(stamp) == {"observer", "tab", "profile", "config_revision"}:
+            stamp = {**stamp, 'platform_id': self.context['platform_id']}
+        return super().observe_native(elements, stamp)
 
     def propose_navigation(self, action):
         with self.lock:
@@ -207,6 +135,7 @@ class DextRunControl:
         if type(event) is not str or event not in fields or set(body) != fields[event] | {"review_token", "event"}:
             reject("invalid_operator_event")
         with self.lock:
+            self.overlay()
             if event in ("teach", "teach_correction"):
                 if self.proposal:
                     reject("procedure_review_pending")
@@ -251,14 +180,8 @@ class DextRunControl:
             return {"status": "reviewed", "executed": False}
 
     def _observation(self, observation_id):
-        if self.closed or not self.observation or self.observation["id"] != observation_id or time.monotonic() >= self.observation["expires"] or self.stop_event is not None and self.stop_event.is_set():
-            reject("stale_navigation_observation")
-        try:
-            self.validate_native(self.context)
-        except ValueError:
-            reject("control_context_changed")
-        self.overlay()  # Verify the persisted pinned revision again.
-        if self._source_revision is None or catalogue("dext")["revision"] != self._source_revision:
+        super()._observation(observation_id)
+        if self._business_revision is None or catalogue("dext")["revision"] != self._business_revision:
             reject("navigation_source_changed")
 
     def close(self):

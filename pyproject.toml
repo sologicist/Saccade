@@ -124,6 +124,7 @@ include = [
     # Technical platform metadata lives beside AutoCua in source and site-packages.
     # Include only configuration files, never local platform customer data.
     { path = "platforms/*/platform.json", format = ["sdist", "wheel"] },
+    { path = "platforms/*/learning.json", format = ["sdist", "wheel"] },
     { path = "AutoCua/saccade/business_functions/platforms/dext/policy.json", format = ["sdist", "wheel"] },
     { path = "AutoCua/android/agent_native.pyd", format = "wheel" },   # Windows
     { path = "AutoCua/android/agent_native.so", format = "wheel" },    # macOS, Linux

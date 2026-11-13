@@ -43,6 +43,7 @@ const ON_THE_PAGE: [&str; 6] = ["click", "hold_click", "input", "vault", "keyboa
 pub struct ControllerView {
     business: Mutex<Option<crate::tool_registry::business::BusinessGate>>,
     dext_control: Mutex<Option<Py<PyAny>>>,
+    learning_control: Mutex<Option<Py<PyAny>>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -81,6 +82,7 @@ impl ControllerView {
         Ok(ControllerView {
             business: Mutex::new(None),
             dext_control: Mutex::new(None),
+            learning_control: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -127,23 +129,48 @@ impl ControllerView {
             },
             _ => None,
         };
+        self.configure_learning_control(py, control, context)?;
         *self.dext_control.lock().unwrap() = checked;
         Ok(())
     }
 
+    pub fn configure_learning_control(&self, py: Python<'_>, control: Option<&Bound<'_, PyAny>>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let checked = match control {
+            Some(control) if !control.is_none() => {
+                let context = context.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("operator_channel_required"))?;
+                Some(py.import("AutoCua.saccade.platform_learning")?.getattr("validate_learning_control")?
+                    .call1((control, context))?.unbind())
+            },
+            _ => None,
+        };
+        *self.learning_control.lock().unwrap() = checked;
+        Ok(())
+    }
+
     pub fn procedure_overlay(&self, py: Python<'_>) -> PyResult<String> {
-        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
         match control { Some(control) => control.bind(py).call_method0("overlay")?.extract(), None => Ok(String::new()) }
     }
 
+    pub fn procedure_overlay_for(&self, py: Python<'_>, selected: &str) -> PyResult<String> {
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        if let Some(control) = control {
+            let platform: String = control.bind(py).getattr("context")?.get_item("platform_id")?.extract()?;
+            if selected != format!("{platform}.md") {
+                return Err(pyo3::exceptions::PyValueError::new_err("learning_platform_mismatch"));
+            }
+        }
+        self.procedure_overlay(py)
+    }
+
     pub fn conversational_intervention(&self, py: Python<'_>) -> PyResult<Option<Value>> {
-        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
         let Some(control) = control else { return Ok(None) };
         let control = control.bind(py);
         if !control.getattr("conversational")?.extract::<bool>()? { return Ok(None) }
         control.call_method0("freeze_decision")?;
         let (elements, stamp) = super::service::scan_op(py, &self.scanner, |scanner| {
-            Ok((scanner.mapping.clone(), scanner.dext_navigation_stamp()?))
+            Ok((scanner.mapping.clone(), scanner.platform_learning_stamp()?))
         }).map_err(|error| match error {
             ActErr::Py(error) => error,
             ActErr::Msg(message) => pyo3::exceptions::PyValueError::new_err(message),

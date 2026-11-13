@@ -65,7 +65,7 @@ function composer(handler) {
     const status = { textContent: '' };
     const send = { contentWindow: {} }, stop = { contentWindow: {} };
     const content = { querySelector: selector => selector === '.chat-input' ? input : null };
-    const document = { readyState: 'complete', dispatchEvent() {},
+    const document = { readyState: 'complete', dispatchEvent() {}, querySelector: () => null,
         getElementById: id => ({ chatWrapper: { querySelector: () => content }, agentText: status,
             sendBtnFrame: send, stopBtnFrame: stop })[id] || null };
     let fetches = 0;
@@ -125,5 +125,16 @@ test('disabled local correction mode preserves normal model selection guard', ()
     ui.input.value = 'Normal generic request';
     ui.enter();
     assert.equal(ui.input.value, 'Normal generic request');
+    assert.equal(ui.fetches(), 0);
+});
+
+test('a second installed platform keeps the ordinary composer available during a run', () => {
+    const ui = composer(() => null);
+    ui.window.currentSessionId = 'portal-chat';
+    ui.input.disabled = true;
+    ui.window.remoteRunStarted({ task: 'Open Billing', mode: 'web', session_id: 'portal-chat',
+        platform_context: { platform_id: 'synthetic_portal', execution_mode: 'supervised' } });
+    assert.equal(ui.input.disabled, false);
+    assert.equal(ui.window.currentSessionId, 'portal-chat');
     assert.equal(ui.fetches(), 0);
 });
