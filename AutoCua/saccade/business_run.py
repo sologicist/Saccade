@@ -27,6 +27,7 @@ SCRIBE_FORMAT_ERRORS = frozenset({
     "invalid_invoice_currency",
     "invalid_invoice_amount",
     "incomplete_invoice_proposal",
+    "accounting_provider_incomplete",
 })
 
 
@@ -281,10 +282,16 @@ class BusinessRun:
                     and ticket["name"] == "dext.scribe"
                     and code in SCRIBE_FORMAT_ERRORS
                     and type(preview) is dict
-                    and set(preview) == {"raw_model_response", "truncated"}
+                    and set(preview) == {
+                        "raw_model_response",
+                        "truncated",
+                        "finish_reason",
+                    }
                     and type(preview["raw_model_response"]) is str
-                    and 0 < len(preview["raw_model_response"].encode("utf-8")) <= 32000
+                    and len(preview["raw_model_response"].encode("utf-8")) <= 32000
                     and type(preview["truncated"]) is bool
+                    and type(preview["finish_reason"]) is str
+                    and len(preview["finish_reason"]) <= 64
                 ):
                     return {
                         "status": "error",
@@ -294,6 +301,7 @@ class BusinessRun:
                         "raw_response_truncated": preview["truncated"],
                         "response_validated": False,
                         "operator_review_required": True,
+                        "finish_reason": preview["finish_reason"],
                     }
 
                 reject(code)
@@ -308,10 +316,10 @@ class BusinessRun:
             if self.automatic and ticket["name"] == "dext.scribe":
                 print(
                     "[SCRIBE CONFIRMED] "
-                    f"function={ticket['name']} "
+                    f"function=dext.scribe "
                     f"status={reply['status']} "
-                    f"entries={len(reply['result']['ecriture'])} "
-                    f"journal={reply['result']['journal']}",
+                    f"response_type=raw_text "
+                    f"length={len(reply['result'])}",
                     flush=True,
                 )
             

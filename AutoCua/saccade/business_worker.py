@@ -14,6 +14,7 @@ def execute(request):
         BusinessRun,
         WORKER_ERRORS,
         SCRIBE_FORMAT_ERRORS,)
+    from .accounting_provider import ScribeIncomplete
     automatic = type(request) is dict and request.get('automatic') is True
     expected = {"version", "ticket", "context", "project_root", "offline_receipts", "model"}
     if automatic:
@@ -81,31 +82,40 @@ def execute(request):
             automatic
             and ticket["name"] == "dext.scribe"
             and code in SCRIBE_FORMAT_ERRORS
-            and context is not None
-            and type(context.scribe_raw_response) is str
         ):
-            raw = context.scribe_raw_response
-            candidate = raw
+            if isinstance(error, ScribeIncomplete):
+                raw = error.raw_text
+                reason = error.finish_reason
+            else:
+                raw = (
+                    context.scribe_raw_response
+                    if context is not None
+                    else None
+                )
+                reason = ""
 
-            # Respecter la taille maximale du protocole worker.
-            while candidate:
-                preview = {
-                    "raw_model_response": candidate,
-                    "truncated": candidate != raw,
-                }
+            if type(raw) is str:
+                candidate = raw
 
-                try:
-                    dumps(
-                        {**response, "result": preview},
-                        MAX_OUTPUT,
-                    )
-                except BusinessError as size_error:
-                    if str(size_error) != "size_limit":
+                while True:
+                    preview = {
+                        "raw_model_response": candidate,
+                        "truncated": candidate != raw,
+                        "finish_reason": reason,
+                    }
+
+                    try:
+                        dumps(
+                            {**response, "result": preview},
+                            MAX_OUTPUT,
+                        )
+                    except BusinessError as size_error:
+                        if str(size_error) != "size_limit" or not candidate:
+                            break
+                        candidate = candidate[:len(candidate) // 2]
+                    else:
+                        response["result"] = preview
                         break
-                    candidate = candidate[:len(candidate) // 2]
-                else:
-                    response["result"] = preview
-                    break
         
     except Exception:
         # Exceptions can contain labels, document contents, credentials or paths.
