@@ -1,5 +1,8 @@
 # Dext Auto Lite implementation report
 
+PR6 review corrections on top of 9de2ddd are documented in
+[PR6 review fixes](pr6_auto_lite_review_fixes.md), including current validation results.
+
 ## Branch and baseline
 
 Implementation branch: feat/dext-auto-lite.
@@ -56,17 +59,18 @@ their own explicit trusted registration; this is not a new plugin framework.
 
 ## Downloads and actual filesystem paths
 
-The existing native click tool clicks the observed Download control. Anonymous
+The existing native click tool clicks the observed control, regardless of label. Anonymous
 buttons with the observed download class get a descriptive label from the normal
 scanner. No PDF.js, MAIN-world script, iframe resource extraction, guessed URL,
 fetch, Blob adapter, new browser, download manager or interception layer is used.
 
-For a recognized download click, the existing bridge reads Chrome's Downloads
-history for up to eight seconds after the click. It accepts one newly started,
-completed, existing item with a matching page referrer. Multiple items,
-interruption, a foreign/unknown referrer or missing completion produce explicit
-non-success download metadata. A successful click alone never establishes a
-successful download. The observation does not change Chrome settings or policy.
+Each native click starts one operation on the existing agent line. Chrome
+onCreated/onChanged events and tab-bound webRequest metadata establish a unique
+download ID and request/redirect chain. Only that ID is queried; a filename or
+referrer alone is insufficient. A 100 ms grace replaces the eight-second polling
+loop. Late/in-progress downloads are rechecked at existing action/business
+boundaries without another click. Ambiguous, uncorrelated, interrupted or missing
+files fail closed. The observation does not change Chrome settings or policy.
 
 Chrome's absolute filename is consumed privately by the existing controller and
 business run. Only its basename is returned to the model. The trusted host
@@ -74,11 +78,13 @@ verifies the PDF and can use the actual browser-confirmed parent folder, which
 supports a nondefault Chrome destination. Non-PDF browser downloads retain their
 normal result and are not treated as Scribe inputs.
 
-For an exact filename supplied through chat/tool output, the local helper uses
+For an exact confirmed filename supplied through tool output, the local helper uses
 Windows SHGetKnownFolderPath(FOLDERID_Downloads), or the operator's absolute
 SACCADE_DOWNLOADS_DIR override. It does not use the project working directory,
 search unrelated directories, invent collision suffixes or select a similarly
 named file. Spaces, accents, Unicode and Chrome's exact (1) suffix are preserved.
+Automatic Scribe requires a completed Chrome association for this operation; a
+model-selected existing file cannot establish that association.
 
 The host rejects traversal, unexpected path components, paths outside the trusted
 folder, missing/nonregular/reparse files, .crdownload/.part files, stale files,
@@ -89,7 +95,7 @@ rechecks the file and its host-observed SHA-256 before analysis. A failed newer
 file verification invalidates the previous current-file hint.
 
 Freshness starts when the business run is activated on Dext and is reset to the
-trusted native timestamp of each new Download click. A failed or unconfirmed
+trusted native timestamp of each new native click. A failed or unconfirmed
 new click cannot silently reuse the previous PDF. Older files are not
 automatically trusted on a later run or after reactivation. Download again through
 the existing browser if a stale file has no current evidence. The simple lookup
@@ -144,7 +150,8 @@ approval is required. This does not authorize unrelated documents or Dext writes
 
 When the Web agent uses Google, Scribe reuses that run's selected Gemini model
 and runtime Google key. Otherwise it uses the existing saved Google selection
-when available, or the default in AutoCua's Google MODEL_MAPPINGS. The existing
+when available, or AutoCua's explicit Google DEFAULT_MODEL (gemini-4-argon),
+independent of dictionary ordering. The existing
 llm_manager._key loader resolves GOOGLE_API_KEY from runtime settings, environment
 or the same API-key file used by the app. There is no second credential field,
 store, model table or accounting configuration. Unknown model aliases, missing
@@ -191,9 +198,11 @@ Known production limits:
 - Save/Print dialogs are not automated or suppressed. If Chrome does not create a
   completed download, the tool reports unconfirmed; no successful Scribe result
   can be inferred from a click.
-- Completion must occur within the observation window and retain an exact page
-  referrer. Slow downloads, referrer-policy differences or multiple simultaneous
-  downloads fail clearly and need real-browser observation before adaptation.
+- The initiating request must be observed within two seconds of the click;
+  pending completion is bounded to two minutes. Missing tab/request/redirect
+  evidence, an overflowing metadata buffer or concurrent downloads fail closed.
+  Referrer equality is not required when the unique request chain proves the tab.
+  Actual Chrome/Dext event visibility still needs real-browser verification.
 - Files from earlier runs are rejected as stale rather than guessed/reused.
 - No semantic client-owner identification is inferred from a basename or hash.
 - A frozen launcher must set SACCADE_WORKER_PYTHON to a trusted absolute Python
@@ -228,7 +237,7 @@ Known production limits:
 8. Navigate away and back (also switch owned tabs) and verify resources are revoked
    and restored. Preserve the same conversation and generic browser ownership.
 
-## Final local test results
+## Initial Auto Lite test results (before PR6 review fixes)
 
 - Python: 134 discovered, 126 passed, eight skipped, zero failures/errors;
   25.970 seconds. All skips require unavailable Windows symlink privileges.
@@ -276,7 +285,7 @@ The Python runner uses cached test dependencies and supplies fresh wheel/sdist/
 native-library paths to the existing tests. Build logs and the isolated SDK are
 under ignored .cache/. No application dependency was installed globally.
 
-## Exact source changes
+## Initial Auto Lite source changes
 
 ### Modified (32)
 

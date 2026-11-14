@@ -33,8 +33,13 @@ impl BusinessGate {
         pythonize::depythonize(&self.run.bind(py).call_method0("refresh")?).map_err(Into::into)
     }
 
-    pub fn note_download(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        self.run.bind(py).call_method1("note_download", (path,))?;
+    pub fn note_download(&self, py: Python<'_>, path: &str, operation: u64) -> PyResult<()> {
+        self.run.bind(py).call_method1("note_download", (path,operation))?;
+        Ok(())
+    }
+
+    pub fn invalidate_download(&self, py: Python<'_>, operation: u64) -> PyResult<()> {
+        self.run.bind(py).call_method1("invalidate_download", (operation,))?;
         Ok(())
     }
 
@@ -76,6 +81,7 @@ pub fn denied_error(py: Python<'_>, error: &PyErr) -> Value {
             | "download_file_missing" | "download_incomplete" | "download_stale" | "download_outside_folder"
             | "invalid_download_path" | "invalid_download_filename" | "invalid_download_pdf"
             | "download_file_changed"
+            | "chrome_confirmed_download_required" | "download_operation_changed"
             | "downloads_folder_unavailable" | "downloads_configuration_invalid" | "invalid_client_registration") {
             result["code"] = json!(code);
         }

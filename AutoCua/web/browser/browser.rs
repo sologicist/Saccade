@@ -5331,10 +5331,11 @@ fn bridge_timeout(req: &Value) -> Duration {
         "run_script" => 20.0,
         "navigate" | "reload" | "history" | "wait_load" | "activate" => 35.0,
         "settle" => 3.0,
+        "download_status" => 2.0,
         // The app's picture on a scraping step: tools.js gives up on it at 1.5 s.
         "frame" => 3.0,
         "blank_page" => 15.0,
-        "click" => (if req["observe_download"] == true { 20.0 } else { 10.0 }) + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
+        "click" => 10.0 + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
         "input" | "vault_input" => 15.0,
         _ => 10.0,
     };

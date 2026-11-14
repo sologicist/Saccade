@@ -15,6 +15,12 @@ from tests.business_fixtures import BusinessFixture
 
 
 class AutoLite(unittest.TestCase):
+    def chrome_confirms(self, run, path):
+        # Simulate only the host-side completed-observation boundary. Real
+        # Chrome correlation is separately exercised by the bridge fixtures.
+        run.begin_download(run.download_since_ns)
+        run.note_download(str(path),run.download_since_ns)
+
     def setUp(self):
         import sys
         sdk=Path(__file__).resolve().parents[1]/'.cache/auto-lite-sdk'
@@ -85,6 +91,7 @@ class AutoLite(unittest.TestCase):
         reference=f.data/'synthetic-alpha/comptable_achats.md'
         reference.write_text('Full purchase reference '+ 'history '*3000+' FINAL RULE',encoding='utf8')
         run=BusinessRun(f.context,project_root=f.root,automatic=True,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path)
         run.refresh()
         action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
         ticket=run.prepare(action)
@@ -113,6 +120,68 @@ class AutoLite(unittest.TestCase):
         with patch.dict('os.environ',{'GOOGLE_API_KEY':''}):
             with self.assertRaisesRegex(BusinessError,'accounting_provider_key_missing'):
                 GeminiAccountingProvider().complete([], '')
+
+    def test_automatic_scribe_requires_the_exact_current_chrome_confirmation(self):
+        f=self.fixture; since=time.time_ns()
+        confirmed=f.root/'Invoice (1).pdf'; other=f.root/'Invoice.pdf'
+        confirmed.write_bytes(b'%PDF-1.4 requested %%EOF')
+        other.write_bytes(b'%PDF-1.4 unrelated %%EOF')
+        run=BusinessRun(f.context,project_root=f.root,downloads_dir=f.root,download_since_ns=since)
+        run.refresh()
+        def action(pdf,**fields):
+            return {'type':'call_function','version':1,'name':'dext.scribe',
+                    'arguments':{'pdf':pdf,'client_id':'synthetic-alpha','sens':'achat',**fields}}
+        for selected in (other.name,str(other),confirmed.name):
+            with self.subTest(selected=selected),self.assertRaisesRegex(BusinessError,'chrome_confirmed_download_required'):
+                run.prepare(action(selected))
+        with self.assertRaisesRegex(BusinessError,'download_operation_changed'):
+            run.note_download(str(confirmed),since)
+        self.chrome_confirms(run,confirmed)
+        ticket=run.prepare(action(confirmed.name))
+        self.assertEqual(ticket['arguments']['pdf'],str(confirmed))
+        for selected in (other.name,str(other)):
+            with self.assertRaisesRegex(BusinessError,'download_file_changed'): run.prepare(action(selected))
+        with self.assertRaisesRegex(BusinessError,'download_outside_folder'):
+            run.prepare(action(str(f.root.parent/'Invoice (1).pdf')))
+        with self.assertRaisesRegex(BusinessError,'unauthorized_client'):
+            run.prepare(action(confirmed.name,client_id='synthetic-other'))
+        with self.assertRaisesRegex(BusinessError,'schema_mismatch'):
+            run.prepare(action(confirmed.name,sens='banque'))
+        confirmed.write_bytes(b'%PDF-1.4 substituted bytes %%EOF')
+        with self.assertRaisesRegex(BusinessError,'download_file_changed'): run.prepare(action(confirmed.name))
+
+    def test_new_failed_and_incomplete_observations_revoke_old_files_and_tickets(self):
+        f=self.fixture; since=time.time_ns()
+        path=f.root/'Current.pdf'; path.write_bytes(b'%PDF-1.4 requested %%EOF')
+        run=BusinessRun(f.context,project_root=f.root,downloads_dir=f.root,download_since_ns=since)
+        run.refresh(); self.chrome_confirms(run,path)
+        action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
+        ticket=run.prepare(action)
+        run.begin_download(since+1)
+        self.assertEqual(run.execute(ticket)['code'],'invalid_or_consumed_business_ticket')
+        with self.assertRaisesRegex(BusinessError,'chrome_confirmed_download_required'): run.prepare(action)
+        with self.assertRaisesRegex(BusinessError,'download_operation_changed'):
+            run.note_download(str(path),since)  # Delayed answer from the old operation.
+        run.invalidate_download(since+1)
+        with self.assertRaisesRegex(BusinessError,'chrome_confirmed_download_required'): run.prepare(action)
+        with self.assertRaisesRegex(BusinessError,'download_operation_changed'):
+            run.note_download(str(path),since+1)
+        run.begin_download(since+2)
+        path.with_name(path.name+'.crdownload').write_bytes(b'partial')
+        with self.assertRaisesRegex(BusinessError,'download_incomplete'):
+            run.note_download(str(path),since+2)
+        with self.assertRaisesRegex(BusinessError,'chrome_confirmed_download_required'): run.prepare(action)
+
+    def test_production_and_offline_descriptions_match_their_contracts(self):
+        f=self.fixture
+        production=BusinessRun(f.context,project_root=f.root).refresh()
+        description=production['description']
+        self.assertNotIn('synthetic inputs',description)
+        for term in ('confirmed','absolute path','active registered client','achat','vente',
+                     'comptable_achats.md','comptable_ventes.md','comptable_banque.md','null','Neither function writes'):
+            self.assertIn(term,description)
+        self.assertIn('synthetic inputs',f.run().refresh()['description'])
+        self.assertEqual(production['parameters']['properties']['name']['enum'],['dext.bank','dext.scribe'])
 
     def test_existing_google_loader_and_selected_model_are_reused_without_extra_settings(self):
         from AutoCua.saccade.accounting_provider import settings
@@ -146,13 +215,16 @@ class AutoLite(unittest.TestCase):
 
     def test_unknown_models_are_rejected_and_invalid_saved_settings_use_existing_default(self):
         from AutoCua.saccade.accounting_provider import settings
-        from AutoCua.llm_provider.google.view import MODEL_MAPPINGS
+        from AutoCua.llm_provider.google.view import MODEL_MAPPINGS, DEFAULT_MODEL
         from AutoCua.agent_conversation.service import conversation
         with self.assertRaisesRegex(BusinessError,'accounting_model_unavailable'):
             settings('model-supplied-unregistered-name','synthetic-key')
         (self.fixture.root/'settings.json').write_text('[]',encoding='utf8')
         with patch.object(conversation,'root',return_value=self.fixture.root):
-            self.assertEqual(settings(api_key='synthetic-key')[0],next(iter(MODEL_MAPPINGS)))
+            # Dictionary ordering must never choose the accounting model.
+            reordered=dict(reversed(list(MODEL_MAPPINGS.items())))
+            with patch('AutoCua.llm_provider.google.view.MODEL_MAPPINGS',reordered):
+                self.assertEqual(settings(api_key='synthetic-key')[0],DEFAULT_MODEL)
 
     def test_windows_known_download_folder_is_resolved_without_reading_customer_files(self):
         import os
@@ -170,25 +242,26 @@ class AutoLite(unittest.TestCase):
         run=BusinessRun(f.context,project_root=f.root,automatic=True)
         custom=f.root/'custom Chrome downloads';custom.mkdir()
         path=custom/'Fresh.pdf';path.write_bytes(b'%PDF-1.4 fresh %%EOF')
-        run.note_download(str(path))
+        self.chrome_confirms(run,path)
         self.assertEqual(run.downloads_dir,custom)
         run.refresh()
         path.write_bytes(b'%PDF-1.4 changed %%EOF')
         with self.assertRaisesRegex(BusinessError,'download_file_changed'):
             run.prepare({'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}})
         with self.assertRaisesRegex(BusinessError,'invalid_download_path'):
-            run.note_download(path.name)
-        with self.assertRaisesRegex(BusinessError,'download_file_changed'):
+            run.note_download(path.name,run.download_since_ns)
+        with self.assertRaisesRegex(BusinessError,'chrome_confirmed_download_required'):
             run.prepare({'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}})
         run.begin_download(time.time_ns()+1_000_000_000)
         with self.assertRaisesRegex(BusinessError,'download_stale'):
-            run.note_download(str(path))
+            run.note_download(str(path),run.download_since_ns)
 
     def test_production_worker_rejects_file_changed_after_host_preparation(self):
         from AutoCua.saccade.business_worker import execute
         f=self.fixture;since=time.time_ns()
         path=f.root/'Target.pdf';path.write_bytes(b'%PDF-1.4 original %%EOF')
         run=BusinessRun(f.context,project_root=f.root,automatic=True,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path)
         run.refresh()
         action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
         ticket=run.prepare(action)
@@ -197,6 +270,24 @@ class AutoLite(unittest.TestCase):
             return execute(request)
         run.set_google_runtime('google','gemini-4-argon','synthetic-not-a-key')
         with patch.dict('os.environ',{'GOOGLE_API_KEY':'synthetic-not-a-key'}),patch('AutoCua.saccade.business_process.run_worker',side_effect=worker):
+            self.assertEqual(run.execute(ticket)['code'],'download_file_changed')
+
+    def test_worker_checks_the_bytes_actually_passed_to_the_provider(self):
+        from AutoCua.saccade.business_worker import execute
+        f=self.fixture; since=time.time_ns()
+        path=f.root/'Current.pdf'; path.write_bytes(b'%PDF-1.4 requested %%EOF')
+        run=BusinessRun(f.context,project_root=f.root,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path); run.refresh()
+        action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
+        ticket=run.prepare(action)
+        original=AccountingContext.scribe
+        def replace_after_worker_checks(context,*args):
+            path.write_bytes(b'%PDF-1.4 replaced immediately before provider %%EOF')
+            return original(context,*args)
+        def worker(request,**options):
+            with patch.object(AccountingContext,'scribe',replace_after_worker_checks):
+                return execute(request)
+        with patch('AutoCua.saccade.business_process.run_worker',side_effect=worker),patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-key'})):
             self.assertEqual(run.execute(ticket)['code'],'download_file_changed')
 
     def test_real_windows_child_reads_pdf_and_validates_a_stubbed_sdk_proposal(self):
@@ -244,6 +335,7 @@ class Client:
         (shared/'google/view.py').write_text("MODEL_MAPPINGS={'gemini-4-argon':{'api_name':'gemini-4-argon'}}",encoding='utf8')
         (shared/'llm_manager.py').write_text("from types import SimpleNamespace\nfrom google.genai import Client\ndef build_provider(*args,**kwargs): return SimpleNamespace(client=Client(api_key=kwargs['api_key']))\n",encoding='utf8')
         run=BusinessRun(f.context,project_root=f.root,package_root=f.package,automatic=True,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path)
         run.refresh()
         action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
         ticket=run.prepare(action)
@@ -256,6 +348,7 @@ class Client:
         # trusted Python runtime, never the frozen application binary or PATH.
         import sys
         frozen=BusinessRun(f.context,project_root=f.root,package_root=f.package,automatic=True,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(frozen,path)
         frozen.refresh();ticket=frozen.prepare(action)
         with patch('AutoCua.IS_COMPILED',True),patch.dict('os.environ',{'SACCADE_WORKER_PYTHON':sys.executable}),patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-not-a-key'})):
             result=frozen.execute(ticket)
@@ -276,6 +369,7 @@ class Client:
         path=f.root/'Invoice.pdf'; content=b'%PDF-1.4 Actual fixture bytes %%EOF'
         path.write_bytes(content)
         run=BusinessRun(f.context,project_root=f.root,automatic=True,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path)
         run.refresh()
         action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
         ticket=run.prepare(action)

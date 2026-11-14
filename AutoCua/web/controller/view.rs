@@ -45,6 +45,7 @@ pub struct ControllerView {
     automatic_business: Mutex<bool>,
     active_business_platform: Mutex<Option<String>>,
     google_runtime: Mutex<Option<(String,String,Option<String>)>>,
+    download_operation: Mutex<Option<(String,u64)>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -85,6 +86,7 @@ impl ControllerView {
             automatic_business: Mutex::new(true),
             active_business_platform: Mutex::new(None),
             google_runtime: Mutex::new(None),
+            download_operation: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -154,6 +156,7 @@ impl ControllerView {
     fn call_business(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
         let automatic = *self.automatic_business.lock().unwrap();
         if automatic {
+            self.check_download(py, &mut json!({}))?;
             // Reobserve before dispatch; never refresh a stale model selection
             // into new authority or attach a single-site browser scope.
             let observed = super::service::scan_op(py, &self.scanner, |scanner| {
@@ -231,15 +234,29 @@ impl ControllerView {
         }
     }
 
-    fn check_after_settle(&self, py: Python<'_>, result: &mut Value) -> PyResult<()> {
-        let started = result.as_object_mut().and_then(|value|value.remove("download_started_ns"));
-        if let Some(started) = started.and_then(|value|value.as_u64()) {
-            if *self.automatic_business.lock().unwrap() {
-                if let Some(gate) = self.business.lock().unwrap().as_ref() {
-                    gate.begin_download(py,started)?;
-                }
+    fn check_download(&self, py: Python<'_>, result: &mut Value) -> PyResult<()> {
+        let operation = self.download_operation.lock().unwrap().clone();
+        let Some((tab,started)) = operation else { return Ok(()) };
+        let observed = super::service::scan_op(py, &self.scanner, |scanner| {
+            if scanner.current_target_id().ok().as_deref() != Some(tab.as_str()) {
+                return Err(crate::browser::ScanErr::s("Download observation tab changed"));
             }
+            scanner.bridge_call(json!({"type":"download_status","download_operation":started.to_string()}))
+        });
+        let observation = match observed {
+            Ok(reply) if reply["download"]["state"].is_string() => reply["download"].clone(),
+            _ => json!({"state":"observation_unavailable","operation":started.to_string()}),
+        };
+        // Native operation identity is never accepted from model arguments.
+        if observation["operation"] != started.to_string() {
+            if let Some(gate) = self.business.lock().unwrap().as_ref() { gate.invalidate_download(py,started)?; }
+            result["download"] = json!({"state":"observation_unavailable"});
+            return Ok(());
         }
+        result["download"] = observation;
+        let automatic = *self.automatic_business.lock().unwrap();
+        let business = self.business.lock().unwrap();
+        let gate = if automatic { business.as_ref() } else { None };
         // Consume Chrome's path privately, before the tool result reaches the
         // model. This is a folder hint from the actual completed download, not
         // a new downloader or model-selected filesystem authority.
@@ -247,14 +264,28 @@ impl ControllerView {
             let path = result["download"]["absolute_path"].as_str().map(str::to_owned);
             if let Some(download) = result["download"].as_object_mut() { download.remove("absolute_path"); }
             let pdf = result["download"]["filename"].as_str().is_some_and(|name|name.to_lowercase().ends_with(".pdf"));
-            if pdf && *self.automatic_business.lock().unwrap() {
-                if let (Some(path),Some(gate)) = (path,self.business.lock().unwrap().as_ref()) {
-                    if gate.note_download(py,&path).is_err() {
+            if let Some(gate) = gate {
+                if let Some(path) = path.filter(|_|pdf) {
+                    if gate.note_download(py,&path,started).is_err() {
+                        gate.invalidate_download(py,started)?;
                         result["download"] = json!({"state":"file_verification_failed"});
                     }
+                } else {
+                    gate.invalidate_download(py,started)?;
                 }
             }
+        } else if !matches!(result["download"]["state"].as_str(),Some("not_observed"|"in_progress")) {
+            if let Some(gate) = gate { gate.invalidate_download(py,started)?; }
         }
+        if let Some(download) = result["download"].as_object_mut() {
+            download.remove("operation");
+            download.remove("absolute_path");
+        }
+        Ok(())
+    }
+
+    fn check_after_settle(&self, py: Python<'_>, result: &mut Value) -> PyResult<()> {
+        self.check_download(py,result)?;
         if let Some(mut failure) = self.platform_check(py, None)? {
             failure["tool"] = result.get("tool").cloned().unwrap_or(Value::Null);
             *result = failure;
@@ -492,7 +523,17 @@ impl ControllerView {
             let message = format!("{WEB_STORE_BLOCKED}. Leave it with navigate_tab back, update_tab or new_tab");
             return Ok((json!({"status": "error", "tool": kind, "message": message}), false));
         }
-        let mut result = self.one_inner(py, action)?;
+        let operation = if matches!(kind.as_str(),"click"|"hold_click") && *self.automatic_business.lock().unwrap() {
+            let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos() as u64;
+            let tab = self.scanner.lock().unwrap().current_target_id().ok();
+            if let Some(tab) = tab {
+                *self.download_operation.lock().unwrap() = Some((tab,started));
+                if let Some(gate) = self.business.lock().unwrap().as_ref() { gate.begin_download(py,started)?; }
+                Some(started)
+            } else { None }
+        } else { None };
+        let mut result = self.one_inner(py, action, operation)?;
         // Where the tabs are now, in case the browser goes away before the
         // next scan (ScannerInner::revive reopens them).
         super::service::scan_op(py, &self.scanner, |s| {
@@ -566,7 +607,7 @@ impl ControllerView {
         Ok((result, opened))
     }
 
-    fn one_inner(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
+    fn one_inner(&self, py: Python<'_>, action: &Value, operation: Option<u64>) -> PyResult<Value> {
         let kind = action
             .get("type")
             .filter(|v| truthy(v))
@@ -595,9 +636,9 @@ impl ControllerView {
             "close_tab" => tab::service::close(py, sc, &get("id")),
             "update_tab" => tab::service::update(py, sc, &get("value")),
             "navigate_tab" => tab::service::navigate(py, sc, &get("value")),
-            "click" => click::service::click(py, sc, &get("id"), &get("times"), &elements),
+            "click" => click::service::click(py, sc, &get("id"), &get("times"), &elements, operation),
             "hold_click" => {
-                click::service::hold_click(py, sc, &get("id"), &get("time"), &elements)
+                click::service::hold_click(py, sc, &get("id"), &get("time"), &elements, operation)
             }
             "input" => input::service::type_into(
                 py, sc, &get("id"), &get("value"), &get("enter"), &elements,
@@ -865,10 +906,12 @@ class Run:
         assert provider == 'google' and model == 'gemini-3.8-flash' and key == 'synthetic-runtime-key'
     def begin_download(self, started):
         self.started = started
-    def note_download(self, path):
+    def invalidate_download(self, started):
+        assert started == self.started
+    def note_download(self, path, started):
         from pathlib import Path
         from AutoCua.saccade.downloaded_pdf import resolve_download
-        assert self.started > 0
+        assert self.started == started and started > 0
         absolute, content = resolve_download(path, folder=Path(path).parent)
         assert Path(absolute).is_absolute() and content.startswith(b'%PDF-')
         downloads.append(absolute)
@@ -903,16 +946,30 @@ downloads = []
                 handshake.headers_mut().insert("origin",origin.parse().unwrap());
                 let (mut socket,_) = tungstenite::client(handshake,stream).unwrap();
                 let mut received = Vec::new();
+                let mut download = None;
+                let mut observations = 0;
                 loop {
                     let message = socket.read().unwrap();
                     let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
                     let kind = request["type"].as_str().unwrap();
                     let result = match kind {
                         "tabs" => json!([{"id":1,"url":"https://app.dext.com/receipts","title":"Synthetic invoice","type":"page"}]),
-                        "click" if request["observe_download"] == true => {
-                            std::fs::write(&peer_path,b"%PDF-1.4\nSynthetic invoice\n%%EOF").unwrap();
-                            json!({"download":{"state":"complete","filename":"Synthetic invoice (1).pdf","absolute_path":peer_path}})
+                        "click" => {
+                            download = (request["rect"][1] == 60.0).then(||request["download_operation"].clone());
+                            observations = 0;
+                            json!({"download":{"state":"not_observed","operation":request["download_operation"]}})
                         },
+                        "download_status" if download.as_ref() == Some(&request["download_operation"]) => {
+                            observations += 1;
+                            if observations < 2 {
+                                json!({"download":{"state":"in_progress","operation":request["download_operation"]}})
+                            } else {
+                                std::fs::write(&peer_path,b"%PDF-1.4\nSynthetic invoice\n%%EOF").unwrap();
+                                json!({"download":{"state":"complete","filename":"Synthetic invoice (1).pdf","absolute_path":peer_path,
+                                    "operation":request["download_operation"]}})
+                            }
+                        },
+                        "download_status" => json!({"download":{"state":"not_observed","operation":request["download_operation"]}}),
                         "scroll_probe" => json!({"probe":[0,0,0,received.len()]}),
                         "run_script" => json!({"result":{"value":"Synthetic page result"}}),
                         _ => json!({}),
@@ -938,10 +995,11 @@ downloads = []
                 "1":{"name":"Page","rect":[0,0,800,600]},
                 "2":{"name":"Purchases","rect":[1,1,50,20],"line":"<button>Purchases</button>"},
                 "3":{"name":"Search","rect":[1,30,50,20],"line":"<input>"},
-                "4":{"name":"Download","rect":[1,60,50,20],"line":"<button>Download</button>"}
+                "4":{"name":"Exporter","rect":[1,60,50,20],"line":"<button>Exporter</button>"}
             }).as_object().unwrap().clone(),"");
             for action in [
                 json!({"type":"click","id":2}),
+                json!({"type":"click","id":2,"times":2}),
                 json!({"type":"input","id":3,"value":"Synthetic query","enter":false}),
                 json!({"type":"keyboard","value":"CTRL+A"}),
                 json!({"type":"scroll","id":1,"direction":"down"}),
@@ -959,6 +1017,13 @@ downloads = []
                     assert_eq!(result["download"]["state"],"complete");
                 }
             }
+            let original_operation = view.download_operation.lock().unwrap().clone().unwrap();
+            *view.download_operation.lock().unwrap() = Some(("2".into(),original_operation.1));
+            let mut changed_tab = json!({});
+            view.check_download(py,&mut changed_tab).unwrap();
+            assert_eq!(changed_tab["download"]["state"],"observation_unavailable");
+            assert!(!changed_tab.to_string().contains("absolute_path"));
+            *view.download_operation.lock().unwrap() = Some(original_operation);
             // Existing generic geometry and destination checks still apply.
             for action in [json!({"type":"click","id":999}),
                            json!({"type":"update_tab","value":"https://chromewebstore.google.com/"})] {
@@ -976,7 +1041,7 @@ downloads = []
                 assert!(result.is_ok(),"{kind} was blocked before native dispatch");
             }
             assert!(download_path.is_file());
-            py.run(&CString::new("assert len(downloads) == 1").unwrap(),Some(&locals),None).unwrap();
+            py.run(&CString::new("assert downloads and len(set(downloads)) == 1").unwrap(),Some(&locals),None).unwrap();
             scanner.lock().unwrap().url = "https://app.dext.com.evil.example/".into();
             let denied = view.call_business(py,&json!({"type":"call_function","version":1,"name":"dext.bank","arguments":{}})).unwrap();
             assert_eq!(denied["status"],"error");
@@ -994,9 +1059,10 @@ downloads = []
                 assert!(received.iter().any(|request|request["type"] == kind),"missing native dispatch: {kind}");
             }
             let clicks: Vec<_> = received.iter().filter(|request|request["type"] == "click").collect();
-            assert_eq!(clicks.len(),2);
-            assert_eq!(clicks[0]["observe_download"],false);
-            assert_eq!(clicks[1]["observe_download"],true);
+            assert_eq!(clicks.len(),3);
+            assert!(clicks.iter().all(|request| request["download_operation"].is_string() && request.get("observe_download").is_none()));
+            assert_eq!(clicks[1]["times"],2);
+            assert!(clicks.windows(2).all(|pair|pair[0]["download_operation"] != pair[1]["download_operation"]));
             for request in received.iter().filter(|request|matches!(request["type"].as_str(),
                 Some("click"|"input"|"keyboard"|"scroll"|"navigate"|"history"|"reload"|"run_script"|"dialog"))) {
                 assert_eq!(request["tabId"],1,"{request}");

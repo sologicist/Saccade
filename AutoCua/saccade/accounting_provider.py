@@ -22,7 +22,7 @@ def settings(model=None, api_key=None):
     """Resolve the existing AutoCua Google selection and credential loader."""
     try:
         from AutoCua.llm_provider.llm_manager import _key
-        from AutoCua.llm_provider.google.view import MODEL_MAPPINGS
+        from AutoCua.llm_provider.google.view import MODEL_MAPPINGS, DEFAULT_MODEL
     except ImportError:
         reject('accounting_provider_dependency_missing')
     if model is None:
@@ -35,7 +35,7 @@ def settings(model=None, api_key=None):
         if isinstance(saved, dict) and saved.get('provider') == 'google' and saved.get('model') in MODEL_MAPPINGS:
             model = saved['model']
         else:
-            model = next(iter(MODEL_MAPPINGS))
+            model = DEFAULT_MODEL
     if model not in MODEL_MAPPINGS:
         reject('accounting_model_unavailable')
     key = _key(api_key, 'GOOGLE_API_KEY')

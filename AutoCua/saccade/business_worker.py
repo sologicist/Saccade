@@ -26,6 +26,14 @@ def execute(request):
         run = BusinessRun(request["context"], project_root=Path(request["project_root"]), offline_receipts=request["offline_receipts"], automatic=automatic,
             downloads_dir=Path(request["downloads_dir"]) if automatic else None,
             download_since_ns=request.get("download_since_ns"))
+        if automatic and ticket['name'] == 'dext.scribe':
+            fingerprint = request['document_sha256']
+            if type(fingerprint) is not str or len(fingerprint) != 64 or any(c not in '0123456789abcdef' for c in fingerprint):
+                reject('chrome_confirmed_download_required')
+            run.begin_download(request['download_since_ns'])
+            # Restore only the trusted host envelope's exact association. prepare
+            # rereads the file and must match this hash, not a newly trusted hash.
+            run._current_download = (ticket['arguments']['pdf'], fingerprint)
         run.refresh()
         checked = run.prepare(ticket["action"])
         for key in ("platform_id", "context_revision", "revision", "effect", "capabilities", "arguments", "name"):
@@ -41,7 +49,8 @@ def execute(request):
             if digest(content) != request['document_sha256']:
                 reject('download_file_changed')
         from AutoCua.saccade.business_functions.platforms.dext.runtime import AccountingContext, _CURRENT
-        context = AccountingContext(run.data_root, clients, model=request["model"], offline_receipts=run.offline_receipts, automatic=automatic, downloads_dir=run.downloads_dir)
+        context = AccountingContext(run.data_root, clients, model=request["model"], offline_receipts=run.offline_receipts, automatic=automatic, downloads_dir=run.downloads_dir,
+            expected_pdf=(checked['arguments']['pdf'],request['document_sha256']) if automatic and ticket['name'] == 'dext.scribe' else None)
         token = _CURRENT.set(context)
         try:
             # This literal installed module is the only import target. Policy and

@@ -30,10 +30,11 @@ class SyntheticAccountingProvider:
 
 
 class AccountingContext:
-    def __init__(self, root, clients, *, provider=None, model="offline-synthetic-v1", offline_receipts=None, automatic=False, downloads_dir=None):
+    def __init__(self, root, clients, *, provider=None, model="offline-synthetic-v1", offline_receipts=None, automatic=False, downloads_dir=None, expected_pdf=None):
         if not automatic and model != "offline-synthetic-v1":
             reject("unsupported_offline_model")
         self.automatic, self.downloads_dir = automatic, downloads_dir
+        self.expected_pdf = expected_pdf
         if automatic:
             from ....accounting_provider import GeminiAccountingProvider
             provider = provider or GeminiAccountingProvider(model)
@@ -90,7 +91,9 @@ class AccountingContext:
         if self.automatic:
             from ....downloaded_pdf import resolve_download
             from .invoice_validation import analysis
-            _, pdf = resolve_download(fixture_id,folder=self.downloads_dir)
+            absolute, pdf = resolve_download(fixture_id,folder=self.downloads_dir)
+            if self.expected_pdf is not None and self.expected_pdf != (absolute,digest(pdf)):
+                reject('download_file_changed')
             markdown = self.reference(client_id, "comptable_achats.md" if sens == "achat" else "comptable_ventes.md")
             raw = self.provider.scribe(pdf,markdown,'',{'client_id':client_id,'sens':sens})
             return analysis(raw,sens,has_description_rule=True)

@@ -26,6 +26,7 @@ class BusinessRun:
         self._google_model = None
         self._google_key = None
         self._current_download = None
+        self._download_operation = None
         self.package_root = package_root
         self.project_root = Path(project_root) if project_root else package_root.parent
         self.data_root = self.project_root / "platforms/dext/data"
@@ -59,25 +60,48 @@ class BusinessRun:
         current["revision"] = digest([current["revision"], registration, self.context, self.offline_receipts, self.automatic])
         return current, clients
 
-    def note_download(self, absolute_path):
+    def note_download(self, absolute_path, started_ns):
         """Host-only Chrome result, never a model-selected folder setting."""
-        # A failed new file check must not leave an earlier PDF selectable.
-        if self.automatic:
+        with self._lock:
+            if not self.automatic or type(started_ns) is not int or not self._download_operation or started_ns != self._download_operation:
+                reject('download_operation_changed')
+            # A failed new file check must not leave an earlier PDF selectable.
             self._current_download = (None, None)
-        from .downloaded_pdf import resolve_download
-        path = Path(absolute_path)
-        if not self.automatic or not path.is_absolute():
-            reject('invalid_download_path')
-        absolute, content = resolve_download(str(path),folder=path.parent,since_ns=self.download_since_ns)
-        self.downloads_dir = path.parent
-        self._current_download = (absolute, digest(content))
+            self._pending.clear()
+            self._documents.clear()
+            from .downloaded_pdf import resolve_download
+            try:
+                path = Path(absolute_path)
+                if not path.is_absolute():
+                    reject('invalid_download_path')
+                absolute, content = resolve_download(str(path),folder=path.parent,since_ns=self.download_since_ns)
+            except BusinessError:
+                self._download_operation = None
+                raise
+            self.downloads_dir = path.parent
+            self._current_download = (absolute, digest(content))
 
     def begin_download(self, started_ns):
         """Host click timestamp replaces the earlier file-selection window."""
         if not self.automatic or type(started_ns) is not int or started_ns <= 0:
             reject('invalid_download_observation')
-        self.download_since_ns = started_ns
-        self._current_download = None
+        with self._lock:
+            if started_ns == self._download_operation:
+                return
+            self.download_since_ns = started_ns
+            self._download_operation = started_ns
+            self._current_download = None
+            self._pending.clear()
+            self._documents.clear()
+
+    def invalidate_download(self, started_ns):
+        """A failed observation cannot leave an earlier PDF or ticket usable."""
+        with self._lock:
+            if started_ns == self._download_operation:
+                self._current_download = None
+                self._download_operation = None
+                self._pending.clear()
+                self._documents.clear()
 
     def refresh(self):
         """Called before every model decision, never after its chosen revision."""
@@ -86,7 +110,7 @@ class BusinessRun:
             self._decision, clients = self.snapshot()
             self._pending.clear()
             self._documents.clear()
-            definition = model_tool(self._decision)
+            definition = model_tool(self._decision, offline=not self.automatic)
             if self.automatic:
                 definition["description"] += " Active operator-registered client: " + (next(iter(clients), "unconfigured")) + ". Only analyze the document explicitly requested by the user. Scribe uses the configured AutoCua Gemini provider and sends that PDF and its client reference for the requested analysis."
             return definition
@@ -120,9 +144,11 @@ class BusinessRun:
                 reject("operator_argument_required")
             document_hash = None
             if self.automatic and action["name"] == "dext.scribe":
+                if not self._download_operation or not self._current_download or not all(self._current_download):
+                    reject('chrome_confirmed_download_required')
                 from .downloaded_pdf import resolve_download
                 absolute, content = resolve_download(arguments["pdf"],folder=self.downloads_dir,since_ns=self.download_since_ns)
-                if self._current_download and self._current_download != (absolute,digest(content)):
+                if self._current_download != (absolute,digest(content)):
                     reject('download_file_changed')
                 arguments["pdf"] = absolute
                 document_hash = digest(content)
@@ -193,6 +219,7 @@ WORKER_ERRORS = {"accounting_model_required", "accounting_model_unavailable", "a
                  "accounting_provider_incomplete", "accounting_provider_invalid_response", "accounting_provider_failed",
                  "invalid_download_path", "invalid_download_filename", "download_outside_folder",
                  "invalid_download_pdf", "download_incomplete", "download_file_missing", "download_stale", "download_file_changed","business_revision_changed", "required_file_unavailable", "unsafe_path", "size_limit",
+                 "chrome_confirmed_download_required", "download_operation_changed",
                  "invalid_bank_reference", "conflicting_bank_account", "invalid_provider_response",
                  "verified_download_receipt_required", "offline_fixture_identity_mismatch",
                  "invoice_critical_mismatch", "invoice_total_mismatch", "invoice_entries_mismatch",

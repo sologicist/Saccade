@@ -49,6 +49,8 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/automatic_platform.py",
             "AutoCua/saccade/downloaded_pdf.py",
             "AutoCua/saccade/accounting_provider.py",
+            "AutoCua/llm_provider/google/view.py",
+            "AutoCua/web/browser/AutoCuaBridge/tools.js",
             "AutoCua/saccade/business_functions/__init__.py",
             "AutoCua/saccade/business_functions/platforms/__init__.py",
             "AutoCua/saccade/business_functions/platforms/dext/__init__.py",

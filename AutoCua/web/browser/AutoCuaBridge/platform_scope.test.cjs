@@ -246,8 +246,10 @@ function automaticToolsFixture() {
       async create(options) { created.push(options); return { id: 2 }; },
       async remove(id) { removed.push(id); },
     },
+    downloads: { onCreated: event(), onChanged: event(), async search() { return []; } },
+    webRequest: { onBeforeRequest: event(), onBeforeRedirect: event(), onHeadersReceived: event() },
   };
-  const context = vm.createContext({ chrome, setTimeout, clearTimeout });
+  const context = vm.createContext({ chrome, setTimeout, clearTimeout, URL });
   const toolsSource = fs.readFileSync(path.join(__dirname, "tools.js"), "utf8");
   vm.runInContext(toolsSource + `
 globalThis.actualTools = {
@@ -273,19 +275,43 @@ test("scoped beforeunload dialogs remain unanswered and require operator review"
   assert.deepEqual(f.commands, []);
 });
 
-test('normal native clicks report only new completed Chrome filenames without changing download policy',async()=>{
-  const f=automaticToolsFixture();
-  const page='https://app.dext.com/invoice';
-  f.chrome.tabs.get=async()=>({id:1,url:page});
+function downloadFixture() {
+  const f=automaticToolsFixture(),line={},items=new Map(),queries=[];
+  const page='https://app.dext.com/invoice',url='https://files.example.test/synthetic.pdf';
+  f.tools.own(1,line);
+  f.chrome.tabs.get=async id=>({id,url:page});
   f.chrome.debugger.attach=async()=>{};
-  f.chrome.downloads={search:async()=>[{startTime:new Date(Date.now()+100).toISOString(),referrer:page,
-    state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\Facture été (1).pdf'}]};
-  const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],times:1,observe_download:true},{});
-  assert.equal(result.clicked,true);
-  assert.equal(result.download.filename,'Facture été (1).pdf');
-  assert.equal(result.download.state,'complete');
-  assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,3);
-  assert.ok(f.commands.every(c=>!c[1].includes('DownloadBehavior')));
+  f.chrome.downloads.search=async query=>{queries.push(query);return items.has(query.id)?[items.get(query.id)]:[];};
+  f.item=(changes={})=>({id:1,startTime:new Date().toISOString(),url,finalUrl:url,referrer:page,
+    state:'complete',exists:true,fileSize:100,filename:'C:\\Custom Downloads\\Facture été (1).pdf',...changes});
+  f.request=async(changes={})=>f.chrome.webRequest.onBeforeRequest.emit({tabId:1,requestId:'request-one',
+    timeStamp:Date.now(),url,...changes});
+  f.created=async row=>{items.set(row.id,row);await f.chrome.downloads.onCreated.emit(row);};
+  f.press=null;
+  f.chrome.debugger.sendCommand=async(...args)=>{
+    f.commands.push(plain(args));
+    if(args[1]==='Input.dispatchMouseEvent' && args[2].type==='mouseReleased' && f.press) await f.press();
+    return {};
+  };
+  f.click=(operation='100',changes={})=>f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],
+    times:1,download_operation:operation,...changes},line);
+  f.status=(operation='100',tabId=1)=>f.tools.handle({type:'download_status',tabId,download_operation:operation},line);
+  return Object.assign(f,{line,items,queries,url,page});
+}
+
+test('native downloads are observed for Download, icon-only, PDF, Exporter and unlabeled links',async()=>{
+  for(const label of ['Download','','PDF','Exporter','Document menu','Invoice link']) {
+    const f=downloadFixture();
+    f.press=async()=>{await f.request();await f.created(f.item());};
+    const result=await f.click('100',{label}); // The observer never examines this label.
+    assert.equal(result.clicked,true);
+    assert.equal(result.download.filename,'Facture été (1).pdf');
+    assert.equal(result.download.absolute_path,'C:\\Custom Downloads\\Facture été (1).pdf');
+    assert.equal(result.download.state,'complete');
+    assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,3);
+    assert.ok(f.commands.every(c=>!c[1].includes('DownloadBehavior')));
+    assert.ok(f.queries.every(query=>Object.keys(query).join()==='id'));
+  }
 });
 
 test('automatic scans follow an active owned tab without taking human, competing or scoped tabs',async()=>{
@@ -303,33 +329,129 @@ test('automatic scans follow an active owned tab without taking human, competing
   assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:true},line)).id,1);
 });
 
-test('native download observations reject canceled, concurrent and foreign-source files',async()=>{
-  for(const scenario of ['interrupted','concurrent','foreign']) {
-    const f=automaticToolsFixture(),page='https://app.dext.com/invoice';
-    f.chrome.tabs.get=async()=>({id:1,url:page}); f.chrome.debugger.attach=async()=>{};
-    const row={startTime:new Date(Date.now()+100).toISOString(),referrer:page,state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\invoice.pdf'};
-    if(scenario==='interrupted') row.state='interrupted';
-    if(scenario==='foreign') row.referrer='https://other.example/';
-    f.chrome.downloads={search:async()=>scenario==='concurrent'?[row,{...row}]:[row]};
-    const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],observe_download:true},{});
-    assert.equal(result.download.state,scenario==='concurrent'?'ambiguous':scenario==='foreign'?'source_unverified':'interrupted');
+test('unrelated sources, cross-tab duplicates, ambiguous and interrupted downloads fail closed',async()=>{
+  for(const scenario of ['interrupted','concurrent','foreign','duplicate-request','unobserved','missing-file']) {
+    const f=downloadFixture();
+    f.press=async()=>{
+      if(scenario!=='unobserved') await f.request({tabId:scenario==='foreign'?2:1});
+      if(scenario==='duplicate-request') await f.request({tabId:2,requestId:'other-tab'});
+      await f.created(f.item({state:scenario==='interrupted'?'interrupted':'complete',exists:scenario!=='missing-file'}));
+      if(scenario==='concurrent') await f.created(f.item({id:2}));
+    };
+    const result=await f.click();
+    const expected={concurrent:'ambiguous','missing-file':'file_unavailable',interrupted:'interrupted'}[scenario]||'source_unverified';
+    assert.equal(result.download.state,expected,scenario);
     assert.equal(result.download.filename,undefined);
   }
 });
 
-test('an old filename or absent download evidence cannot turn a native click or Save dialog into download success',async()=>{
-  for(const scenario of ['old','no-api']) {
-    const f=automaticToolsFixture(),page='https://app.dext.com/invoice';
-    f.chrome.tabs.get=async()=>({id:1,url:page}); f.chrome.debugger.attach=async()=>{};
-    let clock=Date.now();
-    f.context.Date=class extends Date {static now(){clock+=5000;return clock;}};
-    if(scenario==='old') f.chrome.downloads={search:async()=>[{startTime:'2000-01-01T00:00:00Z',referrer:page,state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\old.pdf'}]};
-    const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],observe_download:true},{});
+test('redirects use one observed tab/request chain without trusting referrer equality',async()=>{
+  const f=downloadFixture(),initial='https://app.dext.com/synthetic-export',final=f.url;
+  f.press=async()=>{
+    await f.request({url:initial});
+    await f.chrome.webRequest.onBeforeRedirect.emit({tabId:1,requestId:'request-one',url:initial,redirectUrl:final});
+    await f.request({url:final});
+    await f.created(f.item({url:initial,finalUrl:final,referrer:'https://redirect.example.test/'}));
+  };
+  assert.equal((await f.click()).download.state,'complete');
+});
+
+test('regular clicks have a short bounded grace and never poll download history',async()=>{
+  const f=downloadFixture(),started=performance.now();
+  const result=await f.click();
+  assert.equal(result.clicked,true);
+  assert.equal(result.download.state,'not_observed');
+  assert.match(result.download.message,/wait for status; do not repeat/i);
+  assert.ok(performance.now()-started<1000,'ordinary clicks must not incur an eight-second delay');
+  assert.deepEqual(f.queries,[]);
+});
+
+test('late creation and incomplete downloads complete on status without another click',async()=>{
+  const f=downloadFixture();
+  assert.equal((await f.click()).download.state,'not_observed');
+  await f.request();await f.created(f.item({state:'in_progress'}));
+  assert.equal((await f.status()).download.state,'in_progress');
+  f.items.set(1,{...f.items.get(1),state:'complete'});
+  await f.chrome.downloads.onChanged.emit({id:1,state:{current:'complete'}});
+  assert.equal((await f.status()).download.state,'complete');
+  assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,3);
+});
+
+test('old files, missing observation APIs and system Save dialogs never establish success',async()=>{
+  for(const scenario of ['old','no-api','save-dialog']) {
+    const f=downloadFixture();
+    if(scenario==='no-api') delete f.chrome.downloads.search;
+    if(scenario==='old') f.press=async()=>{await f.request();await f.created(f.item({startTime:'2000-01-01T00:00:00Z'}));};
+    const result=await f.click();
     assert.equal(result.clicked,true);
-    assert.equal(result.download.state,'unconfirmed');
+    assert.equal(result.download.state,scenario==='no-api'?'observation_unavailable':'not_observed');
     assert.equal(result.download.filename,undefined);
     assert.ok(!f.commands.some(c=>c[1]==='Input.dispatchKeyEvent'));
   }
+});
+
+test('new clicks, changed tabs and debugger detachment cannot reuse an earlier observation',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{await f.request();await f.created(f.item());};
+  assert.equal((await f.click()).download.state,'complete');
+  assert.equal((await f.status('100',2)).download.state,'observation_unavailable');
+  f.press=null;
+  assert.equal((await f.click('101')).download.state,'not_observed');
+  assert.equal((await f.status('100')).download.state,'observation_unavailable');
+  await f.chrome.debugger.onDetach.emit({tabId:1},'canceled_by_user');
+  assert.equal((await f.status('101')).download.state,'observation_unavailable');
+});
+
+test('completion arriving with a second candidate is rechecked after asynchronous lookup',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{await f.request();await f.created(f.item());};
+  f.chrome.downloads.search=async()=>{await f.created(f.item({id:2}));return [f.items.get(1)];};
+  assert.equal((await f.click()).download.state,'ambiguous');
+});
+
+test('failed completion stays failed and timed-out or overflowed observations are explicit',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{await f.request();await f.created(f.item({state:'in_progress'}));};
+  assert.equal((await f.click()).download.state,'in_progress');
+  await f.chrome.downloads.onChanged.emit({id:1,state:{current:'interrupted'}});
+  f.items.set(1,{...f.items.get(1),state:'complete'});
+  assert.equal((await f.status()).download.state,'interrupted');
+  const timeout=downloadFixture();
+  timeout.press=async()=>{await timeout.request();await timeout.created(timeout.item({state:'in_progress'}));};
+  await timeout.click();timeout.line.downloadObservation.expires=Date.now()-1;
+  assert.equal((await timeout.status()).download.state,'incomplete');
+  const overflow=downloadFixture();
+  overflow.press=async()=>{for(let i=0;i<129;i++) await overflow.request({requestId:String(i)});};
+  assert.equal((await overflow.click()).download.state,'observation_overflow');
+});
+
+test('a matching response from an older or another-tab request cannot prove the clicked download',async()=>{
+  for(const tabId of [1,2]) {
+    const f=downloadFixture();
+    f.press=async()=>{
+      if(tabId===2) await f.request();
+      await f.chrome.webRequest.onHeadersReceived.emit({tabId,requestId:'preexisting',url:f.url,timeStamp:Date.now()});
+      await f.created(f.item());
+    };
+    assert.equal((await f.click()).download.state,'source_unverified');
+  }
+});
+
+test('a double click keeps normal trusted input and only one observed file',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{if(!f.items.size){await f.request();await f.created(f.item());}};
+  assert.equal((await f.click('100',{times:2})).download.state,'complete');
+  assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,5);
+});
+
+test('download metadata lookups have a bounded timeout without another browser gesture',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{await f.request();await f.created(f.item());};
+  f.chrome.downloads.search=()=>new Promise(()=>{});
+  const started=performance.now();
+  assert.equal((await f.click()).download.state,'observation_unavailable');
+  assert.ok(performance.now()-started<1500);
+  assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,3);
 });
 
 test("profile-wide scoped review also holds a dialog on an initial unowned tab", async () => {
