@@ -42,6 +42,7 @@ class AccountingContext:
         self.provider = provider or SyntheticAccountingProvider(clients)
         self.offline_receipts = offline_receipts or {}
         self.references = {}
+        self.scribe_raw_response = None
 
     def reference(self, client_id, name, *, optional=False):
         if name not in ('comptable_achats.md','comptable_ventes.md','comptable_banque.md'):
@@ -90,13 +91,35 @@ class AccountingContext:
             reject("invalid_invoice_direction")
         if self.automatic:
             from ....downloaded_pdf import resolve_download
-            from .invoice_validation import analysis
-            absolute, pdf = resolve_download(fixture_id,folder=self.downloads_dir)
-            if self.expected_pdf is not None and self.expected_pdf != (absolute,digest(pdf)):
-                reject('download_file_changed')
-            markdown = self.reference(client_id, "comptable_achats.md" if sens == "achat" else "comptable_ventes.md")
-            raw = self.provider.scribe(pdf,markdown,'',{'client_id':client_id,'sens':sens})
-            return analysis(raw,sens,has_description_rule=True)
+
+            absolute, pdf = resolve_download(
+                fixture_id,
+                folder=self.downloads_dir
+            )
+
+            if self.expected_pdf is not None and self.expected_pdf != (
+                absolute, digest(pdf)
+            ):
+                reject("download_file_changed")
+
+            markdown = self.reference(
+                client_id,
+                "comptable_achats.md" if sens == "achat"
+                else "comptable_ventes.md"
+            )
+
+            raw = self.provider.scribe(
+                pdf,
+                markdown,
+                "",
+                {"client_id": client_id, "sens": sens}
+            )
+
+            # Retour direct de Gemini. Aucune validation comptable.
+            if type(raw) is not str:
+                reject("accounting_provider_invalid_response")
+
+            return raw
         receipt = self.offline_receipts.get(fixture_id)
         if not receipt or receipt.get("client_id") != client_id or receipt.get("sens") != sens:
             reject("verified_download_receipt_required")
@@ -112,4 +135,11 @@ class AccountingContext:
             reject("offline_fixture_identity_mismatch")
         raw = self.provider.scribe(pdf, markdown, description, receipt["expected"])
         from .invoice_validation import analysis
-        return analysis(raw, sens, has_description_rule=bool(description), expected=receipt.get("critical"))
+        return dumps(
+            analysis(
+                raw, sens,
+                has_description_rule=bool(description),
+                expected=receipt.get("critical")
+            ),
+            32768
+        )

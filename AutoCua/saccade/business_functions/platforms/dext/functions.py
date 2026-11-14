@@ -35,6 +35,13 @@ class InvoiceProposal(TypedDict):
     total_ttc: str | None
     total_tva: str | None
     devise: str | None
+    statut: NotRequired[
+        Literal["proposee", "a_revoir", "sans_ecriture"]
+    ]
+    motifs: NotRequired[list[str]]
+    validation_comptable: NotRequired[
+        Literal["non_effectuee"]
+    ]
 
 
 def bank(string: Annotated[str, {"minLength": 1, "maxLength": 1000, "pattern": r"\S"}], client_id: str) -> BankResult:
@@ -42,6 +49,10 @@ def bank(string: Annotated[str, {"minLength": 1, "maxLength": 1000, "pattern": r
     return current().bank(string, client_id)
 
 
-def scribe(pdf: str, client_id: str, sens: Literal["achat", "vente"]) -> InvoiceProposal:
-    """Analyze an actual downloaded PDF absolute path using the active client reference."""
+def scribe(
+    pdf: str,
+    client_id: str,
+    sens: Literal["achat", "vente"]
+) -> str:
+    """Return Gemini's raw accounting response without business validation."""
     return current().scribe(pdf, client_id, sens)

@@ -11,6 +11,24 @@ from .business_catalogue import PACKAGE_ROOT, catalogue, client_registration, mo
 from .business_contract import BusinessError, digest, dumps, loads, read_safe, reject, validate
 from .session_context import _validate_context
 
+SCRIBE_FORMAT_ERRORS = frozenset({
+    "invalid_provider_response",
+    "invalid_json",
+    "duplicate_json_key",
+    "nonfinite_number",
+    "json_integer_limit",
+    "schema_depth",
+    "schema_mismatch",
+    "invalid_invoice_entries",
+    "invoice_entries_mismatch",
+    "invalid_invoice_journal",
+    "invalid_invoice_value",
+    "invalid_invoice_date",
+    "invalid_invoice_currency",
+    "invalid_invoice_amount",
+    "incomplete_invoice_proposal",
+})
+
 
 class BusinessRun:
     """Only the trusted host constructs this object; no model-supplied roots."""
@@ -249,7 +267,36 @@ class BusinessRun:
             if type(reply) is not dict or set(reply) != {"version", "call_id", "run_id", "status", "result", "error", "references"} or type(reply["version"]) is not int or reply["version"] != 1 or reply["call_id"] != token or reply["run_id"] != self.run_id:
                 reject("invalid_worker_response")
             if reply["status"] != "success":
-                reject(reply["error"] if type(reply["error"]) is str and reply["error"] in WORKER_ERRORS else "worker_failed")
+                code = (
+                    reply["error"]
+                    if type(reply["error"]) is str
+                    and reply["error"] in WORKER_ERRORS
+                    else "worker_failed"
+                )
+
+                preview = reply["result"]
+
+                if (
+                    self.automatic
+                    and ticket["name"] == "dext.scribe"
+                    and code in SCRIBE_FORMAT_ERRORS
+                    and type(preview) is dict
+                    and set(preview) == {"raw_model_response", "truncated"}
+                    and type(preview["raw_model_response"]) is str
+                    and 0 < len(preview["raw_model_response"].encode("utf-8")) <= 32000
+                    and type(preview["truncated"]) is bool
+                ):
+                    return {
+                        "status": "error",
+                        "tool": "call_function",
+                        "code": code,
+                        "raw_model_response": preview["raw_model_response"],
+                        "raw_response_truncated": preview["truncated"],
+                        "response_validated": False,
+                        "operator_review_required": True,
+                    }
+
+                reject(code)
             references = reply["references"]
             if type(references) is not dict or not references or set(references) - {"comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"} or any(type(v) is not str or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in references.values()):
                 reject("invalid_worker_response")
@@ -258,7 +305,20 @@ class BusinessRun:
                                   "client_digest": digest(ticket["arguments"]["client_id"]),
                                   "references": reply["references"]})
             result = {"status": "success", "tool": "call_function", "result": reply["result"]}
-            if ticket["name"] == "dext.bank" and reply["result"]["compte"] is None or ticket["name"] == "dext.scribe" and reply["result"]["type"] != "devis" and not reply["result"]["ecriture"]:
+            if self.automatic and ticket["name"] == "dext.scribe":
+                print(
+                    "[SCRIBE CONFIRMED] "
+                    f"function={ticket['name']} "
+                    f"status={reply['status']} "
+                    f"entries={len(reply['result']['ecriture'])} "
+                    f"journal={reply['result']['journal']}",
+                    flush=True,
+                )
+            
+            if (
+                ticket["name"] == "dext.bank"
+                and reply["result"]["compte"] is None
+            ):
                 result["operator_review_required"] = True
             if self.automatic and ticket['name']=='dext.scribe' and reply['references'].get(reference_name)==reference_digest:
                 self._completed_scribe = {cache_key:loads(dumps(result))}

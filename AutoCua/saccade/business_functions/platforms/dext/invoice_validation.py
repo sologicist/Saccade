@@ -37,6 +37,28 @@ def _rows(value):
         reject("invoice_entries_mismatch")
     return value
 
+def _draft_rows(value):
+    """Preserve Gemini's accounting draft without business validation."""
+    if type(value) is not list or len(value) > 100:
+        reject("invalid_invoice_entries")
+
+    for row in value:
+        if type(row) is not dict or set(row) != {
+            "compte", "role", "debit_centimes", "credit_centimes"
+        }:
+            reject("invalid_invoice_entries")
+
+        if (
+            type(row["compte"]) is not str
+            or not row["compte"]
+            or len(row["compte"]) > 20
+            or row["role"] not in ("tiers", "base", "tva", "banque", "autre")
+            or not _amount(row["debit_centimes"])
+            or not _amount(row["credit_centimes"])
+        ):
+            reject("invalid_invoice_entries")
+
+    return value
 
 def _simple_invoice(piece, rows, sens, kind):
     """Complex, multi-rate, unknown-party or incompatible roles require review."""
@@ -103,7 +125,12 @@ def analysis(raw, sens, *, has_description_rule, expected=None):
             actual = piece.get(key) if piece is not None else None
             if actual != value and (actual is not None or not reviewing):
                 reject("invoice_critical_mismatch")
-    rows = _rows(parsed["ecriture"])
+    rows = (
+    _rows(parsed["ecriture"])
+    if expected is not None
+    else _draft_rows(parsed["ecriture"])
+    )
+    
     if expected is not None and not reviewing and (journal != expected.get("journal") or [row["compte"] for row in rows] != expected.get("accounts")):
         reject("invoice_critical_mismatch")
     result = {"date": piece["date"] if piece else None, "type": kind, "ecriture": [],

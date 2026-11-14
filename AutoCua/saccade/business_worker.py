@@ -10,7 +10,10 @@ from .business_contract import BusinessError, MAX_OUTPUT, dumps, loads, reject, 
 
 
 def execute(request):
-    from .business_run import BusinessRun, WORKER_ERRORS
+    from .business_run import (
+        BusinessRun,
+        WORKER_ERRORS,
+        SCRIBE_FORMAT_ERRORS,)
     automatic = type(request) is dict and request.get('automatic') is True
     expected = {"version", "ticket", "context", "project_root", "offline_receipts", "model"}
     if automatic:
@@ -22,6 +25,7 @@ def execute(request):
         reject("invalid_worker_request")
     response = {"version": 1, "call_id": ticket.get("call_id"), "run_id": ticket.get("run_id"),
                 "status": "error", "result": None, "error": "worker_failed", "references": {}}
+    context = None
     try:
         run = BusinessRun(request["context"], project_root=Path(request["project_root"]), offline_receipts=request["offline_receipts"], automatic=automatic,
             downloads_dir=Path(request["downloads_dir"]) if automatic else None,
@@ -66,7 +70,43 @@ def execute(request):
             _CURRENT.reset(token)
         response.update(status="success", result=result, error=None, references=context.references)
     except BusinessError as error:
-        response["error"] = str(error) if str(error) in WORKER_ERRORS else "worker_failed"
+        code = str(error)
+
+        response["error"] = (
+            code if code in WORKER_ERRORS
+            else "worker_failed"
+        )
+
+        if (
+            automatic
+            and ticket["name"] == "dext.scribe"
+            and code in SCRIBE_FORMAT_ERRORS
+            and context is not None
+            and type(context.scribe_raw_response) is str
+        ):
+            raw = context.scribe_raw_response
+            candidate = raw
+
+            # Respecter la taille maximale du protocole worker.
+            while candidate:
+                preview = {
+                    "raw_model_response": candidate,
+                    "truncated": candidate != raw,
+                }
+
+                try:
+                    dumps(
+                        {**response, "result": preview},
+                        MAX_OUTPUT,
+                    )
+                except BusinessError as size_error:
+                    if str(size_error) != "size_limit":
+                        break
+                    candidate = candidate[:len(candidate) // 2]
+                else:
+                    response["result"] = preview
+                    break
+        
     except Exception:
         # Exceptions can contain labels, document contents, credentials or paths.
         # Neither their text nor tracebacks are sent to stdout/stderr.

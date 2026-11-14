@@ -2311,9 +2311,29 @@ impl AgentService {
                 return Ok(Flow::Break);
             }
             if business_review_required(&action_result) {
-                (*final_status,*final_message) = business_review_outcome(&action_result,self.platform_context.is_some());
-                return Ok(Flow::Break);
-            }
+                let results = action_result
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| vec![action_result.clone()]);
+
+                let has_failure = results.iter().any(|r| {
+                    r["tool"] == "call_function"
+                        && r["status"] != "success"
+                });
+
+                if has_failure || self.platform_context.is_some() {
+                    (*final_status, *final_message) =
+                        business_review_outcome(
+                            &action_result,
+                            self.platform_context.is_some()
+                        );
+                    return Ok(Flow::Break);
+                }
+
+    // Successful analysis requiring review:
+    // keep the result and let the agent explain it.
+}
             // The pictures a scrape read took this step go with the next
             // input; a step without a read leaves none (run_script window.rs).
             let shots = crate::controller::run_script::service::window::take_shots();
