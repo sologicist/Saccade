@@ -247,7 +247,7 @@ function automaticToolsFixture() {
       async remove(id) { removed.push(id); },
     },
   };
-  const context = vm.createContext({ chrome, setTimeout, clearTimeout, URL, AbortController, Uint8Array, TextEncoder, crypto:require('node:crypto').webcrypto, btoa: value => Buffer.from(value, "binary").toString("base64") });
+  const context = vm.createContext({ chrome, setTimeout, clearTimeout, URL, AbortController, Uint8Array, TextEncoder, atob: value=>Buffer.from(value,"base64").toString("binary"), crypto:require('node:crypto').webcrypto, btoa: value => Buffer.from(value, "binary").toString("base64") });
   const toolsSource = fs.readFileSync(path.join(__dirname, "tools.js"), "utf8");
   vm.runInContext(toolsSource + `
 globalThis.actualTools = {
@@ -581,4 +581,35 @@ test("keyboard authorization observes top-frame focus without exposing its value
   assert.ok(!JSON.stringify(result).includes(element.value));
   f.chrome.scripting.executeScript=async()=>[{frameId:4,result}];
   await assert.rejects(f.tools.handle({type:'execution_focus',tabId:1},{}),/focus_unavailable/);
+});
+
+
+test("serialized scanner labels the empty Dext PDF button without extension globals", () => {
+  const extension = vm.createContext({});
+  vm.runInContext(fs.readFileSync(path.join(__dirname,"element.js"),"utf8") +
+    "\nglobalThis.serializedScan=elementScanPage.toString();globalThis.scanConfig=ELEMENT_DEFAULT_CONFIG;", extension);
+  for (const variant of ['dext','ordinary','print','named']) {
+    const receipt = {querySelector:()=>({})};
+    const button = {nodeType:1,localName:'button',namespaceURI:'http://www.w3.org/1999/xhtml',
+      firstChild:null, nextSibling:null, tabIndex:0,
+      closest:selector=>selector==='.receipt-page' && variant!=='ordinary'?receipt:null,
+      matches:selector=>selector==='button.download.s-button-download' && variant!=='print',
+      getAttribute:key=>key==='aria-label' && variant==='named'?'Existing name':null,
+      hasAttribute:()=>false, getClientRects:()=>[{}],
+      getBoundingClientRect:()=>({left:10,top:10,width:20,height:20})};
+    const document = {nodeType:9,firstChild:button,scrollingElement:{clientWidth:100,clientHeight:100},getElementById:()=>null};
+    const window = {devicePixelRatio:1,frameElement:null,addEventListener(){},removeEventListener(){},
+      getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1',cursor:'pointer',pointerEvents:'auto'})};
+    window.parent=window; window.top=window;
+    document.defaultView=window; button.ownerDocument=document; button.parentNode=document;
+    const cfg=plain(extension.scanConfig); cfg.occlusion={enabled:false};
+    const page = vm.createContext({window,self:window,document,location:{href:'https://app.dext.com/receipt/synthetic'},performance:{now:()=>0},cfg});
+    // executeScript serializes only func, not its service-worker lexical scope.
+    assert.equal(vm.runInContext('typeof elementDextPdfName',page),'undefined');
+    const result = vm.runInContext('('+extension.serializedScan+')(cfg,{nonce:"synthetic",wait_ms:0})',page);
+    assert.equal(result.error,undefined,result.error);
+    const record=result.recs.find(row=>row.tag==='button');
+    assert.ok(record);
+    assert.equal(record.name,variant==='dext'?'T\u00e9l\u00e9charger PDF':variant==='named'?'Existing name':'');
+  }
 });

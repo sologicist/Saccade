@@ -98,7 +98,10 @@ class PlatformLearningControl:
         # No platform-specific navigation whitelist is required.
         # The native controller still validates the observed target,
         # browser ownership and platform scope.
-        if kind in ('click', 'hold_click', 'input', 'keyboard'):
+        download_click = kind in ('click','hold_click') and (
+            str(target.get('name','')).strip().casefold() in ('download','download pdf','telecharger','télécharger','télécharger pdf')
+            or ' download=' in str(target.get('line','')))
+        if kind in ('click', 'hold_click', 'input', 'keyboard') and not download_click:
             return {
                 'allowed': True,
                 'effect': 'interaction',
@@ -106,7 +109,7 @@ class PlatformLearningControl:
 
         # Downloads and confirmation dialogs remain subject
         # to separate, explicit authorization.
-        effect = 'download' if kind == 'download' else 'interaction'
+        effect = 'download' if kind == 'download' or download_click else 'interaction'
 
         target = {
             **target,
@@ -119,8 +122,9 @@ class PlatformLearningControl:
             target,
             effect=effect,
             destination=(
-                'private platform download storage'
-                if kind == 'download'
+                'Chrome-managed destination (unverified; scoped downloads remain denied)'
+                if download_click else 'private platform download storage'
+                if effect == 'download'
                 else self.context['platform_id']
             ),
             run_id=self.run_id,

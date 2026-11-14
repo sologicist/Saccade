@@ -14,6 +14,17 @@ from AutoCua.saccade.operator_requests import OperatorRequests
 from tests.business_fixtures import BusinessFixture
 
 class ProductionScribe(unittest.TestCase):
+    def test_native_download_button_uses_click_authority_without_extraction_or_receipt(self):
+        target={'tag':'button','role':'','name':'Download PDF','line':'<button>Download PDF</button>','rect':[1,2,20,10]}
+        action={'type':'click','id':2,'times':1}
+        self.assertFalse(self.c.authorize_execution(action,self.stamp,{'2':target})['allowed'])
+        self.assertEqual(self.c.execution.pending['binding']['effect'],'download')
+        self.assertEqual(self.c.execution.pending['binding']['action']['type'],'click')
+        self.c.execution.review(self.c.execution.pending['id'],True)
+        self.assertTrue(self.c.authorize_execution(action,self.stamp,{'2':target})['allowed'])
+        self.assertNotIn('viewer_source',self.c.execution.pending['binding']['target'])
+        self.assertNotIn('pdf_resource',self.c.execution.pending['binding']['target'])
+
     def test_navigation_click_does_not_create_or_consume_a_download_decision(self):
         pending=copy.deepcopy(self.c.execution.pending)
         decision=self.c.authorize_execution({'type':'click','id':2,'times':1},self.stamp,self.elements)
@@ -147,3 +158,28 @@ class ProductionScribe(unittest.TestCase):
         response=run_worker(request,package_root=Path(scribe_pdf.__file__).parents[1],
             provider_environment={'GEMINI_API_KEY':'','COMPTABLE_LLM_MODEL':scribe_pdf.DEFAULT_MODEL})
         self.assertEqual(response['error'],'scribe_provider_unconfigured')
+
+    def test_real_isolated_child_runs_scribe_validation_with_a_synthetic_provider_module(self):
+        import shutil
+        from AutoCua.saccade.business_process import run_worker
+        # A disposable trusted installation, never a module in the production
+        # package or client folder. The only stub is the external provider API;
+        # subprocess isolation, worker, PDF/reference checks and validator run.
+        package=Path(scribe_pdf.__file__).parents[1]
+        for source in (package/'saccade').rglob('*.py'):
+            target=self.f.package/source.relative_to(package)
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(source,target)
+        stub='''from types import SimpleNamespace as NS
+def completion(**options):
+    assert options['api_key'] == 'synthetic-not-a-key'
+    assert options['messages'][1]['content'][1]['file']['file_data'].startswith('data:application/pdf;base64,JVBERi0')
+    return NS(choices=[NS(finish_reason='stop',message=NS(content=RESPONSE))])
+'''.replace('RESPONSE',repr(self.raw))
+        (self.f.package.parent/'litellm.py').write_text(stub,encoding='utf-8')
+        request=self.request()
+        response=run_worker(request,package_root=self.f.package,
+            provider_environment={'GEMINI_API_KEY':'synthetic-not-a-key','COMPTABLE_LLM_MODEL':scribe_pdf.DEFAULT_MODEL})
+        self.assertEqual(response['status'],'success',response.get('error'))
+        self.assertTrue(response['result']['proposal']['ecriture'])
+        self.assertFalse(response['result']['posted_to_dext'])

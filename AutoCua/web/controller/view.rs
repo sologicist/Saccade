@@ -377,7 +377,7 @@ impl ControllerView {
             let receipt = control.bind(py).call_method1("save_download", (pythonize::pythonize(py, &result)?,))?;
             return Ok(Some(pythonize::depythonize(&receipt)?));
         }
-        Ok(Some(json!({"operator_authorized":true})))
+        Ok(Some(json!({"operator_authorized":true,"effect":decision["effect"]})))
     }
 
     /// Hand over the ids from the scan the model was just shown. The app-name
@@ -625,7 +625,7 @@ impl ControllerView {
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => return Err(error),
             Err(error) => {
                 let detail = error.value(py).to_string();
-                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download", "download_requires_observed_link", "invalid_download_target", "unobserved_download_target", "invalid_download_url", "download_requires_platform", "download_observation_failed", "invalid_download_receipt"];
+                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download", "download_requires_observed_link", "invalid_download_target", "unobserved_download_target", "invalid_download_url", "download_requires_platform", "download_observation_failed", "invalid_download_receipt", "verified_download_receipt_required", "foreign_download_receipt", "download_file_changed"];
                 let code = if detail.contains(crate::platform_scope::APPROVAL_UNAVAILABLE) {
                     "APPROVAL_UNAVAILABLE"
                 } else if detail.contains("not in extension mode") { "chrome_bridge_unavailable" }
@@ -643,9 +643,12 @@ impl ControllerView {
                 if let Some(control) = self.learning_control.lock().unwrap().as_ref() {
                     control.bind(py).call_method0("fail_execution")?;
                 }
+                let request = match code {
+                    _ => format!("Operation blocked: {code}. Review the document, client, direction or download response before choosing a supported alternative. No successful effect is claimed; do not replay an uncertain effect."),
+                };
                 return Ok((json!({"status":"waiting_operator", "tool":action["type"], "code":code,
                     "intervention":{"category":"blocked", "reason":"unsafe_or_blocked",
-                    "request":format!("Operation blocked: {code}. Review the document, client, direction or download response before choosing a supported alternative. No successful effect is claimed; do not replay an uncertain effect.")}}), false));
+                    "request":request}}), false));
             }
         };
         let operator_authorized = execution.as_ref().is_some_and(|v| v["operator_authorized"] == true);
@@ -744,6 +747,21 @@ impl ControllerView {
         })?;
 
         let mut result = dispatched?;
+        let observed_download_click = matches!(kind.as_str(), "click" | "hold_click") && {
+            let state = self.state.lock().unwrap();
+            let key = action["id"].as_i64().unwrap_or_default().to_string();
+            state.elements.get(&key).is_some_and(|target| {
+                let name = target["name"].as_str().unwrap_or_default().trim().to_lowercase();
+                matches!(name.as_str(), "download" | "download pdf" | "telecharger" | "télécharger" | "télécharger pdf") ||
+                    target["line"].as_str().unwrap_or_default().contains(" download=")
+            })
+        };
+        if result["status"] == "success" && (observed_download_click || execution.as_ref().is_some_and(|v|v["effect"] == "download")) {
+            return Ok((json!({"status":"waiting_operator","tool":kind,"code":"native_download_unconfirmed",
+                "intervention":{"category":"blocked","reason":"unsafe_or_blocked",
+                "request":"The native click was dispatched, but no completed browser download with a verified absolute file path is available. Scoped browser download DENY remains active. No download receipt or Scribe success is claimed. Do not repeat this unchanged action or automate a system Save/Print dialog."}}),false));
+        }
+
 
         // Where the tabs are now, in case the browser goes away before the
         // next scan (ScannerInner::revive reopens them).

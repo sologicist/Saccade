@@ -26,6 +26,15 @@ class ConversationalOperatorContracts(unittest.TestCase):
         control.freeze_decision()
         return control
 
+    def test_unchanged_answer_after_blocked_question_keeps_model_suspended(self):
+        self.pause('blocked', 'PDF retrieval is unavailable: pdfjs_not_exposed.')
+        self.assertEqual(self.chat('Download the PDF')[0], 'waiting')
+        for answer in ('rien', 'Nothing changed', 'aucun changement'):
+            kind, data = self.chat(answer)
+            self.assertEqual(kind, 'waiting')
+            self.assertIsNone(data)
+            self.assertEqual(self.broker.status('chat')['state'], 'waiting_operator')
+
     def pause(self, category, text, data=None):
         self.broker.suspend('chat', 'synthetic-run', data or self.data,
             {'category': category, 'reason': 'authentication_required' if category == 'authentication' else 'missing_information', 'request': text})

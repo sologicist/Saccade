@@ -1,11 +1,3 @@
-// A descriptive label, never permission or document identity evidence.
-function elementDextPdfName(el, tag) {
-  const receipt = el.closest?.('.receipt-page');
-  return tag === 'button' && el.matches?.('button.download.s-button-download') && receipt &&
-    receipt.querySelector('.ipdfjs-preview iframe[title="PDF Preview"][src="/pdf-preview"]')
-      ? 'T\u00e9l\u00e9charger PDF' : '';
-}
-
 // AutoCua - browser element scanner, extension side (AutoCuaBridge)
 //
 // A copy of AutoCua/web/tree/element.rs that runs inside the extension instead of
@@ -198,6 +190,13 @@ async function elementSettle(tabId) {
 // that asks after its parent's result went back is still placed. One listener per
 // frame: a new scan replaces it, and hellos carrying another scan's nonce are ignored.
 function elementScanPage(cfg, scan) {
+  // A descriptive label, never permission or document identity evidence.
+  function elementDextPdfName(el, tag) {
+    const receipt = el.closest?.('.receipt-page');
+    return tag === 'button' && el.matches?.('button.download.s-button-download') && receipt
+        ? 'T\u00e9l\u00e9charger PDF' : '';
+  }
+
   let frameElement = null;
   try {
     frameElement = window.frameElement;

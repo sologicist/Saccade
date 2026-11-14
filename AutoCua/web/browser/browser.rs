@@ -5534,6 +5534,9 @@ fn bridge_timeout(req: &Value) -> Duration {
         "blank_page" => 15.0,
         "click" => 10.0 + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
         "input" | "vault_input" => 15.0,
+        // Fixed PDF.js/fetch acquisition has its own 20 s bound; let it return
+        // a precise failure and complete document revalidation before timeout.
+        "download_observed" => 35.0,
         _ => 10.0,
     };
     Duration::from_secs_f64(secs)

@@ -62,6 +62,8 @@ def prepare(project, context, session, arguments, stamp, elements, *, observatio
     clients, registration = client_registration(root)
     if client not in clients: reject('scribe_client_mismatch')
     receipt = verified_download(project,context,session,arguments['document'])
+    if receipt.get('viewer_source'):
+        reject('verified_download_receipt_required')
     source = receipt.get('source')
     current = {k:stamp.get(k) for k in ('session','tab','page')}
     if not source or source != current or not elements:
@@ -82,7 +84,8 @@ def prepare(project, context, session, arguments, stamp, elements, *, observatio
                 for k,v in rows[:24] if type(v) is dict}
     return {'client_id':client,'sens':sens,'registration':registration,'receipt':receipt['id'],
             'pdf_sha256':receipt['sha256'],'reference_file':name,'reference_revision':reference,
-            'source':source,'observation_digest':observation_digest or digest(elements),'model':model,
+            'source':source,
+            'observation_digest':observation_digest or digest(elements),'model':model,
             'identity_confirmation':'Confirm that the currently observed Dext document belongs to this active client and invoice direction, and corresponds to this downloaded PDF. A filename or hash alone is not identity evidence.',
             'observed_document':observed,
             'disclosure':'Send this PDF and the FULL current selected accounting Markdown to Google Gemini for this one analysis only.'}

@@ -361,6 +361,9 @@ class OperatorRequests:
                     {**base, 'action': 'resume', 'answer': ''},
                 )
 
+            if item.get('blocked_context') and answer.strip().casefold().rstrip('.!') in ('rien', 'nothing', 'no change', 'nothing changed', 'aucun changement'):
+                self._rotate(item, 'The operation remains blocked because no new evidence was supplied. Provide changed non-sensitive context or cancel. Repeating approval cannot enable an unavailable transport.')
+                return 'waiting', None
             routes = None
             try:
                 routes = correction_routes(answer, control.store.adapter) if control else None
@@ -376,6 +379,7 @@ class OperatorRequests:
                 item.pop('edit_second', None)
             elif not routes and (category == 'blocked' or navigation_question(item['request']['request']) or item.get('edit_second')):
                 if category == 'blocked' and not navigation_question(item['request']['request']):
+                    item['blocked_context'] = True
                     item['request'] = {'category': 'question', 'reason': 'missing_information',
                         'request': 'What information has changed? Describe non-sensitive context; I will recheck it before continuing. This cannot authorize an external action.'}
                     self._rotate(item, item['request']['request'])
