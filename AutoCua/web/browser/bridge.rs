@@ -595,6 +595,13 @@ impl Bridge {
         Self::open_with(src, dest, true)
     }
 
+    /// Synthetic peers use the real authenticated transport without acquiring
+    /// the desktop app's global run lock or starting a browser.
+    #[cfg(test)]
+    pub fn open_test_peer(src: &Path, dest: &Path) -> io::Result<Bridge> {
+        Self::open_with(src, dest, false)
+    }
+
     /// `open`, holding the run lock or not: the app's idle line (`idle_serve`) holds
     /// none, being what the lock tells to step aside.
     fn open_with(src: &Path, dest: &Path, run: bool) -> io::Result<Bridge> {

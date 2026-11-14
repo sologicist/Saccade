@@ -142,19 +142,29 @@ pub fn click(
     refuse_web_store_link(elements, idx, &page)?;
     let n = py_int_value(times).map(|n| n.clamp(1, MAX_CLICK_TIMES)).unwrap_or(1);
     let rect = rect_for(elements, idx)?;
-    with_cursor(py, scanner, &rect, |s| {
+    let target = elements.get(&idx.to_string());
+    let observed_download = target.is_some_and(|v| {
+        let name = v["name"].as_str().unwrap_or_default().to_lowercase();
+        name.contains("download") || name.contains("télécharger") ||
+            v["line"].as_str().unwrap_or_default().contains(" download=")
+    });
+    let download_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_nanos() as u64;
+    let download = with_cursor(py, scanner, &rect, |s| {
         if s.bridged() {
             // Extension mode: the same press, dispatched by AutoCuaBridge (tools.js).
-            return s.bridge_call(json!({"type": "click", "rect": rect, "times": n})).map(|_| ());
+            return s.bridge_call(json!({"type": "click", "rect": rect, "times": n,"observe_download":observed_download}))
+                .map(|reply|reply.get("download").cloned().unwrap_or(Value::Null));
         }
-        s.with_tab(|cdp, sess| press(cdp, sess, &rect, 0.0, n))
+        s.with_tab(|cdp, sess| press(cdp, sess, &rect, 0.0, n)).map(|_|Value::Null)
     })?;
     let how = if n == 2 { "double-clicked" } else { "clicked" };
     let message = format!("{how} [{idx}] {}", label_for(elements, idx))
         .trim()
         .to_string();
     Ok(json!({"status": "success", "tool": "click", "id": idx, "times": n,
-              "message": message}))
+              "message": message,"download":download,
+              "download_started_ns":if observed_download {json!(download_started)} else {Value::Null}}))
 }
 
 /// Press and hold [id] for `seconds`, then release.

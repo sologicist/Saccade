@@ -80,19 +80,11 @@
             // Mobile use with no device picked yet (e.g. a reopened mobile chat
             // before re-pairing) — the user must select iOS/Android first.
             if (agentMode === 'mobile' && !agentSub) return;
-            let platformSelection = {};
-            try {
-                if (window.getPlatformSelection) platformSelection = window.getPlatformSelection(agentMode);
-            } catch (error) {
-                const status = document.getElementById('agentText');
-                if (status) status.textContent = String(error.message || error);
-                return;
-            }
             // Shell use on Manual: the terminal is the input, not this box (agent_mode.js).
             if (agentMode === 'shell' && modeWrap.dataset.shellInput === 'manual') return;
 
             const run = beginRun(message, agentMode, agentSub, '');
-            document.dispatchEvent(new CustomEvent('platformsession:busy'));
+
 
             // Shell use bypasses the main agent: the task goes STRAIGHT to the
             // coder agent (backend: run_shell_task in service.py) and the CLI
@@ -111,7 +103,6 @@
                 // session_id threads the active chat: null/"new" => fresh start,
                 // an existing id => continue that saved session (agent resumes).
                 body: JSON.stringify({
-                    ...platformSelection,
                     provider: sel.provider,
                     model: sel.model,
                     task: message,
@@ -250,9 +241,7 @@
             // Adopt the backend's session id (a brand-new chat is minted
             // server-side) so the run-end save + future sends target it.
             if (data.session_id) window.currentSessionId = data.session_id;
-            document.dispatchEvent(new CustomEvent('platformsession:restore', {
-                detail: { context: data.platform_context || null, bound: true, busy: true }
-            }));
+
             // Shell use: the run is this chat's (a brand-new one only has its id now)
             if (agentMode === 'shell' && window.cliShellStarted) window.cliShellStarted(data.session_id);
             // This run's id: its video finds its turn by it (chat_scroll.js).
@@ -302,7 +291,7 @@
         // stop handler AND from script.js's agentComplete()/agentError() — every line is
         // safe to run twice (remove-absent-class, re-post-show are no-ops).
         function restoreIdle() {
-            document.dispatchEvent(new CustomEvent('platformsession:idle'));
+
             const sendBtnFrame = getSendFrame();
             const stopBtnFrame = getStopFrame();
             const agentStrip = document.getElementById('agentResponseStrip');

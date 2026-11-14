@@ -251,13 +251,15 @@ function automaticToolsFixture() {
   const toolsSource = fs.readFileSync(path.join(__dirname, "tools.js"), "utf8");
   vm.runInContext(toolsSource + `
 globalThis.actualTools = {
+  handle: toolsHandle,
+  scanTarget: toolsScanTarget,
   own: (id, line) => toolsOurs.set(id, line),
   dialogHeld: (id) => toolsDialogs.has(id),
   wasReplaced: (id) => toolsReplaced.has(id),
   reopen: toolsReopen,
   setScopeReview: (handler) => { toolsOnScopeReview = handler; },
 };`, context);
-  return { chrome, tools: context.actualTools, commands, tabReads, created, removed };
+  return { chrome, tools: context.actualTools, commands, tabReads, created, removed, context };
 }
 
 test("scoped beforeunload dialogs remain unanswered and require operator review", async () => {
@@ -269,6 +271,65 @@ test("scoped beforeunload dialogs remain unanswered and require operator review"
   assert.match(line.platformScope.failure, /operator review.*beforeunload/i);
   assert.equal(f.tools.dialogHeld(1), true);
   assert.deepEqual(f.commands, []);
+});
+
+test('normal native clicks report only new completed Chrome filenames without changing download policy',async()=>{
+  const f=automaticToolsFixture();
+  const page='https://app.dext.com/invoice';
+  f.chrome.tabs.get=async()=>({id:1,url:page});
+  f.chrome.debugger.attach=async()=>{};
+  f.chrome.downloads={search:async()=>[{startTime:new Date(Date.now()+100).toISOString(),referrer:page,
+    state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\Facture été (1).pdf'}]};
+  const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],times:1,observe_download:true},{});
+  assert.equal(result.clicked,true);
+  assert.equal(result.download.filename,'Facture été (1).pdf');
+  assert.equal(result.download.state,'complete');
+  assert.equal(f.commands.filter(c=>c[1]==='Input.dispatchMouseEvent').length,3);
+  assert.ok(f.commands.every(c=>!c[1].includes('DownloadBehavior')));
+});
+
+test('automatic scans follow an active owned tab without taking human, competing or scoped tabs',async()=>{
+  const f=automaticToolsFixture(),line={};
+  f.chrome.tabs.get=async id=>({id,url:'https://example.com/'});
+  f.chrome.tabs.query=async()=>[{id:2,url:'https://app.dext.com/'}];
+  f.tools.own(1,line);
+  assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:true},line)).id,1);
+  f.tools.own(2,{other:true});
+  assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:true},line)).id,1);
+  f.tools.own(2,line);
+  assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:true},line)).id,2);
+  assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:false},line)).id,1);
+  line.platformScope={};
+  assert.equal((await f.tools.scanTarget({tabId:1,follow_owned_active:true},line)).id,1);
+});
+
+test('native download observations reject canceled, concurrent and foreign-source files',async()=>{
+  for(const scenario of ['interrupted','concurrent','foreign']) {
+    const f=automaticToolsFixture(),page='https://app.dext.com/invoice';
+    f.chrome.tabs.get=async()=>({id:1,url:page}); f.chrome.debugger.attach=async()=>{};
+    const row={startTime:new Date(Date.now()+100).toISOString(),referrer:page,state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\invoice.pdf'};
+    if(scenario==='interrupted') row.state='interrupted';
+    if(scenario==='foreign') row.referrer='https://other.example/';
+    f.chrome.downloads={search:async()=>scenario==='concurrent'?[row,{...row}]:[row]};
+    const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],observe_download:true},{});
+    assert.equal(result.download.state,scenario==='concurrent'?'ambiguous':scenario==='foreign'?'source_unverified':'interrupted');
+    assert.equal(result.download.filename,undefined);
+  }
+});
+
+test('an old filename or absent download evidence cannot turn a native click or Save dialog into download success',async()=>{
+  for(const scenario of ['old','no-api']) {
+    const f=automaticToolsFixture(),page='https://app.dext.com/invoice';
+    f.chrome.tabs.get=async()=>({id:1,url:page}); f.chrome.debugger.attach=async()=>{};
+    let clock=Date.now();
+    f.context.Date=class extends Date {static now(){clock+=5000;return clock;}};
+    if(scenario==='old') f.chrome.downloads={search:async()=>[{startTime:'2000-01-01T00:00:00Z',referrer:page,state:'complete',exists:true,fileSize:100,filename:'C:\\SyntheticDownloads\\old.pdf'}]};
+    const result=await f.tools.handle({type:'click',tabId:1,rect:[1,2,20,10],observe_download:true},{});
+    assert.equal(result.clicked,true);
+    assert.equal(result.download.state,'unconfirmed');
+    assert.equal(result.download.filename,undefined);
+    assert.ok(!f.commands.some(c=>c[1]==='Input.dispatchKeyEvent'));
+  }
 });
 
 test("profile-wide scoped review also holds a dialog on an initial unowned tab", async () => {

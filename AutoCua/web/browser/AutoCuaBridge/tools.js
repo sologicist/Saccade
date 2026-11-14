@@ -1694,6 +1694,14 @@ async function toolsTab(msg) {
   return tab;
 }
 
+async function toolsScanTarget(msg, line) {
+  if (msg.follow_owned_active && line && !line.platformScope) {
+    const [active] = await chrome.tabs.query({active:true,lastFocusedWindow:true});
+    if (active && toolsOurs.get(active.id) === line) return active;
+  }
+  return toolsTab(msg);
+}
+
 function toolsRect(msg) {
   const r = msg.rect;
   if (!Array.isArray(r) || r.length !== 4 || r.some((v) => typeof v !== "number")) {
@@ -1708,7 +1716,29 @@ async function toolsHandle(msg, line) {
   switch (msg.type) {
     case "click": {
       const tab = await toolsTab(msg);
+      const started = new Date().toISOString();
       await toolsPress(tab.id, toolsRect(msg), Number(msg.hold_s) || 0, Number(msg.times) || 1);
+      if (msg.observe_download) {
+        // Read Chrome's existing download history only. Do not change policy,
+        // start downloads, guess endpoints, intercept clicks or save dialogs.
+        const deadline = Date.now() + 8000;
+        while (chrome.downloads?.search && Date.now() < deadline) {
+          const rows = (await chrome.downloads.search({startedAfter:started,limit:3}))
+            .filter(row => Date.parse(row.startTime) >= Date.parse(started));
+          if (rows.length > 1) return {clicked:true,download:{state:"ambiguous"}};
+          if (rows.length === 1) {
+            const row = rows[0];
+            if (row.referrer !== tab.url) return {clicked:true,download:{state:"source_unverified"}};
+            if (row.state === "interrupted") return {clicked:true,download:{state:"interrupted"}};
+            if (row.state === "complete" && row.exists && row.fileSize > 0 && typeof row.filename === "string") {
+              const filename = row.filename.split(/[\\/]/).pop();
+              return {clicked:true,download:{state:"complete",filename,absolute_path:row.filename}};
+            }
+          }
+          await toolsSleep(200);
+        }
+        return {clicked:true,download:{state:"unconfirmed",message:"No completed Chrome download was observed. A Save/Print dialog may require attention; do not claim success or repeat the click."}};
+      }
       return { clicked: true };
     }
     case "input": {

@@ -42,6 +42,9 @@ const ON_THE_PAGE: [&str; 6] = ["click", "hold_click", "input", "vault", "keyboa
 /// Routes one step's actions against the live browser.
 pub struct ControllerView {
     business: Mutex<Option<crate::tool_registry::business::BusinessGate>>,
+    automatic_business: Mutex<bool>,
+    active_business_platform: Mutex<Option<String>>,
+    google_runtime: Mutex<Option<(String,String,Option<String>)>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -79,6 +82,9 @@ impl ControllerView {
         };
         Ok(ControllerView {
             business: Mutex::new(None),
+            automatic_business: Mutex::new(true),
+            active_business_platform: Mutex::new(None),
+            google_runtime: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -92,6 +98,8 @@ impl ControllerView {
     // ------------------------------------------------------------------ setup
 
     pub fn configure_business(&self, py: Python<'_>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        *self.automatic_business.lock().unwrap() = context.is_none();
+        *self.active_business_platform.lock().unwrap() = None;
         let gate = match context {
             Some(context) => {
                 let value: Value = pythonize::depythonize(context)?;
@@ -106,22 +114,74 @@ impl ControllerView {
     }
 
     pub fn refresh_business(&self, py: Python<'_>) -> PyResult<Option<Value>> {
-        self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()
+        if *self.automatic_business.lock().unwrap() {
+            let url = self.scanner.lock().unwrap().url.clone();
+            let module = py.import("AutoCua.saccade.automatic_platform")?;
+            let platform: Option<String> = module.call_method1("detect_platform", (&url,))?.extract()?;
+            let mut active = self.active_business_platform.lock().unwrap();
+            if *active != platform {
+                *self.business.lock().unwrap() = None;
+                *active = None;
+                if let Some(id) = platform.as_ref() {
+                    let run = module.call_method1("business_for_platform", (id,))?;
+                    if !run.is_none() {
+                        *self.business.lock().unwrap() = Some(crate::tool_registry::business::BusinessGate::automatic(run.unbind()));
+                    }
+                }
+                *active = platform;
+            }
+        }
+        let automatic = *self.automatic_business.lock().unwrap();
+        let business = self.business.lock().unwrap();
+        if automatic {
+            if let (Some(gate),Some((provider,model,key))) = (business.as_ref(),self.google_runtime.lock().unwrap().as_ref()) {
+                gate.configure_google(py,provider,model,key.as_deref())?;
+            }
+        }
+        business.as_ref().map(|gate| gate.refresh(py)).transpose()
+    }
+
+    pub fn configure_google_runtime(&self, provider: &str, model: &str, key: Option<&str>) {
+        *self.google_runtime.lock().unwrap() = Some((provider.into(),model.into(),if provider == "google" {key.map(str::to_owned)} else {None}));
     }
 
     #[cfg(test)]
     pub fn business_fixture(&self, run: Py<PyAny>) {
+        *self.automatic_business.lock().unwrap() = false;
         *self.business.lock().unwrap() = Some(crate::tool_registry::business::BusinessGate::from_fixture(run));
     }
 
     fn call_business(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
+        let automatic = *self.automatic_business.lock().unwrap();
+        if automatic {
+            // Reobserve before dispatch; never refresh a stale model selection
+            // into new authority or attach a single-site browser scope.
+            let observed = super::service::scan_op(py, &self.scanner, |scanner| {
+                scanner.scan_core()?;
+                Ok(scanner.url.clone())
+            });
+            let url = match observed {
+                Ok(url) => url,
+                Err(_) => return Ok(json!({"status":"error","tool":"call_function",
+                    "code":"business_observation_unavailable","operator_review_required":true})),
+            };
+            let platform: Option<String> = py.import("AutoCua.saccade.automatic_platform")?
+                .call_method1("detect_platform", (&url,))?.extract()?;
+            if platform.is_none() || platform != *self.active_business_platform.lock().unwrap() {
+                *self.business.lock().unwrap() = None;
+                *self.active_business_platform.lock().unwrap() = None;
+                return Ok(crate::tool_registry::business::denied());
+            }
+        }
         let business = self.business.lock().unwrap();
         let Some(gate) = business.as_ref() else { return Ok(crate::tool_registry::business::denied()) };
         let permit = match gate.authorize(py, action) {
             Ok(permit) => permit,
             Err(error) => return Ok(crate::tool_registry::business::denied_error(py, &error)),
         };
-        if let Err(error) = super::service::scan_op(py, &self.scanner, |scanner| scanner.authorize_business_action(action, &permit)) {
+        if let Err(error) = super::service::scan_op(py, &self.scanner, |scanner| {
+            if automatic { scanner.check_platform_scope() } else { scanner.authorize_business_action(action, &permit) }
+        }) {
             return match error {
                 ActErr::Py(error) => Err(error),
                 ActErr::Msg(_) => Ok(crate::tool_registry::business::denied()),
@@ -172,6 +232,29 @@ impl ControllerView {
     }
 
     fn check_after_settle(&self, py: Python<'_>, result: &mut Value) -> PyResult<()> {
+        let started = result.as_object_mut().and_then(|value|value.remove("download_started_ns"));
+        if let Some(started) = started.and_then(|value|value.as_u64()) {
+            if *self.automatic_business.lock().unwrap() {
+                if let Some(gate) = self.business.lock().unwrap().as_ref() {
+                    gate.begin_download(py,started)?;
+                }
+            }
+        }
+        // Consume Chrome's path privately, before the tool result reaches the
+        // model. This is a folder hint from the actual completed download, not
+        // a new downloader or model-selected filesystem authority.
+        if result["download"]["state"] == "complete" {
+            let path = result["download"]["absolute_path"].as_str().map(str::to_owned);
+            if let Some(download) = result["download"].as_object_mut() { download.remove("absolute_path"); }
+            let pdf = result["download"]["filename"].as_str().is_some_and(|name|name.to_lowercase().ends_with(".pdf"));
+            if pdf && *self.automatic_business.lock().unwrap() {
+                if let (Some(path),Some(gate)) = (path,self.business.lock().unwrap().as_ref()) {
+                    if gate.note_download(py,&path).is_err() {
+                        result["download"] = json!({"state":"file_verification_failed"});
+                    }
+                }
+            }
+        }
         if let Some(mut failure) = self.platform_check(py, None)? {
             failure["tool"] = result.get("tool").cloned().unwrap_or(Value::Null);
             *result = failure;
@@ -755,6 +838,169 @@ mod platform_tests {
             assert_eq!(result["status"], "error");
             assert_eq!(result["operator_review_required"], true);
             assert!(result["message"].as_str().unwrap().contains("not been initialized"));
+        });
+    }
+
+    #[test]
+    fn generic_browser_activates_and_revokes_functions_from_native_url_observations() {
+        Python::initialize();
+        Python::attach(|py| {
+            use pyo3::types::PyDict;
+            use std::ffi::CString;
+            let fixture = Fixture::new();
+            let mut inner = ScannerInner::new(&fixture.root.join("generic"),0,None,false);
+            inner.business_test_observations = Some(std::collections::VecDeque::new());
+            inner.url = "https://example.com/".into();
+            let scanner = Arc::new(Mutex::new(inner));
+            let view = ControllerView::new(&fixture.root,None,false,scanner.clone(),None).unwrap();
+            let locals = PyDict::new(py);
+            py.import("sys").unwrap().getattr("path").unwrap().call_method1("insert",(0,
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").to_string_lossy().as_ref())).unwrap();
+            py.run(&CString::new(r#"
+from unittest.mock import patch
+import AutoCua.saccade.automatic_platform as auto
+created = []
+class Run:
+    def set_google_runtime(self, provider, model, key):
+        assert provider == 'google' and model == 'gemini-3.8-flash' and key == 'synthetic-runtime-key'
+    def begin_download(self, started):
+        self.started = started
+    def note_download(self, path):
+        from pathlib import Path
+        from AutoCua.saccade.downloaded_pdf import resolve_download
+        assert self.started > 0
+        absolute, content = resolve_download(path, folder=Path(path).parent)
+        assert Path(absolute).is_absolute() and content.startswith(b'%PDF-')
+        downloads.append(absolute)
+    def refresh(self):
+        return {'name':'call_function','parameters':{'type':'object','properties':{}}}
+    def prepare(self, action):
+        raise AssertionError('A stale selection must not reach Python function authorization')
+def factory(platform):
+    created.append(platform)
+    return Run()
+replacement = patch.object(auto,'business_for_platform',factory)
+replacement.start()
+downloads = []
+"#).unwrap(),Some(&locals),None).unwrap();
+            // An authenticated synthetic extension peer exercises the actual
+            // native request/reply transport. No Chrome or user profile runs.
+            use tungstenite::client::IntoClientRequest;
+            let source = fixture.root.join("bridge-source");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("manifest.json"),r#"{"manifest_version":3,"name":"Synthetic bridge","version":"1.0","background":{"service_worker":"background.js"}}"#).unwrap();
+            std::fs::write(source.join("background.js"),"// Synthetic test peer only.\n").unwrap();
+            let bridge = crate::bridge::Bridge::open_test_peer(&source,&fixture.root.join("test-extension")).unwrap();
+            let port = bridge.port();
+            let token = bridge.token().to_owned();
+            let origin = format!("chrome-extension://{}",bridge.extension_id());
+            let download_path = fixture.root.join("Synthetic invoice (1).pdf");
+            let peer_path = download_path.clone();
+            let peer = std::thread::spawn(move || {
+                let stream = std::net::TcpStream::connect(("127.0.0.1",port)).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
+                let mut handshake = format!("ws://127.0.0.1:{port}/bridge?token={token}").into_client_request().unwrap();
+                handshake.headers_mut().insert("origin",origin.parse().unwrap());
+                let (mut socket,_) = tungstenite::client(handshake,stream).unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let message = socket.read().unwrap();
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    let kind = request["type"].as_str().unwrap();
+                    let result = match kind {
+                        "tabs" => json!([{"id":1,"url":"https://app.dext.com/receipts","title":"Synthetic invoice","type":"page"}]),
+                        "click" if request["observe_download"] == true => {
+                            std::fs::write(&peer_path,b"%PDF-1.4\nSynthetic invoice\n%%EOF").unwrap();
+                            json!({"download":{"state":"complete","filename":"Synthetic invoice (1).pdf","absolute_path":peer_path}})
+                        },
+                        "scroll_probe" => json!({"probe":[0,0,0,received.len()]}),
+                        "run_script" => json!({"result":{"value":"Synthetic page result"}}),
+                        _ => json!({}),
+                    };
+                    socket.send(tungstenite::Message::Text(json!({"id":request["id"],"result":result}).to_string())).unwrap();
+                    let finished = kind == "release";
+                    received.push(request);
+                    if finished { break }
+                }
+                received
+            });
+            {
+                let mut browser = scanner.lock().unwrap();
+                browser.set_bridge(Arc::new(Mutex::new(bridge)));
+                browser.set_cursor_enabled(false);
+            }
+            assert!(super::super::service::scan_op(py,&scanner,|browser|browser.bind_tab("1")).is_ok());
+            view.configure_google_runtime("google","gemini-3.8-flash",Some("synthetic-runtime-key"));
+            assert!(view.refresh_business(py).unwrap().is_none());
+            scanner.lock().unwrap().url = "https://app.dext.com/login".into();
+            assert!(view.refresh_business(py).unwrap().is_some());
+            view.set_elements(json!({
+                "1":{"name":"Page","rect":[0,0,800,600]},
+                "2":{"name":"Purchases","rect":[1,1,50,20],"line":"<button>Purchases</button>"},
+                "3":{"name":"Search","rect":[1,30,50,20],"line":"<input>"},
+                "4":{"name":"Download","rect":[1,60,50,20],"line":"<button>Download</button>"}
+            }).as_object().unwrap().clone(),"");
+            for action in [
+                json!({"type":"click","id":2}),
+                json!({"type":"input","id":3,"value":"Synthetic query","enter":false}),
+                json!({"type":"keyboard","value":"CTRL+A"}),
+                json!({"type":"scroll","id":1,"direction":"down"}),
+                json!({"type":"update_tab","value":"https://app.dext.com/receipts"}),
+                json!({"type":"navigate_tab","value":"back"}),
+                json!({"type":"navigate_tab","value":"reload"}),
+                json!({"type":"click","id":4}),
+            ] {
+                let result = view.route_action(py,&action).unwrap();
+                assert_eq!(result["status"],"success","{action}: {result}");
+                assert!(result.get("operator_review_required").is_none(),"{result}");
+                assert!(!result.to_string().contains("absolute_path"));
+                if action["id"] == 4 {
+                    assert_eq!(result["download"]["filename"],"Synthetic invoice (1).pdf");
+                    assert_eq!(result["download"]["state"],"complete");
+                }
+            }
+            // Existing generic geometry and destination checks still apply.
+            for action in [json!({"type":"click","id":999}),
+                           json!({"type":"update_tab","value":"https://chromewebstore.google.com/"})] {
+                let result = view.route_action(py,&action).unwrap();
+                assert_eq!(result["status"],"error");
+                assert!(result.get("operator_review_required").is_none());
+            }
+            // The native bridge guard also permits the unchanged supported
+            // script/dialog/tab command paths without imposing PR3's whitelist.
+            for kind in ["run_script","dialog","activate","close_tab","new_tab"] {
+                let result = super::super::service::scan_op(py,&scanner,|browser| {
+                    browser.authorize_platform_action(&json!({"type":kind}))?;
+                    browser.bridge_call(json!({"type":kind}))
+                });
+                assert!(result.is_ok(),"{kind} was blocked before native dispatch");
+            }
+            assert!(download_path.is_file());
+            py.run(&CString::new("assert len(downloads) == 1").unwrap(),Some(&locals),None).unwrap();
+            scanner.lock().unwrap().url = "https://app.dext.com.evil.example/".into();
+            let denied = view.call_business(py,&json!({"type":"call_function","version":1,"name":"dext.bank","arguments":{}})).unwrap();
+            assert_eq!(denied["status"],"error");
+            assert!(view.refresh_business(py).unwrap().is_none());
+            scanner.lock().unwrap().url = "https://app.dext.com/receipts".into();
+            assert!(view.refresh_business(py).unwrap().is_some());
+            assert!(view.refresh_business(py).unwrap().is_some());
+            py.run(&CString::new("replacement.stop()\nassert created == ['dext','dext']").unwrap(),Some(&locals),None).unwrap();
+            scanner.lock().unwrap().url = "https://docs.google.com/spreadsheets/synthetic".into();
+            assert!(view.refresh_business(py).unwrap().is_none());
+            assert!(scanner.lock().unwrap().platform_violation().is_none());
+            assert!(super::super::service::scan_op(py,&scanner,|browser|browser.bridge_request(json!({"type":"release"}))).is_ok());
+            let received = py.detach(||peer.join()).unwrap();
+            for kind in ["click","input","keyboard","scroll","navigate","history","reload","run_script","dialog","close_tab","new_tab"] {
+                assert!(received.iter().any(|request|request["type"] == kind),"missing native dispatch: {kind}");
+            }
+            let clicks: Vec<_> = received.iter().filter(|request|request["type"] == "click").collect();
+            assert_eq!(clicks.len(),2);
+            assert_eq!(clicks[0]["observe_download"],false);
+            assert_eq!(clicks[1]["observe_download"],true);
+            for request in received.iter().filter(|request|matches!(request["type"].as_str(),
+                Some("click"|"input"|"keyboard"|"scroll"|"navigate"|"history"|"reload"|"run_script"|"dialog"))) {
+                assert_eq!(request["tabId"],1,"{request}");
+            }
         });
     }
 

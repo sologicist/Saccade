@@ -682,6 +682,16 @@ fn tools_anthropic(registry: &[Value]) -> Vec<Value> {
 }
 
 /// Gemini function declarations.
+fn gemini_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(map.iter().filter(|(key, val)| {
+            key.as_str() != "enum" || val.as_array().is_some_and(|values| values.iter().all(Value::is_string))
+        }).map(|(key, val)| (key.clone(), gemini_schema(val))).collect()),
+        Value::Array(values) => Value::Array(values.iter().map(gemini_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 fn tools_gemini(registry: &[Value]) -> Vec<Value> {
     registry
         .iter()
@@ -690,11 +700,44 @@ fn tools_gemini(registry: &[Value]) -> Vec<Value> {
             m.insert("name".into(), t.get("name").cloned().unwrap_or(Value::Null));
             m.insert(
                 "parameters".into(),
-                t.get("parameters").cloned().unwrap_or(Value::Null),
+                gemini_schema(t.get("parameters").unwrap_or(&Value::Null)),
             );
             with_description(m, t)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod gemini_schema_tests {
+    use super::*;
+
+    #[test]
+    fn recursive_numeric_enum_cleanup_preserves_canonical_and_other_providers() {
+        let schema = json!({"type":"object","properties":{"version":{"type":"integer","enum":[1]},
+            "nested":{"anyOf":[{"type":"integer","enum":[2]},{"type":"string","enum":["achat","vente"]}]}}});
+        let registry = vec![json!({"name":"call_function","parameters":schema})];
+        let normalized = tools_gemini(&registry);
+        assert_eq!(normalized[0]["parameters"]["properties"]["version"]["type"], "integer");
+        assert!(normalized[0]["parameters"]["properties"]["version"].get("enum").is_none());
+        assert!(normalized[0]["parameters"]["properties"]["nested"]["anyOf"][0].get("enum").is_none());
+        assert_eq!(normalized[0]["parameters"]["properties"]["nested"]["anyOf"][1]["enum"],json!(["achat","vente"]));
+        assert_eq!(registry[0]["parameters"],schema);
+        assert_eq!(tools_openai(&registry)[0]["function"]["parameters"],schema);
+        Python::initialize();
+        Python::attach(|py| {
+            let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/auto-lite-sdk");
+            if sdk.is_dir() {
+                py.import("sys").unwrap().getattr("path").unwrap().call_method1("insert",(0,sdk.to_str().unwrap())).unwrap();
+            }
+            if py.import("google.genai.types").is_err() { return; }
+            let locals = pyo3::types::PyDict::new(py);
+            locals.set_item("declaration",pythonize::pythonize(py,&normalized[0]).unwrap()).unwrap();
+            locals.set_item("canonical",pythonize::pythonize(py,&registry[0]).unwrap()).unwrap();
+            // Match the existing Python provider constructor's call stack;
+            // Pydantic resolves SDK forward references using Python frames.
+            py.run(&std::ffi::CString::new("from google.genai import types\ndef validate():\n    return types.FunctionDeclaration(**declaration)\nvalidated = validate()\ndef reject_numeric_enum():\n    try:\n        types.FunctionDeclaration(**canonical)\n    except ValueError:\n        return\n    raise AssertionError('The SDK should reject the original numeric enum')\nreject_numeric_enum()").unwrap(),Some(&locals),None).unwrap();
+        });
+    }
 }
 
 /// Perplexity agent API (Responses-style flat function tools).

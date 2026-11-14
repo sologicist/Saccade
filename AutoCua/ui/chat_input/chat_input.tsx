@@ -9,7 +9,6 @@
 // pc_button.html): the browser extension and the banners load them too.
 import { AgentMode } from '../agent_mode/agent_mode.tsx';
 import { MemoryBar } from '../memory_bar/memory_bar.tsx';
-import { PlatformSessionSelector } from '../platform_session/platform_session.tsx';
 
 export function ChatInput() {
     return (
@@ -46,7 +45,6 @@ export function ChatInput() {
                 to sit beside it, so the whole thing becomes a single slim row; the grey
                 send orb morphs into the glowing stop orb (same slot, crossfade). */}
             <div className="input-area-wrapper">
-                <PlatformSessionSelector />
                 <textarea className="chat-input" placeholder="Select a model in Settings to start..." rows={1} disabled></textarea>
 
                 <div className="input-toolbar">

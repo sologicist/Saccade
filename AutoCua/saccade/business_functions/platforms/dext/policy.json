@@ -2,7 +2,25 @@
   "schema_version": 1,
   "platform_id": "dext",
   "functions": [
-    {"name": "dext.bank", "module": "functions.py", "symbol": "bank", "effect": "compute", "capabilities": ["synthetic_reference"], "description": "Ask the trusted offline fake accounting provider to classify an explicitly supplied synthetic label using the entire current client reference. Returns only compte or null. A real provider would require separate external-disclosure approval and is unavailable here."},
-    {"name": "dext.scribe", "module": "functions.py", "symbol": "scribe", "effect": "compute", "capabilities": ["verified_offline_fixture"], "description": "Validate a structured synthetic invoice proposal. Live or unverified PDFs are blocked until causal download receipts exist. Never writes accounting data."}
+    {
+      "name": "dext.bank",
+      "module": "functions.py",
+      "symbol": "bank",
+      "effect": "compute",
+      "capabilities": [
+        "client_reference"
+      ],
+      "description": "Classify an observed bank label using the active registered client full bank reference. Production mode transmits the label/reference to the configured Gemini accounting model for the analysis explicitly requested by the user. Returns compte or null; never writes to Dext."
+    },
+    {
+      "name": "dext.scribe",
+      "module": "functions.py",
+      "symbol": "scribe",
+      "effect": "compute",
+      "capabilities": [
+        "local_pdf_analysis"
+      ],
+      "description": "Analyze a newly completed local PDF from Downloads using its exact filename or absolute path and the active registered client full achat/vente reference. The trusted host resolves the absolute path. Production analysis sends the actual PDF and full reference to Gemini for the analysis explicitly requested by the user. Returns a validated accounting proposal; never writes to Dext."
+    }
   ]
 }

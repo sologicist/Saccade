@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 import threading
+import time
 from pathlib import Path
 
 from .business_catalogue import PACKAGE_ROOT, catalogue, client_registration, model_tool
@@ -15,10 +15,17 @@ from .session_context import _validate_context
 class BusinessRun:
     """Only the trusted host constructs this object; no model-supplied roots."""
 
-    def __init__(self, context, *, project_root=None, package_root=PACKAGE_ROOT, offline_receipts=None):
+    def __init__(self, context, *, project_root=None, package_root=PACKAGE_ROOT, offline_receipts=None, automatic=True, downloads_dir=None, download_since_ns=None):
         self.context = _validate_context(context, root=project_root)
         if self.context["platform_id"] != "dext" or self.context["execution_mode"] != "supervised":
             reject("unsupported_business_session")
+        self.automatic = automatic
+        self.downloads_dir = downloads_dir
+        self.download_since_ns = time.time_ns() if download_since_ns is None else download_since_ns
+        self._documents = {}
+        self._google_model = None
+        self._google_key = None
+        self._current_download = None
         self.package_root = package_root
         self.project_root = Path(project_root) if project_root else package_root.parent
         self.data_root = self.project_root / "platforms/dext/data"
@@ -30,25 +37,59 @@ class BusinessRun:
         self.receipts = []
         self._clients = tuple(client_registration(self.data_root)[0])
 
+    def set_google_runtime(self, provider, model, api_key):
+        """Host-only application settings, never model-selected arguments."""
+        self._google_model = model if provider == 'google' else None
+        self._google_key = api_key if provider == 'google' else None
+
     def snapshot(self):
         try:
             _validate_context(self.context, root=self.project_root)
         except ValueError:
             reject("business_revision_changed")
         current = catalogue("dext", package_root=self.package_root)
+        if self.automatic:
+            # Live accounting includes a provider disclosure, while explicit
+            # offline test contexts retain the PR4 compute-only contract.
+            for function in current['functions'].values():
+                function['effect'] = 'disclosure'
         clients, registration = client_registration(self.data_root)
         if tuple(clients) != self._clients:
             reject("business_client_scope_changed")
-        current["revision"] = digest([current["revision"], registration, self.context, self.offline_receipts])
+        current["revision"] = digest([current["revision"], registration, self.context, self.offline_receipts, self.automatic])
         return current, clients
+
+    def note_download(self, absolute_path):
+        """Host-only Chrome result, never a model-selected folder setting."""
+        # A failed new file check must not leave an earlier PDF selectable.
+        if self.automatic:
+            self._current_download = (None, None)
+        from .downloaded_pdf import resolve_download
+        path = Path(absolute_path)
+        if not self.automatic or not path.is_absolute():
+            reject('invalid_download_path')
+        absolute, content = resolve_download(str(path),folder=path.parent,since_ns=self.download_since_ns)
+        self.downloads_dir = path.parent
+        self._current_download = (absolute, digest(content))
+
+    def begin_download(self, started_ns):
+        """Host click timestamp replaces the earlier file-selection window."""
+        if not self.automatic or type(started_ns) is not int or started_ns <= 0:
+            reject('invalid_download_observation')
+        self.download_since_ns = started_ns
+        self._current_download = None
 
     def refresh(self):
         """Called before every model decision, never after its chosen revision."""
         _validate_context(self.context, root=self.project_root)
         with self._lock:
-            self._decision, _ = self.snapshot()
+            self._decision, clients = self.snapshot()
             self._pending.clear()
-            return model_tool(self._decision)
+            self._documents.clear()
+            definition = model_tool(self._decision)
+            if self.automatic:
+                definition["description"] += " Active operator-registered client: " + (next(iter(clients), "unconfigured")) + ". Only analyze the document explicitly requested by the user. Scribe uses the configured AutoCua Gemini provider and sends that PDF and its client reference for the requested analysis."
+            return definition
 
     def prepare(self, action):
         with self._lock:
@@ -73,11 +114,19 @@ class BusinessRun:
             client = arguments["client_id"]
             if client not in clients:
                 reject("unauthorized_client")
-            if clients[client]["synthetic"] is not True:
+            if not self.automatic and clients[client]["synthetic"] is not True:
                 reject("real_client_privacy_gate_closed")
-            if action["name"] == "dext.bank" and arguments["string"] not in clients[client]["bank_labels"]:
+            if not self.automatic and action["name"] == "dext.bank" and arguments["string"] not in clients[client]["bank_labels"]:
                 reject("operator_argument_required")
-            if action["name"] == "dext.scribe":
+            document_hash = None
+            if self.automatic and action["name"] == "dext.scribe":
+                from .downloaded_pdf import resolve_download
+                absolute, content = resolve_download(arguments["pdf"],folder=self.downloads_dir,since_ns=self.download_since_ns)
+                if self._current_download and self._current_download != (absolute,digest(content)):
+                    reject('download_file_changed')
+                arguments["pdf"] = absolute
+                document_hash = digest(content)
+            if not self.automatic and action["name"] == "dext.scribe":
                 receipt = self.offline_receipts.get(arguments["pdf"])
                 if not receipt or receipt.get("client_id") != client or receipt.get("sens") != arguments["sens"]:
                     reject("verified_download_receipt_required")
@@ -87,6 +136,8 @@ class BusinessRun:
                       "revision": current["revision"], "effect": entry["effect"],
                       "capabilities": entry["capabilities"], "action": loads(dumps(action)),
                       "arguments": arguments, "name": action["name"]}
+            if document_hash:
+                self._documents[token] = document_hash
             self._pending[token] = ticket
             return loads(dumps(ticket))
 
@@ -101,19 +152,27 @@ class BusinessRun:
                 current, _ = self.snapshot()
                 if current["revision"] != ticket["revision"]:
                     reject("business_revision_changed")
-            model = os.environ.get("COMPTABLE_LLM_MODEL", "offline-synthetic-v1")
-            if model != "offline-synthetic-v1":
-                reject("external_provider_consent_required")
+            model = 'offline-synthetic-v1'
+            options = {}
             request = {"version": 1, "ticket": ticket, "context": self.context,
                        "project_root": str(self.project_root), "offline_receipts": self.offline_receipts,
                        "model": model}
-            reply = run_worker(request, package_root=self.package_root, stop_event=stop_event)
+            if self.automatic:
+                from .accounting_provider import settings
+                model, provider_environment = settings(self._google_model,self._google_key)
+                request['model'] = model
+                from .downloaded_pdf import downloads_folder
+                request.update(automatic=True, download_since_ns=self.download_since_ns,
+                    downloads_dir=str(self.downloads_dir or downloads_folder()),
+                    document_sha256=self._documents.pop(token,None))
+                options = {'provider_environment':provider_environment, 'timeout':100}
+            reply = run_worker(request, package_root=self.package_root, stop_event=stop_event, **options)
             if type(reply) is not dict or set(reply) != {"version", "call_id", "run_id", "status", "result", "error", "references"} or type(reply["version"]) is not int or reply["version"] != 1 or reply["call_id"] != token or reply["run_id"] != self.run_id:
                 reject("invalid_worker_response")
             if reply["status"] != "success":
                 reject(reply["error"] if type(reply["error"]) is str and reply["error"] in WORKER_ERRORS else "worker_failed")
             references = reply["references"]
-            if type(references) is not dict or not references or set(references) - {"comptable_banque.md", "comptable_achats.md", "comptable_ventes.md", "comptable.md"} or any(type(v) is not str or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in references.values()):
+            if type(references) is not dict or not references or set(references) - {"comptable_banque.md", "comptable_achats.md", "comptable_ventes.md"} or any(type(v) is not str or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in references.values()):
                 reject("invalid_worker_response")
             validate(reply["result"], current["functions"][ticket["name"]]["output_schema"])
             self.receipts.append({"call_id": token, "run_id": self.run_id, "revision": ticket["revision"],
@@ -130,12 +189,15 @@ class BusinessRun:
                     "tool": "call_function", "code": str(error), "operator_review_required": True}
 
 
-WORKER_ERRORS = {"business_revision_changed", "required_file_unavailable", "unsafe_path", "size_limit",
+WORKER_ERRORS = {"accounting_model_required", "accounting_model_unavailable", "accounting_provider_key_missing", "accounting_provider_dependency_missing",
+                 "accounting_provider_incomplete", "accounting_provider_invalid_response", "accounting_provider_failed",
+                 "invalid_download_path", "invalid_download_filename", "download_outside_folder",
+                 "invalid_download_pdf", "download_incomplete", "download_file_missing", "download_stale", "download_file_changed","business_revision_changed", "required_file_unavailable", "unsafe_path", "size_limit",
                  "invalid_bank_reference", "conflicting_bank_account", "invalid_provider_response",
                  "verified_download_receipt_required", "offline_fixture_identity_mismatch",
                  "invoice_critical_mismatch", "invoice_total_mismatch", "invoice_entries_mismatch",
                  "invalid_invoice_amount", "invalid_invoice_entry", "invalid_invoice_account",
-                 "invalid_invoice_value", "external_provider_consent_required", "schema_mismatch",
+                 "invalid_invoice_value", "unsupported_offline_model", "schema_mismatch",
                  "invalid_bank_label", "invalid_bank_account", "invalid_reference_encoding",
                  "invalid_invoice_direction", "invalid_invoice_entries", "invalid_invoice_journal",
                  "invalid_invoice_date", "invalid_invoice_currency", "incomplete_invoice_proposal",

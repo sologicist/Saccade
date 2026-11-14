@@ -23,6 +23,7 @@ class BusinessFixture:
         for name in ("__init__.py", "saccade/__init__.py", "saccade/platform_config.py", "saccade/session_context.py",
                      "saccade/business_contract.py", "saccade/business_catalogue.py", "saccade/business_run.py",
                      "saccade/business_process.py", "saccade/business_worker.py",
+                     "saccade/automatic_platform.py", "saccade/downloaded_pdf.py", "saccade/accounting_provider.py",
                      "saccade/business_functions/__init__.py", "saccade/business_functions/platforms/__init__.py"):
             path = self.package / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +55,7 @@ class BusinessFixture:
         (self.data / "registration.json").write_text(json.dumps(self.registration), encoding="utf-8")
 
     def run(self, **kwargs):
+        kwargs.setdefault('automatic', False)  # Explicit offline test context.
         run = BusinessRun(self.context, project_root=self.root, package_root=self.package, **kwargs)
         run.refresh()
         return run

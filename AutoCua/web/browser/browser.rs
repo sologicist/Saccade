@@ -2874,6 +2874,8 @@ impl ScannerInner {
     }
 
     pub fn authorize_platform_action(&mut self, action: &Value) -> SResult<()> {
+        // URL-based skill/function activation does not install a scope. Normal
+        // Web actions keep their existing controller and ownership validation.
         let Some(scope) = self.platform_scope.as_ref() else { return Ok(()) };
         if let Err(message) = scope.validate_action(action) {
             return Err(self.platform_failure(message));
@@ -3152,9 +3154,14 @@ impl ScannerInner {
     /// tuning goes along as the overlay element.js merges over its own defaults
     /// (the same defaults as element.rs, so the merge gives this side's config).
     fn bridge_scan(&mut self) -> SResult<element::ScanOut> {
+        let follow_owned = !self.single_tab && self.platform_scope.is_none();
         let r = self.bridge_call(json!({
             "type": "scan", "overlay": self.cfg.clone(), "marks": self.marks, "screenshot": true,
+            "follow_owned_active":follow_owned,
         }))?;
+        if follow_owned {
+            if let Some(id) = r["tab_id"].as_u64().filter(|id|*id>0) { self.tab_id = Some(id.to_string()); }
+        }
         // A popup holds the tab (it opened just before or during the read): scan_core
         // shows it in place of the page.
         if r.get("dialog").is_some_and(|d| !d.is_null()) {
@@ -3804,7 +3811,7 @@ impl ScannerInner {
         self.check_platform_scope()?;
         #[cfg(test)]
         if self.business_test_observations.is_some() {
-            self.url = "https://app.dext.com/login".into();
+            if self.platform_scope.is_some() { self.url = "https://app.dext.com/login".into(); }
             self.tree_text = "<main><h1>Synthetic Dext fixture</h1><p>No customer records</p></main>".into();
             self.all_tabs = "[1] Synthetic Dext fixture: https://app.dext.com/login".into();
             self.cursor_enabled = false;
@@ -5327,7 +5334,7 @@ fn bridge_timeout(req: &Value) -> Duration {
         // The app's picture on a scraping step: tools.js gives up on it at 1.5 s.
         "frame" => 3.0,
         "blank_page" => 15.0,
-        "click" => 10.0 + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
+        "click" => (if req["observe_download"] == true { 20.0 } else { 10.0 }) + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
         "input" | "vault_input" => 15.0,
         _ => 10.0,
     };
