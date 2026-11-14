@@ -139,7 +139,7 @@ export function startIntro(root: HTMLElement): void {
     const LEAD = 3;
 
     // ---- geometry ------------------------------------------------------
-    const ASPECT = 520 / 720;     // the cropped bot images, width / height
+    const ASPECT = 1;             // Bloub avatars use a square SVG
     const lift = root.querySelector('.lift') as HTMLElement;
     const row = root.querySelector('.row') as HTMLElement;
     const side = root.querySelector('.side') as HTMLElement;
@@ -174,14 +174,13 @@ export function startIntro(root: HTMLElement): void {
         // ...and the team standing on the bottom edge (their lower third
         // fades out, so they rise out of it), the lead's head below the title.
         const feet = H;
-        const h = Math.min(0.36 * vmin, 0.23 * W, 280, feet - clear);  // the lead, at the end
+        const h = Math.min(0.36 * vmin, 0.15 * W, 240, feet - clear);  // the lead, at the end
         const w = h * ASPECT;
         // Atlas: 1.75x while big, pushed down a little, rising into place as
         // it shrinks. Pushed down further where it takes that for the big
         // lead's head to stay below the title. The width needs no check:
-        // while big only the lead shows (at most 0.37 W wide), and the lineup
-        // of seven fits (+-2.425 bot widths: g.h <= 0.23 W keeps it within
-        // 0.81 W).
+        // while big only the lead shows, and the square lineup of seven
+        // fits (+-2.425 bot widths, with g.h <= 0.15 W).
         const big = 1.75;
         const drop = Math.max(28, Math.round(H * 0.06), Math.ceil(clear + h * big - feet));
         return { titleTop: titleTop, feet: feet, h: h, w: w, big: big, drop: drop };

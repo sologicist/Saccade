@@ -1,0 +1,78 @@
+/* The legacy scripts retain their image hooks and travel animations. */
+body.saccade-bloub {
+    --reply-bot-w: var(--reply-bot-h);
+}
+
+.saccade-bloub-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    pointer-events: none;
+}
+
+.saccade-bloub-layer svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    overflow: visible;
+}
+
+body.saccade-bloub #splashOverlay .bot img,
+body.saccade-bloub #modeBot .mb-bot img,
+body.saccade-bloub #liveTurn > .chain-bot img,
+body.saccade-bloub .sub-bot img,
+body.saccade-bloub .cc-rbot img,
+body.saccade-bloub .cc-mbot > img {
+    visibility: hidden !important;
+}
+
+body.saccade-bloub #modeBot {
+    width: var(--mb-h);
+    margin-bottom: -2px;
+}
+
+body.saccade-bloub .chat-turn.live > .chain-bot {
+    aspect-ratio: 1;
+    width: var(--reply-bot-w);
+}
+
+body.saccade-bloub #splashOverlay .bot {
+    -webkit-mask-image: none;
+    mask-image: none;
+}
+
+.agent-container.show-reply > .saccade-bloub-layer,
+.coder-card .cc-line.cc-answer > .saccade-bloub-layer {
+    inset: auto;
+    top: -1px;
+    right: calc(100% + 1px + var(--reply-bot-gap));
+    width: var(--reply-bot-w);
+    height: var(--reply-bot-h);
+}
+
+/* Archived Computer runs keep their video above the reply. */
+.chat-turn:not(.no-screen) > .agent-container.show-reply > .saccade-bloub-layer {
+    top: calc(-1px - var(--reply-under-screen));
+}
+
+/* Also hide these during a hand-off when no replacement layer is mounted.
+   No :has() requirement: the desktop build still targets Safari 14. */
+body.saccade-bloub .agent-container.show-reply::before,
+body.saccade-bloub .coder-card .cc-line.cc-answer::before {
+    display: none;
+}
+
+/* Tool badges stay readable without covering Bloub's eyes or thinking dots. */
+body.saccade-bloub .coder-card.has-head .cc-mbot-face {
+    z-index: 2;
+    left: auto;
+    top: auto;
+    right: 4%;
+    bottom: 8%;
+    width: 28%;
+    height: 28%;
+    border-radius: 50%;
+    background: #fff;
+}

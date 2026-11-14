@@ -2,7 +2,8 @@
   "name": "saccade-ui",
   "private": true,
   "version": "0.1.0",
-  "description": "Saccade web interface — AI-powered browser automation and supervised business workflows",  "type": "module",
+  "description": "Saccade web interface — AI-powered browser automation and supervised business workflows",
+  "type": "module",
   "scripts": {
     "build": "vite build",
     "watch": "vite build --watch",
@@ -10,6 +11,7 @@
     "check": "npm run typecheck && npm run build"
   },
   "dependencies": {
+    "bloub-react": "^1.0.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },

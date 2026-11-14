@@ -11,6 +11,7 @@
 // cloned them, which cli_stage.js replaced, and it checks for them first.
 import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
+import { startSaccadeBloub } from './bloub/saccade_bloub.tsx';
 import { IntroAnimation } from './intro_animation.tsx';
 import { BigCenterContainer } from './container/big_center_container/big_center_container.tsx';
 import { UserContainer } from './container/user/user.tsx';
@@ -360,4 +361,5 @@ if (host) {
     flushSync(() => {
         createRoot(host).render(<App />);
     });
+    startSaccadeBloub();
 }
