@@ -140,6 +140,10 @@ export function startIntro(root: HTMLElement): void {
 
     // ---- geometry ------------------------------------------------------
     const ASPECT = 1;             // Bloub avatars use a square SVG
+    const CRISP_ZOOM = 
+        typeof CSS !== 'undefined' &&
+        CSS.supports('zoom', '1') &&
+        typeof CSS.registerProperty === 'function';
     const lift = root.querySelector('.lift') as HTMLElement;
     const row = root.querySelector('.row') as HTMLElement;
     const side = root.querySelector('.side') as HTMLElement;
@@ -201,7 +205,14 @@ export function startIntro(root: HTMLElement): void {
     function layout(): Geometry {
         const g = geometry(), B = g.big;
         row.style.height = (g.h * B) + 'px';
-        row.style.top = (g.feet - g.h * B) + 'px';
+
+        if (CRISP_ZOOM) {
+            row.style.top = 'auto';
+            row.style.bottom = '0';
+        } else {
+            row.style.top = (g.feet - g.h * B) + 'px';
+            row.style.bottom = 'auto';
+        }
         slots.forEach(function (s, i) {
             s.style.width = (g.w * B) + 'px';
             s.style.height = (g.h * B) + 'px';
@@ -228,7 +239,15 @@ export function startIntro(root: HTMLElement): void {
         const g = layout();
         lift.style.opacity = '1';
         side.style.opacity = '1';
-        row.style.transform = 'scale(' + (1 / g.big) + ')';
+        if (CRISP_ZOOM) {
+            row.style.transform = 'none';
+            row.style.setProperty(
+                '--saccade-intro-zoom',
+                String(1 / g.big)
+            );
+        } else {
+            row.style.transform = 'scale(' + (1 / g.big) + ')';
+        }
         slots.forEach(function (s, i) {
             s.style.transform = placed(g, i);
             (s.querySelector('.eyes') as HTMLElement).style.opacity = '1';
@@ -302,15 +321,43 @@ export function startIntro(root: HTMLElement): void {
         return (last.right - first.left) / 2 + 0.7 * parseFloat(getComputedStyle(sheen).fontSize);
     }
 
-    // The row's ONE transform animation: it grows from 0.85x (ease
-    // "settle"), holds, then shrinks to 1x around its feet (ease
-    // "inOutExpo"). It is laid out big, so 1x is scale(1/B).
     function rowFrames(B: number): Keyframe[] {
         const D = SHRINK_AT + SHRINK;
-        return [{ offset: 0, transform: 'scale(0.85)', easing: EASE_SETTLE },
-                { offset: GROW / D, transform: 'scale(1)' },
-                { offset: SHRINK_AT / D, transform: 'scale(1)', easing: EASE_EXPO },
-                { offset: 1, transform: 'scale(' + (1 / B) + ')' }];
+
+        const frames = [
+            {
+                offset: 0,
+                scale: 0.85,
+                easing: EASE_SETTLE
+            },
+            {
+                offset: GROW / D,
+                scale: 1
+            },
+            {
+                offset: SHRINK_AT / D,
+                scale: 1,
+                easing: EASE_EXPO
+            },
+            {
+                offset: 1,
+                scale: 1 / B
+            }
+        ];
+
+        return frames.map(({ scale, ...rest }) => {
+            if (CRISP_ZOOM) {
+                return {
+                    ...rest,
+                    '--saccade-intro-zoom': String(scale)
+                };
+            }
+
+            return {
+                ...rest,
+                transform: `scale(${scale})`
+            };
+        });
     }
 
     // A pair of eyes' ONE animation: they wake at `at` (open out of a line,
@@ -338,8 +385,6 @@ export function startIntro(root: HTMLElement): void {
         lift.animate([{ opacity: 0 }, { opacity: 1 }],
                      { delay: FIRST, duration: FADE, fill: 'both' });
         zoom = row.animate(rowFrames(B), { delay: FIRST, duration: SHRINK_AT + SHRINK, fill: 'both' });
-        row.animate([{ filter: 'blur(6px)' }, { filter: 'blur(0px)' }],
-                    { delay: FIRST, duration: GROW, easing: EASE_SETTLE, fill: 'backwards' });
         rise = lift.animate([{ transform: 'translateY(' + g.drop + 'px)' }, { transform: 'translateY(0px)' }],
                             { delay: FIRST + SHRINK_AT, duration: SHRINK, easing: EASE_EXPO, fill: 'both' });
         // ...while the others fan out from behind it into the lineup, fading

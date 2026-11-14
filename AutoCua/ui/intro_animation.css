@@ -76,11 +76,20 @@
   opacity: 0;
   pointer-events: none;
 }
+
+@property --saccade-intro-zoom {
+    syntax: "<number>";
+    inherits: false;
+    initial-value: 1;
+}
+
 .row {
   position: absolute;
   left: 0;
   right: 0;
   transform-origin: 50% 100%;   /* Atlas: grows and shrinks from its feet */
+  zoom: var(--saccade-intro-zoom);
+
 }
 /* The side bots fade in as ONE group, behind the lead: while they
    still overlap, the inner ones then hide the outer ones like solid
