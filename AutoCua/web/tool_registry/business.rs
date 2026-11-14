@@ -17,6 +17,19 @@ pub struct BusinessPermit {
 }
 
 impl BusinessGate {
+    pub fn checkpoint(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(self.run.bind(py).call_method0("download_checkpoint")?.unbind())
+    }
+    pub fn clear_download(&self, py: Python<'_>) -> PyResult<()> {
+        self.run.bind(py).call_method0("clear_download")?;
+        Ok(())
+    }
+    pub fn proposal_ready(&self, py: Python<'_>) -> PyResult<bool> {
+        self.run.bind(py).call_method0("proposal_ready")?.extract()
+    }
+    pub fn restore_download(&self, py: Python<'_>, saved: &Bound<'_,PyAny>) -> PyResult<bool> {
+        self.run.bind(py).call_method1("restore_download",(saved,))?.extract()
+    }
     pub fn configure_google(&self, py: Python<'_>, provider: &str, model: &str, key: Option<&str>) -> PyResult<()> {
         self.run.bind(py).call_method1("set_google_runtime",(provider,model,key))?;
         Ok(())

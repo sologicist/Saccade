@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .business_catalogue import PACKAGE_ROOT, catalogue, client_registration, model_tool
-from .business_contract import BusinessError, digest, dumps, loads, reject, validate
+from .business_contract import BusinessError, digest, dumps, loads, read_safe, reject, validate
 from .session_context import _validate_context
 
 
@@ -27,6 +27,7 @@ class BusinessRun:
         self._google_key = None
         self._current_download = None
         self._download_operation = None
+        self._completed_scribe = {}
         self.package_root = package_root
         self.project_root = Path(project_root) if project_root else package_root.parent
         self.data_root = self.project_root / "platforms/dext/data"
@@ -42,6 +43,43 @@ class BusinessRun:
         """Host-only application settings, never model-selected arguments."""
         self._google_model = model if provider == 'google' else None
         self._google_key = api_key if provider == 'google' else None
+
+    def download_checkpoint(self):
+        if not self._current_download or not all(self._current_download):
+            return None
+        return {'path':self._current_download[0],'sha256':self._current_download[1],
+                'operation':self._download_operation,'revision':self.snapshot()[0]['revision'],
+                'completed':self._completed_scribe}
+
+    def proposal_ready(self):
+        return bool(self._completed_scribe)
+
+    def restore_download(self, saved):
+        if not isinstance(saved,dict) or saved.get('revision') != self.snapshot()[0]['revision']:
+            return False
+        try:
+            self.begin_download(saved['operation'])
+            self.note_download(saved['path'],saved['operation'])
+            if self._current_download != (saved['path'],saved['sha256']):
+                self.invalidate_download(saved['operation'])
+                return False
+            completed = saved.get('completed',{})
+            if not isinstance(completed,dict) or len(completed)>1:
+                reject('invalid_browser_checkpoint')
+            for key,result in completed.items():
+                if not isinstance(key,str) or len(key)!=64 or any(c not in '0123456789abcdef' for c in key):
+                    reject('invalid_browser_checkpoint')
+                if (not isinstance(result,dict) or set(result)-{'status','tool','result','operator_review_required'}
+                    or result.get('status')!='success' or result.get('tool')!='call_function'):
+                    reject('invalid_browser_checkpoint')
+                validate(result['result'],self.snapshot()[0]['functions']['dext.scribe']['output_schema'])
+            self._completed_scribe = completed
+            return True
+        except (BusinessError,KeyError,TypeError):
+            self._current_download = None
+            self._download_operation = None
+            self._completed_scribe = {}
+            return False
 
     def snapshot(self):
         try:
@@ -90,6 +128,7 @@ class BusinessRun:
                 return
             self.download_since_ns = started_ns
             self._download_operation = started_ns
+            self._completed_scribe = {}
             self._current_download = None
             self._pending.clear()
             self._documents.clear()
@@ -102,6 +141,9 @@ class BusinessRun:
                 self._download_operation = None
                 self._pending.clear()
                 self._documents.clear()
+
+    def clear_download(self):
+        self.invalidate_download(self._download_operation)
 
     def refresh(self):
         """Called before every model decision, never after its chosen revision."""
@@ -179,6 +221,17 @@ class BusinessRun:
                 if current["revision"] != ticket["revision"]:
                     reject("business_revision_changed")
             model = 'offline-synthetic-v1'
+            if stop_event is not None and stop_event.is_set():
+                reject('worker_cancelled')
+            reference_name = None
+            reference_digest = None
+            if self.automatic and ticket['name']=='dext.scribe':
+                reference_name = 'comptable_achats.md' if ticket['arguments']['sens']=='achat' else 'comptable_ventes.md'
+                client_root = self.data_root/ticket['arguments']['client_id']
+                reference_digest = digest(['reference-present',digest(read_safe(client_root,client_root/reference_name,2*1024*1024))])
+            cache_key = digest([ticket['arguments'],ticket['revision'],self._documents.get(token),reference_digest])
+            if self.automatic and ticket['name']=='dext.scribe' and cache_key in self._completed_scribe:
+                return loads(dumps(self._completed_scribe[cache_key]))
             options = {}
             request = {"version": 1, "ticket": ticket, "context": self.context,
                        "project_root": str(self.project_root), "offline_receipts": self.offline_receipts,
@@ -207,6 +260,8 @@ class BusinessRun:
             result = {"status": "success", "tool": "call_function", "result": reply["result"]}
             if ticket["name"] == "dext.bank" and reply["result"]["compte"] is None or ticket["name"] == "dext.scribe" and reply["result"]["type"] != "devis" and not reply["result"]["ecriture"]:
                 result["operator_review_required"] = True
+            if self.automatic and ticket['name']=='dext.scribe' and reply['references'].get(reference_name)==reference_digest:
+                self._completed_scribe = {cache_key:loads(dumps(result))}
             return result
         except OSError:
             return {"status": "error", "tool": "call_function", "code": "worker_unavailable", "operator_review_required": True}

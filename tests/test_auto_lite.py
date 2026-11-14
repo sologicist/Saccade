@@ -121,6 +121,51 @@ class AutoLite(unittest.TestCase):
             with self.assertRaisesRegex(BusinessError,'accounting_provider_key_missing'):
                 GeminiAccountingProvider().complete([], '')
 
+    def test_browser_checkpoint_restores_only_exact_pdf_and_active_client_revision(self):
+        f=self.fixture; since=time.time_ns()
+        path=f.root/'Resume.pdf';path.write_bytes(b'%PDF-1.4 requested %%EOF')
+        run=BusinessRun(f.context,project_root=f.root,downloads_dir=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path)
+        saved=run.download_checkpoint()
+        resumed=BusinessRun(f.context,project_root=f.root)
+        self.assertTrue(resumed.restore_download(saved))
+        resumed.refresh()
+        action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
+        self.assertEqual(resumed.prepare(action)['arguments']['pdf'],str(path))
+        path.write_bytes(b'%PDF-1.4 replaced %%EOF')
+        self.assertFalse(BusinessRun(f.context,project_root=f.root).restore_download(saved))
+        f.registration['active_client']='synthetic-other';f.write_registration()
+        self.assertFalse(BusinessRun(f.context,project_root=f.root).restore_download(saved))
+
+    def test_completed_scribe_is_reused_in_same_chat_but_reference_changes_require_analysis(self):
+        from AutoCua.saccade.business_worker import execute
+        from AutoCua.saccade.accounting_provider import GeminiAccountingProvider
+        f=self.fixture; since=time.time_ns()
+        path=f.root/'Current.pdf';path.write_bytes(b'%PDF-1.4 requested %%EOF')
+        run=BusinessRun(f.context,project_root=f.root,download_since_ns=since)
+        self.chrome_confirms(run,path); run.refresh()
+        action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
+        raw=f.invoice()['fixture-one']['expected']
+        def worker(request,**options): return execute(request)
+        with patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-key'})),patch('AutoCua.saccade.business_process.run_worker',side_effect=worker) as dispatch,patch.object(GeminiAccountingProvider,'scribe',return_value=raw) as provider:
+            result=run.execute(run.prepare(action))
+            self.assertEqual(result['status'],'success',result)
+            resumed=BusinessRun(f.context,project_root=f.root)
+            self.assertTrue(resumed.restore_download(run.download_checkpoint()))
+            resumed.refresh()
+            self.assertEqual(resumed.execute(resumed.prepare(action)),result)
+            self.assertEqual(dispatch.call_count,1)
+            self.assertEqual(provider.call_count,1)
+            import threading
+            cancelled=threading.Event();cancelled.set()
+            resumed.refresh()
+            self.assertEqual(resumed.execute(resumed.prepare(action),cancelled)['status'],'stopped')
+            self.assertEqual(provider.call_count,1)
+            (f.data/'synthetic-alpha/comptable_achats.md').write_text('Updated complete reference',encoding='utf8')
+            resumed.refresh()
+            self.assertEqual(resumed.execute(resumed.prepare(action))['status'],'success')
+            self.assertEqual(provider.call_count,2)
+
     def test_automatic_scribe_requires_the_exact_current_chrome_confirmation(self):
         f=self.fixture; since=time.time_ns()
         confirmed=f.root/'Invoice (1).pdf'; other=f.root/'Invoice.pdf'

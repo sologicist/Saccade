@@ -1,5 +1,16 @@
 # Dext operations
 
+For an explicitly requested invoice analysis, execute this sequence:
+download once -> wait for trusted confirmation -> call Scribe -> show its result -> stop.
+Read the current trusted download status in call_function's description and tool
+results. If pending, use wait and observe again, without another download click.
+When complete, pass the exact reported filename to call_function, version 1,
+name dext.scribe, arguments pdf, the active registered client_id, sens achat/vente
+(string is null). The host resolves the absolute path. Invoke this native tool;
+do not search GitHub, other chats, chrome://downloads or the console for Scribe.
+For unconfirmed or failed downloads, report the exact state and stop that attempt.
+Saving/printing dialogs, filenames and chat claims cannot prove a completed PDF.
+
 Use the existing Web screenshot, DOM and native navigation tools. Identify the
 current client explicitly from operator registration and the observed UI; the
 hostname identifies Dext, never the accounting client. Do not silently switch

@@ -2338,7 +2338,9 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         if run_pkg == 'web':
             # Website identity is observed by the native Web agent, not chat metadata.
             # Historical PR3 bindings remain readable but never control this run.
-            browser_profile = data.get('browser_profile')
+            from AutoCua.saccade.web_session import WebSession
+            web_session = WebSession(conversation,chat_session_id,task)
+            browser_profile = web_session.profile() or data.get('browser_profile')
             profile_lease = acquire_web_profile(browser_profile)
 
         token_tracker = MemoryTracker(initial_context=_sess.get("context_tokens", 0))
@@ -2541,7 +2543,7 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                     prior_history=prior_history,   # None for a fresh chat
                     speed=speed,                   # ⚡ fast / ✨ quality (all platforms)
                     **({'platform_context': platform_context, 'browser_profile': browser_profile,
-                        'profile_lease': profile_lease} if run_pkg == 'web' else {}),
+                        'profile_lease': profile_lease, 'web_session':web_session} if run_pkg == 'web' else {}),
                     **daisy,
                 )
                 # The page shows the phone in the iOS agent's box: no phone window

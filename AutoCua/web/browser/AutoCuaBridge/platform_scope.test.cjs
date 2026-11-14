@@ -366,6 +366,16 @@ test('regular clicks have a short bounded grace and never poll download history'
   assert.deepEqual(f.queries,[]);
 });
 
+test('Blob downloads report the unsupported source mechanism without guessing a PDF path',async()=>{
+  const f=downloadFixture();
+  f.press=async()=>{await f.created(f.item({url:'blob:https://app.dext.com/synthetic',finalUrl:'blob:https://app.dext.com/synthetic'}));};
+  const result=await f.click();
+  assert.equal(result.download.state,'source_unverified');
+  assert.equal(result.download.mechanism,'blob_url');
+  assert.equal(result.download.reason,'no_verifiable_http_source');
+  assert.equal(result.download.absolute_path,undefined);
+});
+
 test('late creation and incomplete downloads complete on status without another click',async()=>{
   const f=downloadFixture();
   assert.equal((await f.click()).download.state,'not_observed');

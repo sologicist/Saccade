@@ -233,7 +233,12 @@ async function toolsDownloadStatus(line, operation, tabId) {
     request.urls.has(initial) && request.urls.has(final));
   // A unique request chain must belong to the clicked tab. Another tab making
   // the same request, even with the same referrer, is not sufficient evidence.
-  if (matches.length !== 1 || matches[0].tabId !== tabId || !matches[0].eligible) return result('source_unverified');
+  if (matches.length !== 1 || matches[0].tabId !== tabId || !matches[0].eligible) {
+    const mechanism = /^blob:/i.test(row.url) ? 'blob_url' : /^data:/i.test(row.url) ? 'data_url' : 'http_or_unknown';
+    const reason = !initial || !final ? 'no_verifiable_http_source' : matches.length > 1 ? 'ambiguous_request_chain' :
+      !matches.length ? 'request_chain_unobserved' : matches[0].tabId !== tabId ? 'request_from_another_tab' : 'request_outside_action_window';
+    return { ...result('source_unverified'), mechanism, reason };
+  }
   if (row.state === 'interrupted') return result('interrupted');
   if (row.state !== 'complete') {
     return { ...result(Date.now() > observation.expires ? 'incomplete' : 'in_progress'),

@@ -253,6 +253,31 @@ class LauncherProfileContracts(unittest.TestCase):
 
 
 class PlatformSessionAPI(SessionFixtures):
+    def test_explicit_dext_task_acquires_dedicated_profile_and_releases_it(self):
+        response=self.post(task='Open Dext and analyze the requested invoice')
+        self.assertEqual(response.status_code,200,response.json)
+        self.finish_run()
+        self.assertEqual(self.created[-1].kwargs['browser_profile'],'saccade-dext')
+        self.assertIsNone(self.created[-1].kwargs['platform_context'])
+        held=self.acquire('saccade-dext')
+        held.release()
+
+    def test_dext_busy_profile_is_not_replaced_with_personal_chrome(self):
+        self.acquire('saccade-dext')
+        response=self.post(task='Open Dext')
+        self.assertEqual(response.status_code,409,response.json)
+        self.assertFalse(self.created)
+
+    def test_same_chat_followup_keeps_dedicated_profile_without_a_selector(self):
+        response=self.post(task='Open Dext')
+        self.finish_run()
+        session=self.created[-1].kwargs['web_session']
+        session.save('7','https://app.dext.com/synthetic-invoice')
+        resumed=self.post(session_id=response.json['session_id'],task='Call Scribe on this invoice')
+        self.assertEqual(resumed.status_code,200,resumed.json)
+        self.finish_run()
+        self.assertEqual(self.created[-1].kwargs['browser_profile'],'saccade-dext')
+
     def setUp(self):
         super().setUp()
         try:
