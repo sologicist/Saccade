@@ -22,6 +22,9 @@
 # client — Vertex AI keeps the bare model ID rather than renaming it — so
 # api_name is intentionally duplicated across each pair. Only `vertex`
 # differs, which is what picks the client in service.py.
+# Shared API-key default when no compatible Google selection was saved.
+DEFAULT_MODEL = "gemini-4-argon"
+
 MODEL_MAPPINGS = {
     "gemini-4-argon": {
         "api_name": "gemini-4-argon",

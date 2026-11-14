@@ -65,9 +65,7 @@ from AutoCua import data_extraction
 
 # Resumable chat memory + per-chat token tracker. Platform-agnostic, pure-stdlib.
 from AutoCua.agent_conversation.service import conversation
-from AutoCua.saccade.session_context import (
-    UNBOUND, SessionContextError, resolve_platform_context, validate_session_settings,
-)
+from AutoCua.saccade.session_context import SessionContextError
 from AutoCua.saccade.profile_lease import ProfileBusyError, acquire_web_profile
 from AutoCua.memory_compression.memory_tracker import MemoryTracker
 
@@ -2293,8 +2291,6 @@ def _start_agent_run_locked(data, via=None, hooks=None):
                    else 'android' if (agent_mode == 'mobile' and device_os == 'android')
                    else 'web' if agent_mode == 'web'
                    else PLATFORM_PKG)
-        if run_pkg != 'web' and data.get('platform_id') not in (None, ''):
-            raise SessionContextError("A platform can only be selected for Web use.")
         # Every Computer use run is recorded, on a machine that can (not Web use
         # or iOS: their screen box goes once the task is done).
         record = agent_mode == 'computer' and run_recorder.supported()
@@ -2340,25 +2336,10 @@ def _start_agent_run_locked(data, via=None, hooks=None):
         platform_context = None
         browser_profile = None
         if run_pkg == 'web':
-            bound, saved_context = conversation.get_platform_binding(chat_session_id)
-            # Existing unbound chats predate platform sessions and are generic.
-            resumed = req_session_id not in (None, 'new') and str(req_session_id) == chat_session_id
-            if not bound and not resumed:
-                saved_context = UNBOUND
-            platform_context = resolve_platform_context(data, saved_context=saved_context)
-            browser_profile = (platform_context['browser_profile'] if platform_context
-                               else data.get('browser_profile'))
-            if platform_context:
-                if 'browser_profile' in data and data['browser_profile'] != browser_profile:
-                    raise SessionContextError("Platform sessions require their dedicated Chrome profile.")
-                if data.get('browser_port') is not None or data.get('single_tab'):
-                    raise SessionContextError("Platform sessions do not support browser side channels or parallel tabs.")
-                validate_session_settings(
-                    platform_context, provider, model, data.get('speed', 'quality'),
-                    data.get('headless', False), browser_profile,
-                )
+            # Website identity is observed by the native Web agent, not chat metadata.
+            # Historical PR3 bindings remain readable but never control this run.
+            browser_profile = data.get('browser_profile')
             profile_lease = acquire_web_profile(browser_profile)
-            conversation.bind_platform_context(chat_session_id, platform_context)
 
         token_tracker = MemoryTracker(initial_context=_sess.get("context_tokens", 0))
 

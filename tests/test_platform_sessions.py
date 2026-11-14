@@ -170,8 +170,7 @@ class PlatformSessionContracts(SessionFixtures):
             self.conversation.bind_platform_context(sid, self.context())
         path = self.conversation._session_dir(sid) / "platform_session.json"
         path.write_text('{"schema_version":2,"platform_context":null}', encoding="utf-8")
-        with self.assertRaises(session_context.SessionContextError):
-            self.conversation.get_session(sid)
+        self.assertIsNone(self.conversation.get_session(sid)['platform_context'])
         self.assertIn("platform_context_error", self.conversation.list_sessions()[0])
 
     def test_missing_binding_cannot_downgrade_a_saved_scoped_chat(self):
@@ -181,8 +180,7 @@ class PlatformSessionContracts(SessionFixtures):
         (self.conversation._session_dir(sid) / "platform_session.json").unlink()
         with self.assertRaises(session_context.SessionConflictError):
             self.conversation.get_platform_binding(sid)
-        with self.assertRaises(session_context.SessionConflictError):
-            self.conversation.get_session(sid)
+        self.assertIsNone(self.conversation.get_session(sid)['platform_context'])
         # Even if the expendable sidebar index is lost, saved history keeps the
         # binding marker and cannot be replayed with an unrestricted context.
         self.conversation._index_file().unlink()
@@ -333,43 +331,34 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertEqual(response.json["platforms"][0]["name"], "Synthetic Dext")
         self.assertNotIn("procedure", response.json["platforms"][0])
 
-    def test_valid_selection_binds_launch_and_restores_context(self):
+    def test_legacy_selection_does_not_bind_generic_web_or_force_a_profile(self):
         response = self.post(platform_id="dext")
-        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.status_code,200,response.json)
         self.finish_run()
-        self.assertEqual(response.json["platform_context"], self.context())
-        self.assertEqual(self.created[0].kwargs["browser_profile"], "saccade-dext")
-        self.assertEqual(self.created[0].kwargs["platform_context"], self.context())
-        sid = response.json["session_id"]
-        reopened = self.client.get(f"/api/chats/{sid}", headers=self.headers, base_url=self.base_url)
-        self.assertEqual(reopened.status_code, 200, reopened.json)
-        self.assertEqual(reopened.json["platform_context"], self.context())
-        resumed = self.post(session_id=sid)
-        self.assertEqual(resumed.status_code, 200, resumed.json)
+        self.assertIsNone(response.json['platform_context'])
+        self.assertIsNone(self.created[0].kwargs['platform_context'])
+        self.assertIsNone(self.created[0].kwargs['browser_profile'])
+        sid=response.json['session_id']
+        self.assertEqual(self.client.get(f'/api/chats/{sid}',headers=self.headers,base_url=self.base_url).status_code,200)
+        resumed=self.post(session_id=sid)
+        self.assertEqual(resumed.status_code,200,resumed.json)
         self.finish_run()
-        self.assertEqual(resumed.json["platform_context"], self.context())
-        self.assertIsNotNone(self.created[-1].kwargs["prior_history"])
+        self.assertIsNotNone(self.created[-1].kwargs['prior_history'])
 
-    def test_generic_mode_remains_available_and_explicit_switch_is_rejected(self):
-        response = self.post()
-        self.assertEqual(response.status_code, 200, response.json)
+    def test_generic_web_ignores_obsolete_platform_requests_on_resume(self):
+        response=self.post()
         self.finish_run()
-        self.assertIsNone(response.json["platform_context"])
-        changed = self.post(session_id=response.json["session_id"], platform_id="dext")
-        self.assertEqual(changed.status_code, 409, changed.json)
+        changed=self.post(session_id=response.json['session_id'],platform_id='dext')
+        self.assertEqual(changed.status_code,200,changed.json)
+        self.finish_run()
+        self.assertIsNone(changed.json['platform_context'])
 
-    def test_invalid_selection_and_unsupported_settings_are_rejected_before_agent_creation(self):
-        for changes in ({"platform_id": "unknown"}, {"platform_id": "../dext"},
-                        {"platform_id": ["dext"]}, {"platform_id": "dext", "mode": "computer"},
-                        {"platform_id": "dext", "speed": "fast"},
-                        {"platform_id": "dext", "headless": True},
-                        {"platform_id": "dext", "browser_profile": "other"},
-                        {"platform_id": "dext", "browser_port": 9222}):
-            with self.subTest(changes=changes):
-                response = self.post(**changes)
-                self.assertEqual(response.status_code, 400, response.json)
-                self.assertIn("error", response.json)
-        self.assertEqual(self.created, [])
+    def test_obsolete_selection_fields_cannot_control_web_execution(self):
+        for platform in ('unknown','../dext',['dext']):
+            response=self.post(platform_id=platform,execution_mode='auto')
+            self.assertEqual(response.status_code,200,response.json)
+            self.finish_run()
+            self.assertIsNone(self.created[-1].kwargs['platform_context'])
 
     def test_concurrent_start_returns_busy_without_replacing_the_first_run(self):
         self.release.clear()
@@ -385,25 +374,28 @@ class PlatformSessionAPI(SessionFixtures):
         self.assertIs(self.service.active_agent_stop_event, stop_event)
         self.assertEqual(len(self.created), 1)
 
-    def test_corrupt_persisted_scope_returns_error_instead_of_generic_resume(self):
-        response = self.post(platform_id="dext")
+    def test_corrupt_legacy_selection_does_not_break_history_or_generic_resume(self):
+        response=self.post()
         self.finish_run()
-        sid = response.json["session_id"]
-        (self.conversation._session_dir(sid) / "platform_session.json").write_text("{}", encoding="utf-8")
-        reopened = self.client.get(f"/api/chats/{sid}", headers=self.headers, base_url=self.base_url)
-        self.assertEqual(reopened.status_code, 409, reopened.json)
-        resumed = self.post(session_id=sid)
-        self.assertEqual(resumed.status_code, 409, resumed.json)
+        sid=response.json['session_id']
+        (self.conversation._session_dir(sid)/'platform_session.json').write_text('{}',encoding='utf8')
+        reopened=self.client.get(f'/api/chats/{sid}',headers=self.headers,base_url=self.base_url)
+        self.assertEqual(reopened.status_code,200,reopened.json)
+        resumed=self.post(session_id=sid)
+        self.assertEqual(resumed.status_code,200,resumed.json)
+        self.finish_run()
+        self.assertIsNone(resumed.json['platform_context'])
 
-    def test_missing_persisted_scope_requires_operator_review(self):
-        response = self.post(platform_id="dext")
+    def test_historical_bound_chat_can_resume_without_manual_platform_state(self):
+        response=self.post()
         self.finish_run()
-        sid = response.json["session_id"]
-        (self.conversation._session_dir(sid) / "platform_session.json").unlink()
-        reopened = self.client.get(f"/api/chats/{sid}", headers=self.headers, base_url=self.base_url)
-        self.assertEqual(reopened.status_code, 409, reopened.json)
-        resumed = self.post(session_id=sid)
-        self.assertEqual(resumed.status_code, 409, resumed.json)
+        sid=response.json['session_id']
+        self.conversation.bind_platform_context(sid,self.context())
+        (self.conversation._session_dir(sid)/'platform_session.json').unlink()
+        resumed=self.post(session_id=sid)
+        self.assertEqual(resumed.status_code,200,resumed.json)
+        self.finish_run()
+        self.assertIsNone(resumed.json['platform_context'])
 
     def test_another_profile_cannot_replace_an_active_ui_run(self):
         self.release.clear()

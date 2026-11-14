@@ -1,8 +1,4 @@
-"""Synthetic accounting boundary; no network provider or customer disclosure.
-
-The fake provider is explicitly registered by the operator. It does not implement
-accounting inference. Real provider calls are external effects and unavailable.
-"""
+"""Trusted accounting context: complete client references and explicit provider."""
 
 from __future__ import annotations
 
@@ -34,18 +30,25 @@ class SyntheticAccountingProvider:
 
 
 class AccountingContext:
-    def __init__(self, root, clients, *, provider=None, model="offline-synthetic-v1", offline_receipts=None):
-        if model != "offline-synthetic-v1":
-            reject("external_provider_consent_required")
+    def __init__(self, root, clients, *, provider=None, model="offline-synthetic-v1", offline_receipts=None, automatic=False, downloads_dir=None, expected_pdf=None):
+        if not automatic and model != "offline-synthetic-v1":
+            reject("unsupported_offline_model")
+        self.automatic, self.downloads_dir = automatic, downloads_dir
+        self.expected_pdf = expected_pdf
+        if automatic:
+            from ....accounting_provider import GeminiAccountingProvider
+            provider = provider or GeminiAccountingProvider(model)
         self.root, self.clients = root, clients
         self.provider = provider or SyntheticAccountingProvider(clients)
         self.offline_receipts = offline_receipts or {}
         self.references = {}
 
     def reference(self, client_id, name, *, optional=False):
+        if name not in ('comptable_achats.md','comptable_ventes.md','comptable_banque.md'):
+            reject('unauthorized_reference_type')
         if client_id not in self.clients:
             reject("unauthorized_client")
-        if self.clients[client_id].get("synthetic") is not True:
+        if not self.automatic and self.clients[client_id].get("synthetic") is not True:
             reject("real_client_privacy_gate_closed")
         path = self.root / client_id / name
         if optional:
@@ -69,7 +72,7 @@ class AccountingContext:
     def bank(self, label, client_id):
         if type(label) is not str or not label.strip() or len(label) > 1000:
             reject("invalid_bank_label")
-        if label not in self.clients.get(client_id, {}).get("bank_labels", []):
+        if not self.automatic and label not in self.clients.get(client_id, {}).get("bank_labels", []):
             reject("operator_argument_required")
         markdown = self.reference(client_id, "comptable_banque.md")
         result = self.provider.bank(label, markdown, client_id)
@@ -85,13 +88,22 @@ class AccountingContext:
     def scribe(self, fixture_id, client_id, sens):
         if sens not in ("achat", "vente"):
             reject("invalid_invoice_direction")
+        if self.automatic:
+            from ....downloaded_pdf import resolve_download
+            from .invoice_validation import analysis
+            absolute, pdf = resolve_download(fixture_id,folder=self.downloads_dir)
+            if self.expected_pdf is not None and self.expected_pdf != (absolute,digest(pdf)):
+                reject('download_file_changed')
+            markdown = self.reference(client_id, "comptable_achats.md" if sens == "achat" else "comptable_ventes.md")
+            raw = self.provider.scribe(pdf,markdown,'',{'client_id':client_id,'sens':sens})
+            return analysis(raw,sens,has_description_rule=True)
         receipt = self.offline_receipts.get(fixture_id)
         if not receipt or receipt.get("client_id") != client_id or receipt.get("sens") != sens:
             reject("verified_download_receipt_required")
         if type(receipt.get("critical")) is not dict or set(receipt["critical"]) != {"type", "piece", "journal", "accounts"}:
             reject("verified_download_receipt_required")
         markdown = self.reference(client_id, "comptable_achats.md" if sens == "achat" else "comptable_ventes.md")
-        description = self.reference(client_id, "comptable.md", optional=True).strip()
+        description = ""
         path = self.root / receipt["relative_path"]
         if path.suffix.lower() != ".pdf":
             reject("offline_fixture_identity_mismatch")

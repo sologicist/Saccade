@@ -146,12 +146,11 @@
                 // don't repaint their new view.
                 if (seq !== openSeq || window.currentSessionId !== id) return;
                 if (!data || data.error) {
-                    document.dispatchEvent(new CustomEvent('platformsession:error'));
+                    var status = document.getElementById('agentText');
+                    if (status) status.textContent = 'Could not load this conversation.';
                     return;
                 }
-                document.dispatchEvent(new CustomEvent('platformsession:restore', {
-                    detail: { context: data.platform_context || null, bound: true, busy: running }
-                }));
+
                 // Full life of the chat: request/outcome pairs (exchanges.json).
                 var exchanges = Array.isArray(data.exchanges) ? data.exchanges : [];
                 // A SHELL chat renders its history in the CLI stage's own notes
@@ -225,7 +224,8 @@
             })
             .catch(function () {
                 if (seq === openSeq && window.currentSessionId === id) {
-                    document.dispatchEvent(new CustomEvent('platformsession:error'));
+                    var status = document.getElementById('agentText');
+                    if (status) status.textContent = 'Could not load this conversation.';
                 }
             });
     }

@@ -397,12 +397,12 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
                 catalogue("dext", package_root=self.fixture.package)
         path.write_bytes(original)
 
-    def test_external_accounting_model_is_denied_before_worker(self):
+    def test_explicit_offline_fixture_does_not_resolve_live_provider_settings(self):
         run = self.fixture.run()
         ticket = run.prepare(self.fixture.action())
-        with patch.dict("os.environ", {"COMPTABLE_LLM_MODEL": "gemini/unapproved"}), patch("AutoCua.saccade.business_process.run_worker") as worker:
-            self.assertEqual(run.execute(ticket)["code"], "external_provider_consent_required")
-            worker.assert_not_called()
+        with patch('AutoCua.saccade.accounting_provider.settings') as settings:
+            self.assertEqual(run.execute(ticket)['status'],'success')
+            settings.assert_not_called()
 
     def test_worker_executes_fingerprinted_source_instead_of_stale_bytecode(self):
         import py_compile
@@ -417,11 +417,13 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
     def test_absent_reference_revision_cannot_alias_present_content(self):
         clients, _ = client_registration(self.fixture.data)
         context = AccountingContext(self.fixture.data, clients)
-        context.reference("synthetic-alpha", "comptable.md", optional=True)
-        absent = context.references["comptable.md"]
-        (self.fixture.data / "synthetic-alpha/comptable.md").write_bytes(b"absent")
-        context.reference("synthetic-alpha", "comptable.md", optional=True)
-        self.assertNotEqual(context.references["comptable.md"], absent)
+        path = self.fixture.data / "synthetic-alpha/comptable_ventes.md"
+        path.unlink()  # Disposable synthetic fixture only.
+        context.reference("synthetic-alpha", "comptable_ventes.md", optional=True)
+        absent = context.references["comptable_ventes.md"]
+        path.write_bytes(b"New synthetic sales rule")
+        context.reference("synthetic-alpha", "comptable_ventes.md", optional=True)
+        self.assertNotEqual(context.references["comptable_ventes.md"], absent)
 
 
 if __name__ == "__main__":

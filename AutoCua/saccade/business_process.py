@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from .business_contract import MAX_OUTPUT, dumps, loads, reject
 
@@ -75,19 +76,32 @@ class WindowsJob:
             self.handle = None
 
 
-def run_worker(request, *, package_root, stop_event=None, timeout=10.0, output_limit=MAX_OUTPUT):
+def run_worker(request, *, package_root, stop_event=None, timeout=10.0, output_limit=MAX_OUTPUT, provider_environment=None):
     deadline = time.monotonic() + timeout
     from AutoCua import IS_COMPILED
+    interpreter = sys.executable
     if IS_COMPILED:
-        reject("worker_python_runtime_required")
+        interpreter = os.environ.get('SACCADE_WORKER_PYTHON', '')
+        if not interpreter:
+            reject("worker_python_runtime_required")
+        runtime = Path(interpreter)
+        if not runtime.is_absolute() or runtime.is_symlink() or not runtime.is_file():
+            reject('worker_python_runtime_invalid')
     payload = dumps(request, 131_072).encode()
     if stop_event is not None and stop_event.is_set():
         reject("worker_cancelled")
     # -I excludes cwd/PYTHONPATH/user-site. Only the verified installed package
     # root is added; no model argument can choose it. No credentials are inherited.
     environment = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+    if provider_environment is not None:
+        if set(provider_environment) - {'GOOGLE_API_KEY'}:
+            reject('invalid_provider_environment')
+        environment.update(provider_environment)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    process = subprocess.Popen([sys.executable, "-I", "-B", "-c", WORKER_BOOTSTRAP, str(package_root.parent)],
+    # The shared provider imports dotenv, but this isolated child must use only
+    # the credential already resolved by the trusted host, not reload .env.
+    environment["PYTHON_DOTENV_DISABLED"] = "1"
+    process = subprocess.Popen([interpreter, "-I", "-B", "-c", WORKER_BOOTSTRAP, str(package_root.parent)],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                cwd=str(package_root.parent), env=environment, close_fds=True,
                                creationflags=0x08000000 if os.name == "nt" else 0,

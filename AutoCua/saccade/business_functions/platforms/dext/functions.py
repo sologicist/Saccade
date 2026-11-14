@@ -43,5 +43,5 @@ def bank(string: Annotated[str, {"minLength": 1, "maxLength": 1000, "pattern": r
 
 
 def scribe(pdf: str, client_id: str, sens: Literal["achat", "vente"]) -> InvoiceProposal:
-    """Validate an offline invoice proposal; pdf is a fixture ID, never a path."""
+    """Analyze an actual downloaded PDF absolute path using the active client reference."""
     return current().scribe(pdf, client_id, sens)

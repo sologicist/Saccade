@@ -138,6 +138,141 @@ function toolsNotice(text, tabId) {
 
 const toolsSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Download observation only: Chrome still owns downloading, destinations and
+// policy. Keep one bounded metadata observation on the existing agent line.
+// DownloadItem has no tabId; referrer or a filename alone cannot bind a file.
+const TOOLS_DOWNLOAD_GRACE_MS = 100;
+const TOOLS_DOWNLOAD_REQUEST_MS = 2000;
+const TOOLS_DOWNLOAD_COMPLETE_MS = 120000;
+const TOOLS_DOWNLOAD_REQUEST_LIMIT = 128;
+
+function toolsDownloadUrl(raw) {
+  try {
+    const url = new URL(raw);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return null;
+    url.hash = '';
+    return url.href;
+  } catch (_) { return null; }
+}
+
+function toolsDownloadObservations() {
+  return [...new Set(toolsOurs.values())].map(line => [line, line.downloadObservation])
+    .filter(([line, observation]) => observation && !toolsLettingGo.has(line) &&
+      !line.platformScope && !line.platformScopeEnding && toolsOurs.get(observation.tabId) === line);
+}
+
+function toolsDownloadRequest(details, phase = 'start') {
+  for (const [, observation] of toolsDownloadObservations()) {
+    if (observation.failure || Date.now() > observation.expires) continue;
+    const key = `${details.tabId}:${details.requestId}`;
+    let request = observation.requests.get(key);
+    if (!request) {
+      if (!Number.isFinite(details.timeStamp) || details.timeStamp < observation.started ||
+          details.timeStamp > (observation.createdAt || observation.expires)) continue;
+      if (observation.requests.size >= TOOLS_DOWNLOAD_REQUEST_LIMIT) {
+        observation.failure = 'observation_overflow';
+        continue;
+      }
+      request = { tabId: details.tabId, urls: new Set(), eligible: phase === 'start' &&
+        details.timeStamp <= observation.started + TOOLS_DOWNLOAD_REQUEST_MS };
+      observation.requests.set(key, request);
+    }
+    for (const raw of [details.url, details.redirectUrl]) {
+      const url = toolsDownloadUrl(raw);
+      if (url) request.urls.add(url);
+    }
+    if (request.urls.size > 16) observation.failure = 'observation_overflow';
+  }
+}
+
+chrome.webRequest?.onBeforeRequest?.addListener(details => toolsDownloadRequest(details), { urls: ['<all_urls>'] });
+chrome.webRequest?.onBeforeRedirect?.addListener(details => toolsDownloadRequest(details, 'redirect'), { urls: ['<all_urls>'] });
+// This also disambiguates requests already in flight when the click occurred.
+// No headers or response bodies are requested or retained.
+chrome.webRequest?.onHeadersReceived?.addListener(details => toolsDownloadRequest(details, 'response'), { urls: ['<all_urls>'] });
+chrome.downloads?.onCreated?.addListener(item => {
+  for (const [, observation] of toolsDownloadObservations()) {
+    const started = Date.parse(item.startTime);
+    if (!Number.isSafeInteger(item.id) || !Number.isFinite(started) || started < observation.started ||
+        started > observation.expires || Date.now() > observation.expires) continue;
+    observation.ids.add(item.id);
+    observation.createdAt ||= Date.now();
+    if (observation.ids.size > 2) observation.failure = 'ambiguous';
+  }
+});
+
+async function toolsDownloadStatus(line, operation, tabId) {
+  const observation = line.downloadObservation;
+  if (!observation || observation.operation !== operation || observation.tabId !== tabId ||
+      toolsOurs.get(tabId) !== line || line.platformScope || line.platformScopeEnding ||
+      toolsStoppedByPerson || toolsLettingGo.has(line)) {
+    return { state: 'observation_unavailable', operation };
+  }
+  const result = state => ({ state, operation,
+    ...(state === 'not_observed' ? { message: 'No download event observed yet. If a file was expected, wait for status; do not repeat the click.' } : {}),
+    ...(state === 'unconfirmed' ? { message: 'No completed, correlated Chrome download is available. Do not claim success or repeat the unchanged operation.' } : {}) });
+  if (observation.failure) return result(observation.failure);
+  if (observation.ids.size > 1) return result('ambiguous');
+  if (!observation.ids.size) {
+    return result(Date.now() > observation.expires ? 'unconfirmed' : 'not_observed');
+  }
+  // Query only the ID delivered by a fresh Chrome onCreated event. Never pick
+  // a recent history filename or infer a location from a suggested filename.
+  let rows, timer;
+  try {
+    rows = await Promise.race([chrome.downloads.search({ id: [...observation.ids][0] }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('download lookup timeout')),500); })]);
+  } catch (_) { return result('observation_unavailable'); }
+  finally { clearTimeout(timer); }
+  if (rows.length !== 1) return result('unconfirmed');
+  const row = rows[0], started = Date.parse(row.startTime);
+  if (row.id !== [...observation.ids][0] || !Number.isFinite(started) ||
+      started < observation.started || started > observation.expires) return result('source_unverified');
+  const initial = toolsDownloadUrl(row.url), final = toolsDownloadUrl(row.finalUrl || row.url);
+  const matches = [...observation.requests.values()].filter(request => initial && final &&
+    request.urls.has(initial) && request.urls.has(final));
+  // A unique request chain must belong to the clicked tab. Another tab making
+  // the same request, even with the same referrer, is not sufficient evidence.
+  if (matches.length !== 1 || matches[0].tabId !== tabId || !matches[0].eligible) return result('source_unverified');
+  if (row.state === 'interrupted') return result('interrupted');
+  if (row.state !== 'complete') {
+    return { ...result(Date.now() > observation.expires ? 'incomplete' : 'in_progress'),
+      message: Date.now() > observation.expires
+        ? 'Chrome did not complete this download within the observation window. Do not claim success or repeat the unchanged operation.'
+        : 'Chrome has not completed this download. Wait for its status; do not repeat the click.' };
+  }
+  if (row.exists !== true || !(row.fileSize > 0) || typeof row.filename !== 'string' || !row.filename) {
+    return result('file_unavailable');
+  }
+  // Recheck after the asynchronous lookup: a second event or a new operation
+  // must not turn a now-ambiguous/stale observation into a successful result.
+  if (line.downloadObservation !== observation || observation.ids.size !== 1 || observation.failure) {
+    return result(observation.failure || 'ambiguous');
+  }
+  return { ...result('complete'), filename: row.filename.split(/[\\/]/).pop(), absolute_path: row.filename };
+}
+
+function toolsDownloadBegin(line, tabId, operation) {
+  delete line.downloadObservation;
+  if (typeof operation !== 'string' || !/^[1-9][0-9]{0,19}$/.test(operation) ||
+      toolsOurs.get(tabId) !== line || line.platformScope || line.platformScopeEnding || toolsStoppedByPerson ||
+      !chrome.downloads?.onCreated || !chrome.downloads?.onChanged || !chrome.downloads?.search ||
+      !chrome.webRequest?.onBeforeRequest || !chrome.webRequest?.onBeforeRedirect || !chrome.webRequest?.onHeadersReceived) return;
+  const started = Date.now();
+  line.downloadObservation = { operation, tabId, started, expires: started + TOOLS_DOWNLOAD_COMPLETE_MS,
+    requests: new Map(), ids: new Set(), failure: '' };
+}
+
+// Completion is read on the next existing settle/action/business boundary.
+// Events never start a download, invoke a model, or send document data anywhere.
+chrome.downloads?.onChanged?.addListener(delta => {
+  for (const [, observation] of toolsDownloadObservations()) {
+    if (!observation.ids.has(delta.id)) continue;
+    if (delta.state?.current === 'interrupted') observation.failure = 'interrupted';
+    if (delta.exists?.current === false) observation.failure = 'file_unavailable';
+  }
+});
+
 function toolsErr(e) {
   return String((e && e.message) || e);
 }
@@ -284,6 +419,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
+  const owner = toolsOurs.get(source.tabId);
+  if (owner?.downloadObservation?.tabId === source.tabId) delete owner.downloadObservation;
   toolsAttached.delete(source.tabId);
   for (const done of [...(toolsLoadWaiters.get(source.tabId) || [])]) done(false);
   if (reason === "canceled_by_user" && !toolsStoppedByPerson) {
@@ -295,6 +432,8 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  const owner = toolsOurs.get(tabId);
+  if (owner?.downloadObservation?.tabId === tabId) delete owner.downloadObservation;
   toolsAttached.delete(tabId);
   toolsOurs.delete(tabId);
   toolsReopenedTabs.delete(tabId);
@@ -1555,6 +1694,7 @@ async function toolsStripGlow(tabId) {
 /// debugger is on that this worker does not know of (it restarted) go too. An agent among
 /// others (a parallel run) lets only its own tabs go.
 async function toolsLetGo(line, last = true) {
+  delete line.downloadObservation;
   toolsLettingGo.add(line);
   try {
     await toolsLetGoNow(line, last);
@@ -1694,6 +1834,14 @@ async function toolsTab(msg) {
   return tab;
 }
 
+async function toolsScanTarget(msg, line) {
+  if (msg.follow_owned_active && line && !line.platformScope) {
+    const [active] = await chrome.tabs.query({active:true,lastFocusedWindow:true});
+    if (active && toolsOurs.get(active.id) === line) return active;
+  }
+  return toolsTab(msg);
+}
+
 function toolsRect(msg) {
   const r = msg.rect;
   if (!Array.isArray(r) || r.length !== 4 || r.some((v) => typeof v !== "number")) {
@@ -1708,9 +1856,20 @@ async function toolsHandle(msg, line) {
   switch (msg.type) {
     case "click": {
       const tab = await toolsTab(msg);
-      await toolsPress(tab.id, toolsRect(msg), Number(msg.hold_s) || 0, Number(msg.times) || 1);
-      return { clicked: true };
+      toolsDownloadBegin(line, tab.id, msg.download_operation);
+      try {
+        await toolsPress(tab.id, toolsRect(msg), Number(msg.hold_s) || 0, Number(msg.times) || 1);
+        // The same short grace for every label. Slow downloads are observed on
+        // subsequent boundaries rather than holding ordinary clicks for 8 s.
+        if (line.downloadObservation) await toolsSleep(TOOLS_DOWNLOAD_GRACE_MS);
+        return { clicked: true, download: await toolsDownloadStatus(line, msg.download_operation, tab.id) };
+      } catch (error) {
+        delete line.downloadObservation;
+        throw error;
+      }
     }
+    case "download_status":
+      return { download: await toolsDownloadStatus(line, msg.download_operation, msg.tabId) };
     case "input": {
       const tab = await toolsTab(msg);
       await toolsTypeInto(tab.id, toolsRect(msg), msg.text == null ? "" : String(msg.text), !!msg.enter);

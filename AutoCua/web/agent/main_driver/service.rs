@@ -703,7 +703,7 @@ fn route_model_actions(py: Python<'_>, controller: &crate::controller::view::Con
 fn business_result_texts(result: &Value) -> Vec<String> {
     let results = result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![result.clone()]);
     results.iter().filter(|value| value.get("tool").and_then(Value::as_str) == Some("call_function"))
-        .map(|value| format!("\nFunction result (synthetic):\n```json\n{}\n```\n", view::dumps_pretty(value))).collect()
+        .map(|value| format!("\nFunction result:\n```json\n{}\n```\n", view::dumps_pretty(value))).collect()
 }
 
 fn business_review_required(result: &Value) -> bool {
@@ -1767,6 +1767,7 @@ impl AgentService {
         };
         let core = self.llm_manager.get();
         // Freeze the trusted source revision before the model chooses a call.
+        self.controller.configure_google_runtime(&core.provider,&core.model_short_name,core.runtime_api_key.as_deref());
         // A changed bundle after this point must be rejected, never refreshed
         // into permission to run the stale selection.
         match self.controller.refresh_business(py) {
@@ -1933,7 +1934,7 @@ impl AgentService {
         // model enters this branch.
         let mut extra_results: Vec<Value> = Vec::new();
         let is_done = |a: &Value| a.get("type").and_then(Value::as_str) == Some("done");
-        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if (self.llm_manager.get().async_tools() || self.platform_context.is_some())
+        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if (self.llm_manager.get().async_tools() || self.platform_context.is_some() || self.llm_manager.get().business_enabled())
             && actions_val.len() + rejects.len() > 1
             && actions_val.iter().any(|a| is_done(a))
         {
@@ -2028,7 +2029,7 @@ impl AgentService {
             self.save_conversation_files(py, messages, &display_payload, image_sent, *step_number);
             am.append(&normalized)?;
             tr.append(view::encode_results(&note_results))?;
-            println!("{}", view::format_response_impl(&display_payload, true));
+            if !self.llm_manager.get().business_enabled() { println!("{}", view::format_response_impl(&display_payload, true)); }
             if let Some(cb) = &self.text_callback {
                 cb.call1(py, (view::format_response_impl(&display_payload, false),))?;
             }
@@ -2177,7 +2178,7 @@ impl AgentService {
 
         // Format the response with emojis for console output.
         let formatted_response = view::format_response_impl(&display_payload, true);
-        if self.platform_context.is_some() {
+        if self.platform_context.is_some() || self.llm_manager.get().business_enabled() {
             println!("Scoped model turn received; contents are available only in the active conversation.");
         } else {
             println!("{formatted_response}");
@@ -2389,8 +2390,10 @@ impl AgentService {
                 }
             }
 
-            // Print action result
-            if action_result.get("status").and_then(Value::as_str) == Some("success") {
+            // Business contents belong in the private conversation, never diagnostics.
+            if !business_result_texts(&action_result).is_empty() {
+                println!("Business function result delivered to the active conversation.");
+            } else if action_result.get("status").and_then(Value::as_str) == Some("success") {
                 println!("Action executed successfully");
                 match action_result.get("action").and_then(Value::as_str) {
                     Some("todo_created") => println!("Todo list created"),

@@ -17,6 +17,11 @@ pub struct BusinessPermit {
 }
 
 impl BusinessGate {
+    pub fn configure_google(&self, py: Python<'_>, provider: &str, model: &str, key: Option<&str>) -> PyResult<()> {
+        self.run.bind(py).call_method1("set_google_runtime",(provider,model,key))?;
+        Ok(())
+    }
+    pub fn automatic(run: Py<PyAny>) -> Self { Self { run } }
     #[cfg(test)]
     pub fn from_fixture(run: Py<PyAny>) -> Self { Self { run } }
     pub fn new(py: Python<'_>, context: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -26,6 +31,21 @@ impl BusinessGate {
 
     pub fn refresh(&self, py: Python<'_>) -> PyResult<Value> {
         pythonize::depythonize(&self.run.bind(py).call_method0("refresh")?).map_err(Into::into)
+    }
+
+    pub fn note_download(&self, py: Python<'_>, path: &str, operation: u64) -> PyResult<()> {
+        self.run.bind(py).call_method1("note_download", (path,operation))?;
+        Ok(())
+    }
+
+    pub fn invalidate_download(&self, py: Python<'_>, operation: u64) -> PyResult<()> {
+        self.run.bind(py).call_method1("invalidate_download", (operation,))?;
+        Ok(())
+    }
+
+    pub fn begin_download(&self, py: Python<'_>, started: u64) -> PyResult<()> {
+        self.run.bind(py).call_method1("begin_download", (started,))?;
+        Ok(())
     }
 
     pub fn authorize(&self, py: Python<'_>, action: &Value) -> PyResult<BusinessPermit> {
@@ -45,7 +65,7 @@ impl BusinessGate {
 
 pub fn denied() -> Value {
     json!({"status": "error", "tool": "call_function", "code": "business_gate_denied",
-           "message": "The trusted business gate refused this request. Check the active session, current revision and operator-registered synthetic inputs.",
+           "message": "The trusted business gate refused this request. Check the observed website, installed function contract, active registered client and local PDF.",
            "operator_review_required": true})
 }
 
@@ -57,7 +77,12 @@ pub fn denied_error(py: Python<'_>, error: &PyErr) -> Value {
         if matches!(code.as_str(), "business_revision_changed" | "unapproved_callable"
             | "schema_mismatch" | "unauthorized_client" | "operator_argument_required"
             | "verified_download_receipt_required" | "real_client_privacy_gate_closed"
-            | "invalid_business_request" | "business_decision_required" | "business_client_scope_changed" | "unsafe_path") {
+            | "invalid_business_request" | "business_decision_required" | "business_client_scope_changed" | "unsafe_path"
+            | "download_file_missing" | "download_incomplete" | "download_stale" | "download_outside_folder"
+            | "invalid_download_path" | "invalid_download_filename" | "invalid_download_pdf"
+            | "download_file_changed"
+            | "chrome_confirmed_download_required" | "download_operation_changed"
+            | "downloads_folder_unavailable" | "downloads_configuration_invalid" | "invalid_client_registration") {
             result["code"] = json!(code);
         }
     }
