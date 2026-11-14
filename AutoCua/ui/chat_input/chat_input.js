@@ -63,11 +63,43 @@
 
         // Start the agent. Shared by Enter and the send orb's 'sendbtn:clicked' message.
         // Guard mirrors the old Enter behaviour: needs a message + a live provider/model.
-        function startAgent() {
+        let operatorSending = false;
+        async function startAgent() {
             // A phone pairing, or not paired yet, holds the box read only
             // (ios_session.js, android_session.js): nothing is sent till it is.
             if (chatInput.readOnly) return;
             const message = chatInput.value.trim();
+            if (!message) return;
+            // Consult the trusted broker before model selection or beginRun.
+            // A missing poll or network failure must never start another task.
+            const session = window.currentSessionId;
+            if (session) {
+                if (operatorSending) return;
+                operatorSending = true;
+                try {
+                    if (!window.submitOperatorChat) throw new Error('The assistant reply channel is loading. Please retry.');
+                    const handled = await window.submitOperatorChat(message, session);
+                    if (window.currentSessionId !== session) return;
+                    if (handled) {
+                        if (chatInput.value.trim() === message) { chatInput.value = ''; adjustHeight(); }
+                        return;
+                    }
+                } catch (error) {
+                    const status = document.getElementById('agentText');
+                    if (status) status.textContent = String(error.message || 'Could not validate the assistant reply.');
+                    return;
+                } finally { operatorSending = false; }
+            }
+            // Explicit local teaching mode intercepts before a run is created,
+            // a chat task is persisted or any text reaches a model provider.
+            const correction = window.submitDextChatCorrection && window.submitDextChatCorrection(message);
+            if (correction) {
+                correction.then(() => { chatInput.value = ''; adjustHeight(); }).catch(error => {
+                    const status = document.getElementById('agentText');
+                    if (status) status.textContent = String(error.message || 'Correction could not be validated.');
+                });
+                return;
+            }
             // Live (provider, model) selection lives in script.js (Settings writes it).
             const sel = window.getModelSelection ? window.getModelSelection() : {};
             if (!message || !sel.provider || !sel.model) return;
@@ -247,6 +279,9 @@
         // ids, bring the run's bot in, lock the mode.
         function runStarted(data, run) {
             const runBot = run.runBot, chatGoesOn = run.chatGoesOn, agentMode = run.agentMode;
+            // Reopen Web input only after the run acknowledgment; subsequent
+            // messages are classified by the host before any task dispatch.
+            if (agentMode === 'web' && data.platform_context?.platform_id) chatInput.disabled = false;
             // Adopt the backend's session id (a brand-new chat is minted
             // server-side) so the run-end save + future sends target it.
             if (data.session_id) window.currentSessionId = data.session_id;
@@ -329,6 +364,22 @@
         // Expose so script.js's agentComplete() can morph back on natural completion.
         window.chatInputRestoreIdle = restoreIdle;
 
+        // A clarification uses the existing chat renderer without entering a run
+        // lifecycle, showing a spinner or creating any model execution context.
+        window.operatorChatReply = function (payload) {
+            let data;
+            try { data = JSON.parse(payload); } catch (_) { return; }
+            if (data.session_id !== window.currentSessionId || typeof data.reply_html !== 'string') return;
+            if (window.chatScroll) {
+                window.chatScroll.archiveLive();
+                window.chatScroll.setLive('', '');
+                window.chatScroll.setLiveBot('web');
+            }
+            if (window.showUserMessage) window.showUserMessage(data.answer || '');
+            if (window.showRunReply) window.showRunReply(data.reply_html, data.status === 'cancelled' ? 'cancelled' : 'waiting_operator');
+            document.dispatchEvent(new CustomEvent('chats:refresh'));
+        };
+
         // Clear the previous run's visual outputs (milestones, video, reply).
         // Shared by the send path AND the New-chat button (chat.js) so a
         // fresh chat and a fresh run reset identically. Idempotent / guarded.
@@ -407,6 +458,9 @@
         // (same as Enter), the glowing stop orb posts 'pcbtn:clicked' (it also plays
         // its own pop-vanish on click — we just morph back to idle).
         window.addEventListener('message', (e) => {
+            if (e.data !== 'sendbtn:clicked' && e.data !== 'pcbtn:clicked') return;
+            const sourceFrame = e.data === 'sendbtn:clicked' ? getSendFrame() : getStopFrame();
+            if (!sourceFrame || e.source !== sourceFrame.contentWindow || e.origin !== window.location.origin) return;
             if (e.data === 'sendbtn:clicked') {
                 startAgent();
                 return;

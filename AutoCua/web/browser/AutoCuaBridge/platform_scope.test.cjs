@@ -247,17 +247,18 @@ function automaticToolsFixture() {
       async remove(id) { removed.push(id); },
     },
   };
-  const context = vm.createContext({ chrome, setTimeout, clearTimeout });
+  const context = vm.createContext({ chrome, setTimeout, clearTimeout, URL, AbortController, Uint8Array, TextEncoder, atob: value=>Buffer.from(value,"base64").toString("binary"), crypto:require('node:crypto').webcrypto, btoa: value => Buffer.from(value, "binary").toString("base64") });
   const toolsSource = fs.readFileSync(path.join(__dirname, "tools.js"), "utf8");
   vm.runInContext(toolsSource + `
 globalThis.actualTools = {
+  handle: toolsHandle, history: toolsHistory,
   own: (id, line) => toolsOurs.set(id, line),
   dialogHeld: (id) => toolsDialogs.has(id),
   wasReplaced: (id) => toolsReplaced.has(id),
   reopen: toolsReopen,
   setScopeReview: (handler) => { toolsOnScopeReview = handler; },
 };`, context);
-  return { chrome, tools: context.actualTools, commands, tabReads, created, removed };
+  return { chrome, environment: context, tools: context.actualTools, commands, tabReads, created, removed };
 }
 
 test("scoped beforeunload dialogs remain unanswered and require operator review", async () => {
@@ -496,4 +497,119 @@ test("scoped downloads must not rely on a tab-level CDP policy", async () => {
     false,
     "Download protection must use browser-level CDP, not chrome.debugger"
   );
+});
+
+test("authorized resource fetching uses the owned top frame, exact live link and redirect rejection on three platforms", async () => {
+  for (let i = 0; i < 3; i++) {
+    const f = automaticToolsFixture();
+    const origin = `https://portal-${i}.example.test`;
+    const url = origin + '/synthetic.pdf';
+    let reads = 0;
+    f.chrome.tabs.get = async id => ({ id, url: origin + '/page' });
+    f.environment.location = { href: origin + '/page', origin };
+    f.environment.document = { querySelectorAll: () => [{ href: url, getAttribute: () => null, innerText: 'Synthetic document' }] };
+    f.environment.fetch = async (actual, options) => {
+      reads++;
+      assert.equal(actual, url);
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.credentials, 'same-origin');
+      return new Response('%PDF-1.4 Synthetic fixture', { status: 200, headers: { 'content-type': 'application/pdf' } });
+    };
+    f.chrome.scripting = { executeScript: async request => {
+      assert.equal(request.world, 'ISOLATED');
+      assert.deepEqual(plain(request.target), { tabId: 1, frameIds: [0] });
+      return [{ frameId: 0, result: await request.func(...request.args) }];
+    }};
+    const result = await f.tools.handle({ type: 'download_observed', tabId: 1, url, name: 'Synthetic document' }, {});
+    assert.equal(Buffer.from(result.base64, 'base64').toString(), '%PDF-1.4 Synthetic fixture');
+    assert.equal(result.size, 26);
+    assert.equal(reads, 1);
+    await assert.rejects(f.tools.handle({type:'download_observed',tabId:1,url:'https://foreign.example.test/file',name:'Synthetic document'}, {}), /download_origin_denied/);
+    assert.equal(reads, 1);
+    f.environment.document.querySelectorAll = () => [];
+    await assert.rejects(f.tools.handle({type:'download_observed',tabId:1,url,name:'Synthetic document'}, {}), /download_target_changed/);
+    assert.equal(reads, 1);
+    assert.deepEqual(f.commands, []); // Browser download policy is never relaxed.
+  }
+});
+
+test("scoped Back refuses a foreign history destination before dispatch", async () => {
+  const f = automaticToolsFixture();
+  f.chrome.tabs.get = async id => ({id,url:'https://portal.example.test/current'});
+  f.chrome.debugger.attach = async () => {};
+  f.chrome.debugger.sendCommand = async (target, method) => {
+    f.commands.push(method);
+    return method === 'Page.getNavigationHistory' ? {currentIndex:1, entries:[{id:10,url:'https://foreign.example.test/'},{id:11,url:'https://portal.example.test/current'}]} : {};
+  };
+  await assert.rejects(f.tools.history(1,-1,['portal.example.test']), /history_scope_denied/);
+  assert.ok(!f.commands.includes('Page.navigateToHistoryEntry'));
+});
+
+test("download failures never return a verified result or relax browser protection", async () => {
+  const f = automaticToolsFixture();
+  const url='https://portal.example.test/file';
+  f.chrome.tabs.get=async id=>({id,url});
+  f.environment.location={href:url,origin:'https://portal.example.test'};
+  f.environment.document={querySelectorAll:()=>[{href:url,getAttribute:()=>null,innerText:'Document'}]};
+  f.chrome.scripting={executeScript:async request=>[{frameId:0,result:await request.func(...request.args)}]};
+  const request={type:'download_observed',tabId:1,url,name:'Document'};
+  for (const response of [new Response('denied',{status:403}), new Response('html',{headers:{'content-type':'text/html'}}),new Response('',{headers:{'content-type':'application/pdf'}})]) {
+    f.environment.fetch=async()=>response;
+    await assert.rejects(f.tools.handle(request,{}),/download_(response_denied|empty)/);
+  }
+  f.environment.fetch=async()=>{throw Error('redirect rejected');};
+  await assert.rejects(f.tools.handle(request,{}),/redirect rejected/);
+  let cancelled=false;
+  f.environment.fetch=async()=>({status:200,headers:{get:()=> 'application/pdf'},body:{getReader:()=>({read:async()=>({done:false,value:new Uint8Array(8*1024*1024+1)}),cancel:async()=>{cancelled=true;}})}});
+  await assert.rejects(f.tools.handle(request,{}),/download_size_limit/);
+  assert.equal(cancelled,true);
+  assert.deepEqual(f.commands,[]);
+});
+
+test("keyboard authorization observes top-frame focus without exposing its value", async () => {
+  const f=automaticToolsFixture();
+  f.chrome.tabs.get=async id=>({id,url:'https://portal.example.test/'});
+  const element={tagName:'INPUT',id:'field',getAttribute:key=>key==='type'?'PASSWORD':'public',value:'PRIVATE SYNTHETIC VALUE'};
+  f.environment.document={activeElement:element,querySelectorAll:()=>[element]};
+  f.chrome.scripting={executeScript:async request=>{
+    assert.deepEqual(plain(request.target),{tabId:1,frameIds:[0]});
+    return [{frameId:0,result:await request.func()}];
+  }};
+  const result=await f.tools.handle({type:'execution_focus',tabId:1},{});
+  assert.equal(result.type,'password');
+  assert.match(result.digest,/^[a-f0-9]{64}$/);
+  assert.ok(!JSON.stringify(result).includes(element.value));
+  f.chrome.scripting.executeScript=async()=>[{frameId:4,result}];
+  await assert.rejects(f.tools.handle({type:'execution_focus',tabId:1},{}),/focus_unavailable/);
+});
+
+
+test("serialized scanner labels the empty Dext PDF button without extension globals", () => {
+  const extension = vm.createContext({});
+  vm.runInContext(fs.readFileSync(path.join(__dirname,"element.js"),"utf8") +
+    "\nglobalThis.serializedScan=elementScanPage.toString();globalThis.scanConfig=ELEMENT_DEFAULT_CONFIG;", extension);
+  for (const variant of ['dext','ordinary','print','named']) {
+    const receipt = {querySelector:()=>({})};
+    const button = {nodeType:1,localName:'button',namespaceURI:'http://www.w3.org/1999/xhtml',
+      firstChild:null, nextSibling:null, tabIndex:0,
+      closest:selector=>selector==='.receipt-page' && variant!=='ordinary'?receipt:null,
+      matches:selector=>selector==='button.download.s-button-download' && variant!=='print',
+      getAttribute:key=>key==='aria-label' && variant==='named'?'Existing name':null,
+      hasAttribute:()=>false, getClientRects:()=>[{}],
+      getBoundingClientRect:()=>({left:10,top:10,width:20,height:20})};
+    const document = {nodeType:9,firstChild:button,scrollingElement:{clientWidth:100,clientHeight:100},getElementById:()=>null};
+    const window = {devicePixelRatio:1,frameElement:null,addEventListener(){},removeEventListener(){},
+      getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1',cursor:'pointer',pointerEvents:'auto'})};
+    window.parent=window; window.top=window;
+    document.defaultView=window; button.ownerDocument=document; button.parentNode=document;
+    const cfg=plain(extension.scanConfig); cfg.occlusion={enabled:false};
+    const page = vm.createContext({window,self:window,document,location:{href:'https://app.dext.com/receipt/synthetic'},performance:{now:()=>0},cfg});
+    // executeScript serializes only func, not its service-worker lexical scope.
+    assert.equal(vm.runInContext('typeof elementDextPdfName',page),'undefined');
+    const result = vm.runInContext('('+extension.serializedScan+')(cfg,{nonce:"synthetic",wait_ms:0})',page);
+    assert.equal(result.error,undefined,result.error);
+    const record=result.recs.find(row=>row.tag==='button');
+    assert.ok(record);
+    assert.equal(record.name,variant==='dext'?'T\u00e9l\u00e9charger PDF':variant==='named'?'Existing name':'');
+  }
 });

@@ -58,9 +58,9 @@ the entire freshly read `comptable_banque.md` to the accounting provider boundar
 It returns exactly `{"compte": string_or_null}`. Accounts must contain 2–20
 uppercase letters/digits and must not start with `512`. Null represents an
 uncertain classification; it is not evidence of accounting correctness.
-The native loop hands a null classification, or an invoice proposal requiring
-review, back to the operator after displaying the typed result. A quote needs no
-accounting entry and does not manufacture one.
+The native loop hands a null classification, an uncertain invoice, every credit
+note and every quote back to the operator after displaying the typed result.
+A quote needs no accounting entry and does not manufacture one.
 
 The initial provider is explicitly a **fake**, selected with the separate
 `COMPTABLE_LLM_MODEL=offline-synthetic-v1` setting. Its responses are trusted
@@ -80,7 +80,9 @@ for sales. Types are `facture`, `avoir`, `devis` or null. Lines use `compte`,
 centimes, single-sided lines, balance, VAT/base/party roles and invoice direction
 are checked. Quotes, unknown documents, explicit review and complex/multi-rate
 allocations produce empty entries and a null journal. Credit notes reverse sides.
-Description is null when the optional current `comptable.md` rule is unavailable.
+Each client has exactly three reference files: `comptable_banque.md`,
+`comptable_achats.md`, and `comptable_ventes.md`. There is no generic reference
+file. Description remains null on this runtime path; the output schema is unchanged.
 
 Production `scribe` always refuses unverified PDFs with
 `verified_download_receipt_required` **before starting a worker**. The argument
@@ -106,8 +108,8 @@ Intentional adaptations/tightening:
 - Duplicate keys, nonfinite JSON and extra fields are rejected for both functions.
 - The original remote accounting inference is represented by an injectable
   provider boundary; only the trusted offline fake is enabled in PR4.
-- PDF fixtures are limited to 256 KiB; references to 2 MiB and optional description
-  rules to 8 KiB. Provider JSON is limited to 32,000 bytes, worker output to 64 KiB.
+- PDF fixtures are limited to 256 KiB and each of the three references to 2 MiB.
+  Provider JSON is limited to 32,000 bytes, worker output to 64 KiB.
 - Malformed rows are rejected even for quotes/review outputs. `512*` accounts
   are refused in invoice proposals too. Critical synthetic fixture mismatches
   fail explicitly rather than accepting a well-formed invented proposal.
@@ -138,14 +140,21 @@ For an offline synthetic pilot, the operator can create this local file:
 }
 ```
 
-Also create a nonempty, entirely invented
-`platforms/dext/data/synthetic-pilot/comptable_banque.md`. There is no production
+Also create nonempty, entirely invented `comptable_banque.md`,
+`comptable_achats.md` and `comptable_ventes.md` under
+`platforms/dext/data/synthetic-pilot/`. The complete three-file bundle is validated
+in the parent and worker before a business function executes. There is no production
 fallback client or baked-in tenant. The active client binding is fixed when the
 run is constructed; changing it requires a new run. Labels must match the
 operator's registered strings exactly. Synthetic unknown labels return null.
 Setting `synthetic` to false closes the privacy gate. Marking real data as
 synthetic would be an operator configuration error, not a privacy mechanism.
 Do not put actual labels, clients, documents or references in pilot configuration.
+
+For explicit local directory initialization, three-file validation and real-client
+metadata registration, see [dext_reference_onboarding.md](dext_reference_onboarding.md).
+Registration is not real-record authorization or disclosure consent. The CLI never
+imports archives or retags real data as synthetic.
 
 Every call rereads current references, detects changes during reading and records
 their digests in an in-memory receipt. Receipts contain a hashed client identity,

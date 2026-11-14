@@ -177,7 +177,16 @@ impl PlatformScope {
         let kind = action.get("type").and_then(Value::as_str).unwrap_or_default();
         match kind {
             "done" | "wait" | "todo_list" | "update_todo" | "scratchpad" | "skills" => Ok(()),
+            // Supervision does not remove the native viewport navigation tool.
+            // Its normal controller still resolves the observed region and runs
+            // the same pre/post scope checks. This grants no click, form input,
+            // download, disclosure or accounting authority.
+            "scroll" if self.execution_mode == "supervised" => Ok(()),
+            "navigate_tab" if self.execution_mode == "supervised" && matches!(action.get("value").and_then(Value::as_str), Some("back" | "forward")) => Ok(()),
             "new_tab" | "update_tab" => {
+                // The same declared-origin navigation contract applies to all
+                // installed platforms. A platform name is not a permission.
+                // Downloads and business effects retain separate gates.
                 let url = action.get("value").and_then(Value::as_str)
                     .ok_or_else(|| scope_error("Platform navigation requires an explicit HTTPS URL."))?;
                 self.validate_url(url)
@@ -191,10 +200,10 @@ impl PlatformScope {
 
     /// Separate native authorization; JSON flags can never manufacture a permit.
     pub fn validate_business_action(&self, action: &Value, permit: &crate::tool_registry::business::BusinessPermit) -> Result<(), String> {
-        if self.violation().is_some() || self.platform_id != "dext" || self.execution_mode != "supervised"
+        if self.violation().is_some() || self.execution_mode != "supervised"
             || permit.platform != self.platform_id || permit.context_revision != self.config_revision
             || !matches!(permit.effect.as_str(), "read" | "compute")
-            || !matches!(permit.name.as_str(), "dext.bank" | "dext.scribe")
+            || action.get("name").and_then(Value::as_str) != Some(permit.name.as_str())
             || permit.action != *action || action.get("type").and_then(Value::as_str) != Some("call_function") {
             return Err(APPROVAL_UNAVAILABLE.to_string());
         }
@@ -407,7 +416,7 @@ mod tests {
             data["execution_mode"] = json!(mode);
             let scope = PlatformScope::from_value(&data).unwrap();
             for kind in [
-                "click", "hold_click", "input", "vault", "keyboard", "scroll",
+                "click", "hold_click", "input", "vault", "keyboard",
                 "dialog", "run_script", "more", "index", "index_read",
                 "exit_scrape_mode", "navigate_tab", "close_tab", "download",
                 "call_function", "unknown", "",
@@ -415,6 +424,7 @@ mod tests {
                 let result = scope.validate_action(&json!({"type": kind, "value": "https://app.dext.com/"}));
                 assert_eq!(result, Err(APPROVAL_UNAVAILABLE.to_string()), "{mode}: {kind}");
             }
+            assert_eq!(scope.validate_action(&json!({"type":"scroll","direction":"down","id":1})).is_ok(), mode == "supervised");
             for kind in ["done", "wait", "todo_list", "update_todo", "scratchpad", "skills", "switch_tab"] {
                 assert!(scope.validate_action(&json!({"type": kind})).is_ok(), "{kind}");
             }
@@ -423,6 +433,25 @@ mod tests {
                 assert!(scope.validate_action(&json!({"type": kind, "value": "https://app.dext.com.evil.test/"})).is_err());
                 assert!(scope.validate_action(&json!({"type": kind})).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn supervised_url_navigation_is_independent_of_platform_identity() {
+        for id in ["dext", "portal_alpha", "portal_beta", "portal_gamma"] {
+            let mut data = context();
+            let host = format!("{}.example.test", id.replace('_', "-"));
+            data["platform_id"] = json!(id);
+            data["browser_profile"] = json!(format!("saccade-{id}"));
+            data["allowed_hosts"] = json!([host]);
+            data["start_url"] = json!(format!("https://{host}/login"));
+            let scope = PlatformScope::from_value(&data).unwrap();
+            for action in ["new_tab", "update_tab"] {
+                assert!(scope.validate_action(&json!({"type":action,"value":format!("https://{host}/sections")})).is_ok());
+                assert!(scope.validate_action(&json!({"type":action,"value":"https://foreign.example.test/"})).is_err());
+            }
+            assert!(scope.validate_action(&json!({"type":"download"})).is_err());
+            assert!(scope.validate_action(&json!({"type":"call_function"})).is_err());
         }
     }
 

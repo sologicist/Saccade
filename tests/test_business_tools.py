@@ -118,6 +118,7 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
         self.assertEqual(result["result"], {"compte": "40100000"})
         first = run.receipts[-1]["references"]
         self.fixture.reference.write_text("Entire changed synthetic Markdown.", encoding="utf-8")
+        run.refresh()  # A changed reference requires a new model decision.
         self.assertEqual(run.execute(run.prepare(self.fixture.action()))["status"], "success")
         self.assertNotEqual(first, run.receipts[-1]["references"])
         self.assertNotIn("synthetic-alpha", json.dumps(run.receipts))
@@ -417,11 +418,13 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
     def test_absent_reference_revision_cannot_alias_present_content(self):
         clients, _ = client_registration(self.fixture.data)
         context = AccountingContext(self.fixture.data, clients)
-        context.reference("synthetic-alpha", "comptable.md", optional=True)
-        absent = context.references["comptable.md"]
-        (self.fixture.data / "synthetic-alpha/comptable.md").write_bytes(b"absent")
-        context.reference("synthetic-alpha", "comptable.md", optional=True)
-        self.assertNotEqual(context.references["comptable.md"], absent)
+        path = self.fixture.data / "synthetic-alpha/comptable_ventes.md"
+        path.unlink()  # This test owns its generated synthetic fixture.
+        context.reference("synthetic-alpha", "comptable_ventes.md", optional=True)
+        absent = context.references["comptable_ventes.md"]
+        path.write_bytes(b"absent")
+        context.reference("synthetic-alpha", "comptable_ventes.md", optional=True)
+        self.assertNotEqual(context.references["comptable_ventes.md"], absent)
 
 
 if __name__ == "__main__":

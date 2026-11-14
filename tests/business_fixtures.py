@@ -23,6 +23,7 @@ class BusinessFixture:
         for name in ("__init__.py", "saccade/__init__.py", "saccade/platform_config.py", "saccade/session_context.py",
                      "saccade/business_contract.py", "saccade/business_catalogue.py", "saccade/business_run.py",
                      "saccade/business_process.py", "saccade/business_worker.py",
+                     "saccade/client_references.py",
                      "saccade/business_functions/__init__.py", "saccade/business_functions/platforms/__init__.py"):
             path = self.package / name
             path.parent.mkdir(parents=True, exist_ok=True)

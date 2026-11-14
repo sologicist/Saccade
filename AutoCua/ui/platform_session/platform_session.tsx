@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import { chooseExecutionMode, choosePlatform, newSelection, restoreSelection, selectionPayload } from './selection.ts';
 import type { PlatformSummary } from './selection.ts';
+import { DextReview } from './dext_review.tsx';
 
 declare global {
     interface Window {
@@ -81,8 +82,9 @@ export function PlatformSessionSelector() {
             <p className="platform-session-note" role="status">
                 {state.error || catalogError || (state.restoring ? 'Loading saved platform context…' : state.bound
                     ? 'Platform and execution mode are saved for this chat. Start a new chat to change them.'
-                    : state.platformId ? 'Observe and navigate in Chrome. Complete sign-in manually; other actions require approval controls.' : '')}
+                    : state.platformId ? 'Complete sign-in manually. Dext navigation previews require independent operator review; live execution remains blocked.' : '')}
             </p>
+            <DextReview enabled={web && state.platformId === 'dext' && state.executionMode === 'supervised'} />
         </div>
     );
 }

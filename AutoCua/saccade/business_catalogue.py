@@ -90,20 +90,27 @@ def catalogue(platform_id, *, package_root=PACKAGE_ROOT):
             "functions": entries}
 
 
-def client_registration(data_root):
+def read_registration(data_root):
     path = data_root / "registration.json"
     if not path.exists() and not path.is_symlink():
-        return {}, digest(b"unconfigured")
+        return None, digest(b"unconfigured")
     raw = read_safe(data_root, path, 32_768)
     value = loads(raw)
     if type(value) is not dict or set(value) != {"schema_version", "active_client", "clients"} or type(value["schema_version"]) is not int or value["schema_version"] != 1 or type(value["clients"]) is not dict or len(value["clients"]) > 32 or type(value["active_client"]) is not str or value["active_client"] not in value["clients"]:
         reject("invalid_client_registration")
     for client, policy in value["clients"].items():
-        if not CLIENT_ID.fullmatch(client) or type(policy) is not dict or set(policy) != {"synthetic", "bank_labels", "bank_responses"} or type(policy["synthetic"]) is not bool or type(policy["bank_responses"]) is not dict or type(policy["bank_labels"]) is not list or not 1 <= len(policy["bank_labels"]) <= 64 or any(type(label) is not str or not 1 <= len(label) <= 1000 for label in policy["bank_labels"]) or set(policy["bank_responses"]) - set(policy["bank_labels"]):
+        if not CLIENT_ID.fullmatch(client) or client == "navigation" or type(policy) is not dict or set(policy) != {"synthetic", "bank_labels", "bank_responses"} or type(policy["synthetic"]) is not bool or type(policy["bank_responses"]) is not dict or type(policy["bank_labels"]) is not list or not (1 if policy["synthetic"] else 0) <= len(policy["bank_labels"]) <= 64 or any(type(label) is not str or not 1 <= len(label) <= 1000 for label in policy["bank_labels"]) or set(policy["bank_responses"]) - set(policy["bank_labels"]):
             reject("invalid_client_registration")
+    return value, digest(raw)
+
+
+def client_registration(data_root):
+    value, revision = read_registration(data_root)
+    if value is None:
+        return {}, revision
     # The model cannot select another registered client's data for this run.
     active = value["active_client"]
-    return {active: value["clients"][active]}, digest(raw)
+    return {active: value["clients"][active]}, revision
 
 
 def model_tool(snapshot):

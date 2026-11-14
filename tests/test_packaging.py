@@ -46,6 +46,26 @@ class BuiltWheelContracts(unittest.TestCase):
             "AutoCua/saccade/business_run.py",
             "AutoCua/saccade/business_process.py",
             "AutoCua/saccade/business_worker.py",
+            "AutoCua/saccade/procedure_store.py",
+            "AutoCua/saccade/platform_learning.py",
+            "AutoCua/saccade/learning_adapter.py",
+            "AutoCua/saccade/dext_learning.py",
+            "AutoCua/saccade/dext_control.py",
+            "AutoCua/saccade/operator_requests.py",
+            "AutoCua/saccade/execution.py",
+            "AutoCua/saccade/capabilities.py",
+            "AutoCua/saccade/scribe_pdf.py",
+            "AutoCua/saccade/operator_diagnostics.py",
+            "AutoCua/saccade/operator_language.py",
+            "AutoCua/ui/platform_session/operator_chat.ts",
+            "AutoCua/ui/platform_session/operator_resume.ts",
+            "AutoCua/ui/platform_session/operator_review.tsx",
+            "AutoCua/ui/container/agent/run_reply.js",
+            "AutoCua/ui/script.js",
+            "AutoCua/ui/index.js",
+            "AutoCua/saccade/client_references.py",
+            "AutoCua/saccade/reference_management.py",
+            "AutoCua/saccade/navigation_correction.py",
             "AutoCua/saccade/business_functions/__init__.py",
             "AutoCua/saccade/business_functions/platforms/__init__.py",
             "AutoCua/saccade/business_functions/platforms/dext/__init__.py",
@@ -78,6 +98,9 @@ class BuiltWheelContracts(unittest.TestCase):
                     self.assertNotIn("reports", parts)
                     self.assertNotEqual(parts[-1], "agent.md")
                 self.assertNotIn("AutoCua_data", parts)
+                self.assertNotIn("legacy_reference", parts)
+                self.assertNotIn("Saccade-PR5-handoff", parts)
+                self.assertNotIn("navigation", parts if "data" in parts else ())
 
     def test_extracted_wheel_loads_without_the_source_checkout(self):
         with tempfile.TemporaryDirectory(prefix="saccade-wheel-install-") as temporary:
@@ -91,7 +114,7 @@ class BuiltWheelContracts(unittest.TestCase):
             self.wheel.extractall(install_root)
             # -I removes the source checkout and ambient PYTHONPATH. No runtime
             # dependencies or Chrome session are needed to load configuration.
-            code = """
+            code = r"""
 import importlib
 import json
 import sys
@@ -109,6 +132,12 @@ assert platform.procedure_path == installed / "AutoCua/default_skills/web/domain
 platform.procedure_path.read_text(encoding="utf-8")
 assert platform.allowed_hosts == ("app.dext.com",)
 assert "dext" in [item.id for item in list_platforms()]
+from AutoCua.saccade.dext_control import DextRunControl
+from AutoCua.saccade.session_context import build_platform_context
+control = DextRunControl(build_platform_context("dext"), "wheel-synthetic")
+assert control.overlay() == ""
+assert control.status()["capabilities"]["live_scribe"] == "verified_download_receipt_required"
+control.close()
 from AutoCua.saccade.business_catalogue import catalogue
 catalog = catalogue("dext")
 assert set(catalog["functions"]) == {"dext.bank", "dext.scribe"}
@@ -122,11 +151,30 @@ data = installed / "platforms/dext/data"
     "clients":{"wheel-synthetic":{"synthetic":True,"bank_labels":["SYNTHETIC WHEEL LABEL"],
     "bank_responses":{"SYNTHETIC WHEEL LABEL":{"compte":"40100000"}}}}}), encoding="utf-8")
 (data / "wheel-synthetic/comptable_banque.md").write_text("Entire synthetic wheel reference.", encoding="utf-8")
+for name in ("comptable_achats.md", "comptable_ventes.md"):
+    (data / "wheel-synthetic" / name).write_text("Entire synthetic wheel invoice reference.", encoding="utf-8")
 run = BusinessRun(build_platform_context("dext"))
 run.refresh()
 ticket = run.prepare({"type":"call_function","version":1,"name":"dext.bank",
     "arguments":{"client_id":"wheel-synthetic","string":"SYNTHETIC WHEEL LABEL"}})
 assert run.execute(ticket)["result"] == {"compte":"40100000"}
+from AutoCua.saccade.platform_learning import PlatformLearningControl
+functions_dir = installed / "platforms/dext/functions"
+functions_dir.mkdir()
+(functions_dir / "echo.py").write_text('def echo(text: str) -> str:\n    return "WHEEL:" + text\n', encoding="utf-8")
+(installed / "platforms/dext/capabilities.json").write_text(json.dumps({"schema_version":1,"platform_id":"dext","functions":[
+    {"id":"dext.wheel_echo","source":"echo.py","symbol":"echo","effect":"compute","destination":"local",
+     "description":"Synthetic installed wheel function","output_visibility":"public"}]}), encoding="utf-8")
+control = PlatformLearningControl(build_platform_context("dext"), "wheel-capability")
+action = {"type":"call_function","version":1,"name":"dext.wheel_echo","arguments":{"text":"SYNTHETIC"}}
+stamp = {"platform_id":"dext","profile":"saccade-dext","config_revision":control.context["config_revision"],"session":"synthetic-browser","tab":"1"}
+assert "dext.wheel_echo" in str(control.execution_tools())
+assert not control.authorize_execution(action,stamp,{})["allowed"]
+control.execution.review(control.execution.pending["id"],True)
+assert control.authorize_execution(action,stamp,{})["allowed"]
+assert control.execute_capability(action)["result"] == "WHEEL:SYNTHETIC"
+assert set(catalogue("dext")["functions"]) == {"dext.bank", "dext.scribe"}
+control.close()
 native = importlib.import_module("AutoCua.web.agent_native")
 assert Path(native.__file__).resolve().is_relative_to(installed)
 print(json.dumps({"id": platform.id, "native_imported": True}))
@@ -153,7 +201,7 @@ class BuiltSourceContracts(unittest.TestCase):
         for resource in ("AutoCua/saccade/business_run.py", "AutoCua/saccade/business_worker.py",
                          "AutoCua/saccade/business_functions/platforms/dext/functions.py",
                          "AutoCua/saccade/business_functions/platforms/dext/policy.json",
-                         "AutoCua/web/tool_registry/business.rs", "AutoCua/web/Cargo.toml",
+                         "AutoCua/web/tool_registry/business.rs", "AutoCua/web/browser/download_events.rs", "AutoCua/web/Cargo.toml",
                          "platforms/dext/platform.json"):
             self.assertTrue(any(name.endswith("/" + resource) for name in names), resource)
         for name in names:

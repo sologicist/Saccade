@@ -67,6 +67,12 @@ result = {}
 with patch.object(session_context, "load_platform", side_effect=lambda platform_id, root=None: load_platform(platform_id, root=fixture_root)), \
      patch.object(session_context, "_registered_vision_model", return_value=True), \
      patch.dict(sys.modules, {llm.__name__: llm}):
+    if request.get("learning"):
+        from AutoCua.saccade.platform_learning import PlatformLearningControl
+        selected = kwargs['platform_context']
+        if request['learning'] == 'foreign':
+            selected = session_context.build_platform_context('dext', root=fixture_root)
+        kwargs['learning_control'] = PlatformLearningControl(selected, 'native-test-chat', project_root=fixture_root)
     if request.get("hold") or request.get("borrow"):
         held = profile_lease.acquire_web_profile(profile)
     if request.get("borrow"):
@@ -122,7 +128,7 @@ class NativePlatformEntryContracts(unittest.TestCase):
         (platform_dir / "platform.json").write_text(json.dumps(config), encoding="utf-8")
         self.context = build_platform_context("dext", root=self.root)
 
-    def invoke(self, *, context=True, hold=False, borrow=False, forged_lease=False, **changes):
+    def invoke(self, *, context=True, hold=False, borrow=False, forged_lease=False, learning=None, **changes):
         kwargs = {
             "provider": "openai", "model": "synthetic", "speed": "quality",
             "browser_profile": "saccade-dext", "platform_context": self.context if context else None,
@@ -130,7 +136,7 @@ class NativePlatformEntryContracts(unittest.TestCase):
         kwargs.update(changes)
         result = subprocess.run(
             [sys.executable, "-I", "-c", _NATIVE_WORKER, str(REPOSITORY_ROOT), str(self.native_path), str(self.root)],
-            input=json.dumps({"kwargs": kwargs, "hold": hold, "borrow": borrow, "forged_lease": forged_lease}),
+            input=json.dumps({"kwargs": kwargs, "hold": hold, "borrow": borrow, "forged_lease": forged_lease, "learning": learning}),
             capture_output=True, text=True, cwd=self.root, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -176,6 +182,43 @@ class NativePlatformEntryContracts(unittest.TestCase):
         self.assertEqual(result["error"], "DeliberateStartupFailure")
         self.assertEqual(result["llm_calls"], 1)
         self.assertTrue(result["profile_available"])
+
+    def test_correction_restart_requires_scoped_paired_history_before_startup(self):
+        for changes in ({}, {'prior_history': {'assistant_messages': ['step'], 'tool_responses': []}},
+                        {'context': False, 'prior_history': {'assistant_messages': ['step'], 'tool_responses': ['result']}}):
+            with self.subTest(changes=changes):
+                result = self.invoke(correction_reopen=True, **changes)
+                self.assertEqual(result['error'], 'ValueError')
+                self.assertEqual(result['llm_calls'], 0)
+                self.assertTrue(result['profile_available'])
+
+    def test_confirmed_correction_restart_does_not_bypass_profile_ownership(self):
+        history = {'assistant_messages': ['step'], 'tool_responses': ['result']}
+        held = self.invoke(correction_reopen=True, prior_history=history, hold=True)
+        self.assertEqual(held['error'], 'ProfileBusyError')
+        self.assertEqual(held['llm_calls'], 0)
+        valid = self.invoke(correction_reopen=True, prior_history=history)
+        self.assertEqual(valid['error'], 'DeliberateStartupFailure')
+        self.assertEqual(valid['llm_calls'], 1)
+
+    def test_second_platform_control_is_checked_before_model_or_browser_startup(self):
+        from tests.platform_learning_fixtures import install_synthetic
+        context = install_synthetic(self.root)
+        changes = {'platform_context': context, 'browser_profile': context['browser_profile']}
+        foreign = self.invoke(learning='foreign', **changes)
+        self.assertEqual(foreign['error'], 'BusinessError')
+        self.assertEqual(foreign['llm_calls'], 0)
+        self.assertTrue(foreign['profile_available'])
+        valid = self.invoke(learning='valid', **changes)
+        self.assertEqual(valid['error'], 'DeliberateStartupFailure')
+        self.assertEqual(valid['llm_calls'], 1)
+        self.assertTrue(valid['profile_available'])
+
+    def test_forged_learning_control_is_not_accepted_as_native_authority(self):
+        result = self.invoke(learning_control={'platform_id': 'dext', 'approved': True})
+        self.assertEqual(result['error'], 'BusinessError')
+        self.assertEqual(result['llm_calls'], 0)
+        self.assertTrue(result['profile_available'])
 
     def test_borrowed_lease_remains_owned_by_its_caller_after_startup_failure(self):
         result = self.invoke(borrow=True)

@@ -75,7 +75,7 @@ class WindowsJob:
             self.handle = None
 
 
-def run_worker(request, *, package_root, stop_event=None, timeout=10.0, output_limit=MAX_OUTPUT):
+def run_worker(request, *, package_root, stop_event=None, timeout=10.0, output_limit=MAX_OUTPUT, provider_environment=None):
     deadline = time.monotonic() + timeout
     from AutoCua import IS_COMPILED
     if IS_COMPILED:
@@ -86,6 +86,10 @@ def run_worker(request, *, package_root, stop_event=None, timeout=10.0, output_l
     # -I excludes cwd/PYTHONPATH/user-site. Only the verified installed package
     # root is added; no model argument can choose it. No credentials are inherited.
     environment = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if key in os.environ}
+    if provider_environment is not None:
+        if set(provider_environment) - {'GEMINI_API_KEY','COMPTABLE_LLM_MODEL'}:
+            reject('invalid_provider_environment')
+        environment.update(provider_environment)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     process = subprocess.Popen([sys.executable, "-I", "-B", "-c", WORKER_BOOTSTRAP, str(package_root.parent)],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

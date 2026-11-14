@@ -503,6 +503,13 @@ class ConversationService:
         message = message or ""
         if status == "success":
             return f"Task completed: {message}".strip().rstrip(":")
+        if status == "waiting_operator":
+            from AutoCua.saccade.operator_requests import validate_request
+            try:
+                question = validate_request(json.loads(message))['request']
+            except (ValueError, TypeError, KeyError):
+                question = 'Please review the current environment before continuing.'
+            return question + '\n\nPaused for operator assistance. Reply in this chat when ready; no model requests are running.'
         if status == "error":
             return f"Agent terminated (error / provider): {message}".strip().rstrip(":")
         return f"Agent stopped before completing: {message}".strip().rstrip(":")
@@ -639,6 +646,18 @@ class ConversationService:
         sid = self._new_id()
         self._touch_index(sid, title=self._title_from_task(task), agent_mode=agent_mode)
         return sid, None
+
+    def save_operator_reply(self, session_id, answer, reply, *, status='waiting_operator'):
+        """Append a host-validated paused exchange without changing model memory.
+
+        The existing resume checkpoint and call/result pairing stay untouched.
+        This is the ordinary local chat transcript, never the procedure store.
+        """
+        history = self._read_session(session_id)
+        if not history or not history.get('assistant_messages'):
+            raise ValueError('The operator conversation checkpoint is unavailable.')
+        self._append_exchange(session_id, answer, reply, status)
+        self._touch_index(session_id, last_done_message=reply)
 
     def save_run(self, session_id, assistant_messages, tool_responses, status,
                  message, task, last_messages=None, context_tokens=None,

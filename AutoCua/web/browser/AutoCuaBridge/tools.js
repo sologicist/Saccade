@@ -860,7 +860,7 @@ async function toolsReload(tabId) {
 }
 
 /// tab/service.rs step_history(): -1 is back, +1 is forward, refused at the ends.
-async function toolsHistory(tabId, delta) {
+async function toolsHistory(tabId, delta, scopeHosts = null) {
   const tab = await chrome.tabs.get(tabId);
   if (toolsUnreachable(tab.url || tab.pendingUrl)) {
     // A Chrome page takes no debugger: the tabs API steps the history instead.
@@ -887,6 +887,10 @@ async function toolsHistory(tabId, delta) {
   if (want < 0 || want >= entries.length) {
     throw new Error(`no page to go ${delta < 0 ? "back" : "forward"} to - this tab is at the ` +
       `${delta < 0 ? "start" : "end"} of its history`);
+  }
+  if (scopeHosts !== null) {
+    const url = new URL(entries[want].url);
+    if (!Array.isArray(scopeHosts) || !scopeHosts.length || url.protocol !== "https:" || url.username || url.password || url.port || !scopeHosts.includes(url.hostname)) throw Error("history_scope_denied");
   }
   const id = entries[want] && entries[want].id;
   if (!Number.isInteger(id)) throw new Error("history entry has no id");
@@ -1745,6 +1749,56 @@ async function toolsHandle(msg, line) {
       if (!code.trim()) throw new Error("run_script needs JavaScript in `value`");
       return toolsEvaluate(tab.id, code);
     }
+    case "execution_focus": {
+      const tab = await toolsTab(msg);
+      const replies = await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},world:"ISOLATED",func:async () => {
+        const element = document.activeElement;
+        if (!element) throw Error("focus_unavailable");
+        const descriptor = [element.tagName, element.getAttribute("type"), element.id, element.getAttribute("name"),
+          element.getAttribute("aria-label"), [...document.querySelectorAll("*")].indexOf(element), element.form?.action];
+        const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(descriptor)));
+        return {tag:element.tagName, type:String(element.getAttribute("type") || "").toLowerCase(), digest:[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join("")};
+      }});
+      if (replies.length !== 1 || replies[0].frameId !== 0 || !replies[0].result) throw Error("focus_unavailable");
+      return replies[0].result;
+    }
+    case "download_observed": {
+      const tab = await toolsTab(msg);
+      // Fixed trusted browser code, not a model-supplied script. Keep Chrome's
+      // browser-wide download denial in force: this bounded, same-origin fetch
+      // returns an authorized resource over the already owned bridge only.
+      const replies = await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED",
+        func: async (requested, expectedName) => {
+          const url = new URL(requested, location.href);
+          if (url.protocol !== "https:" || url.origin !== location.origin || url.username || url.password) throw Error("download_origin_denied");
+          const normal = s => String(s).replace(/\s+/g, " ").trim();
+          const links = [...document.querySelectorAll("a[href]")].filter(a => a.href === url.href && normal(a.getAttribute("aria-label") || a.innerText || a.textContent) === normal(expectedName));
+          if (links.length !== 1) throw Error("download_target_changed");
+          const abort = new AbortController();
+          const timeout = setTimeout(() => abort.abort(), 20000);
+          try {
+          const response = await fetch(url.href, { credentials: "same-origin", redirect: "error", cache: "no-store", signal: abort.signal });
+          const mime = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+          if (response.status !== 200 || !["application/pdf", "application/octet-stream", "text/plain"].includes(mime) || !response.body) throw Error("download_response_denied");
+          const reader = response.body.getReader();
+          const chunks = []; let size = 0;
+          try {
+            while (true) {
+              const chunk = await reader.read(); if (chunk.done) break;
+              size += chunk.value.length;
+              if (size > 8 * 1024 * 1024) throw Error("download_size_limit");
+              chunks.push(chunk.value);
+            }
+          } finally { await reader.cancel(); }
+          if (!size) throw Error("download_empty");
+          let binary = "";
+          for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 8192) binary += String.fromCharCode(...chunk.subarray(i, i + 8192));
+          return { base64: btoa(binary), size, mime };
+          } finally { clearTimeout(timeout); }
+        }, args: [String(msg.url), String(msg.name)] });
+      if (replies.length !== 1 || replies[0].frameId !== 0 || !replies[0].result) throw Error("download_observation_failed");
+      return replies[0].result;
+    }
     case "navigate": {
       const tab = await toolsTab(msg);
       const url = String(msg.url || "");
@@ -1759,7 +1813,7 @@ async function toolsHandle(msg, line) {
     }
     case "history": {
       const tab = await toolsTab(msg);
-      await toolsHistory(tab.id, Number(msg.delta) || 0);
+      await toolsHistory(tab.id, Number(msg.delta) || 0, msg.scope_hosts ?? null);
       return { loaded: true };
     }
     case "wait_load": {

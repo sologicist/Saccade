@@ -96,6 +96,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+scribe = ["litellm>=1.0"]
 # Paired iPhone/iPad (the simulator path needs only Xcode).
 ios = ["pymobiledevice3>=10; sys_platform == 'darwin'"]
 
@@ -124,6 +125,10 @@ include = [
     # Technical platform metadata lives beside AutoCua in source and site-packages.
     # Include only configuration files, never local platform customer data.
     { path = "platforms/*/platform.json", format = ["sdist", "wheel"] },
+    { path = "platforms/*/execution.json", format = ["sdist", "wheel"] },
+    { path = "platforms/*/capabilities.json", format = ["sdist", "wheel"] },
+    { path = "platforms/*/functions/*.py", format = ["sdist", "wheel"] },
+    { path = "platforms/*/learning.json", format = ["sdist", "wheel"] },
     { path = "AutoCua/saccade/business_functions/platforms/dext/policy.json", format = ["sdist", "wheel"] },
     { path = "AutoCua/android/agent_native.pyd", format = "wheel" },   # Windows
     { path = "AutoCua/android/agent_native.so", format = "wheel" },    # macOS, Linux

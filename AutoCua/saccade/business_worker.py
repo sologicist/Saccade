@@ -10,6 +10,19 @@ from .business_contract import BusinessError, MAX_OUTPUT, dumps, loads, reject, 
 
 
 def execute(request):
+    if type(request) is dict and request.get('version') == 2:
+        if type(request['version']) is not int or set(request) - {'authorization'} != {'version','context','project_root','revision','name','arguments','session_id'}:
+            reject('invalid_worker_request')
+        from .capabilities import execute_worker
+        try:
+            return execute_worker(request)
+        except BusinessError as error:
+            from .scribe_pdf import ERRORS
+            code = str(error)
+            allowed = {'capability_revision_changed','unregistered_capability','schema_mismatch','verified_download_receipt_required','foreign_download_receipt','download_file_changed','verified_record_identity_required','capability_effect_unverified'}
+            return {'status':'error','error':code if code in allowed | ERRORS else 'capability_execution_failed','result':None}
+        except Exception:
+            return {'status':'error','error':'capability_execution_failed','result':None}
     from .business_run import BusinessRun, WORKER_ERRORS
     if type(request) is not dict or set(request) != {"version", "ticket", "context", "project_root", "offline_receipts", "model"} or type(request["version"]) is not int or request["version"] != 1:
         reject("invalid_worker_request")
@@ -28,6 +41,8 @@ def execute(request):
         snapshot, clients = run.snapshot()
         if snapshot["revision"] != ticket["revision"]:
             reject("business_revision_changed")
+        from .client_references import require_reference_bundle
+        require_reference_bundle(run.data_root, ticket["arguments"]["client_id"])
         from AutoCua.saccade.business_functions.platforms.dext.runtime import AccountingContext, _CURRENT
         context = AccountingContext(run.data_root, clients, model=request["model"], offline_receipts=run.offline_receipts)
         token = _CURRENT.set(context)

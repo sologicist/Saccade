@@ -190,6 +190,13 @@ async function elementSettle(tabId) {
 // that asks after its parent's result went back is still placed. One listener per
 // frame: a new scan replaces it, and hellos carrying another scan's nonce are ignored.
 function elementScanPage(cfg, scan) {
+  // A descriptive label, never permission or document identity evidence.
+  function elementDextPdfName(el, tag) {
+    const receipt = el.closest?.('.receipt-page');
+    return tag === 'button' && el.matches?.('button.download.s-button-download') && receipt
+        ? 'T\u00e9l\u00e9charger PDF' : '';
+  }
+
   let frameElement = null;
   try {
     frameElement = window.frameElement;
@@ -796,7 +803,7 @@ function elementScanPage(cfg, scan) {
         const kind = act ? "a" : land ? "l" : "t";
         const rec = {
           el, tag, role, parent: parent[ni], node: ni, doc: docI, rect: r, kind,
-          name: clip(axName || text, lim.max_name),
+          name: clip(axName || text || elementDextPdfName(el, tag), lim.max_name),
           idx: null, ty: null, href: null, checked: false, expanded: null, val: null, editable: false,
         };
         if (act) {

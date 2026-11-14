@@ -42,6 +42,8 @@ const ON_THE_PAGE: [&str; 6] = ["click", "hold_click", "input", "vault", "keyboa
 /// Routes one step's actions against the live browser.
 pub struct ControllerView {
     business: Mutex<Option<crate::tool_registry::business::BusinessGate>>,
+    dext_control: Mutex<Option<Py<PyAny>>>,
+    learning_control: Mutex<Option<Py<PyAny>>>,
     /// The scanner owns the CDP connection, so every page action has to go
     /// through it — there is no second channel to the browser.
     scanner: Arc<Mutex<ScannerInner>>,
@@ -79,6 +81,8 @@ impl ControllerView {
         };
         Ok(ControllerView {
             business: Mutex::new(None),
+            dext_control: Mutex::new(None),
+            learning_control: Mutex::new(None),
             scanner,
             stop_event,
             single_tab,
@@ -94,8 +98,7 @@ impl ControllerView {
     pub fn configure_business(&self, py: Python<'_>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let gate = match context {
             Some(context) => {
-                let value: Value = pythonize::depythonize(context)?;
-                if value["platform_id"] == "dext" && value["execution_mode"] == "supervised" {
+                if py.import("AutoCua.saccade.business_run")?.call_method1("supports_legacy", (context,))?.extract::<bool>()? {
                     Some(crate::tool_registry::business::BusinessGate::new(py, context)?)
                 } else { None }
             }
@@ -106,7 +109,114 @@ impl ControllerView {
     }
 
     pub fn refresh_business(&self, py: Python<'_>) -> PyResult<Option<Value>> {
-        self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()
+        let mut definition = self.business.lock().unwrap().as_ref().map(|gate| gate.refresh(py)).transpose()?;
+        let learning = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let supervised = learning.as_ref().map(|c| c.bind(py).getattr("context")?.get_item("execution_mode")?.extract::<String>()).transpose()?.is_some_and(|mode|mode == "supervised");
+        if let Some(learning) = learning {
+            let generic = learning.bind(py).call_method0("execution_tools")?;
+            if !generic.is_none() {
+                let merged = py.import("AutoCua.saccade.capabilities")?.getattr("merge_tools")?
+                    .call1((pythonize::pythonize(py, &definition)?, generic))?;
+                definition = Some(pythonize::depythonize(&merged)?);
+            }
+        }
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        if let Some(control) = control { control.bind(py).call_method0("freeze_decision")?; }
+        let mut definitions: Vec<Value> = definition.into_iter().collect();
+        if supervised { definitions.push(crate::tool_registry::service::download_tool()); }
+        if self.dext_control.lock().unwrap().is_some() {
+            let tool: Value = pythonize::depythonize(&py.import("AutoCua.saccade.dext_control")?.getattr("NAVIGATION_TOOL")?)?;
+            definitions.push(tool);
+        }
+        Ok(if definitions.is_empty() { None } else { Some(json!(definitions)) })
+    }
+
+    pub fn configure_dext_control(&self, py: Python<'_>, control: Option<&Bound<'_, PyAny>>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let checked = match control {
+            Some(control) if !control.is_none() => {
+                let context = context.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("operator_channel_required"))?;
+                Some(py.import("AutoCua.saccade.dext_control")?.getattr("validate_control")?
+                    .call1((control, context))?.unbind())
+            },
+            _ => None,
+        };
+        self.configure_learning_control(py, control, context)?;
+        *self.dext_control.lock().unwrap() = checked;
+        Ok(())
+    }
+
+    pub fn configure_learning_control(&self, py: Python<'_>, control: Option<&Bound<'_, PyAny>>, context: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let checked = match control {
+            Some(control) if !control.is_none() => {
+                let context = context.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("operator_channel_required"))?;
+                Some(py.import("AutoCua.saccade.platform_learning")?.getattr("validate_learning_control")?
+                    .call1((control, context))?.unbind())
+            },
+            _ => None,
+        };
+        *self.learning_control.lock().unwrap() = checked;
+        Ok(())
+    }
+
+    pub fn procedure_overlay(&self, py: Python<'_>) -> PyResult<String> {
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        match control { Some(control) => control.bind(py).call_method0("overlay")?.extract(), None => Ok(String::new()) }
+    }
+
+    pub fn procedure_overlay_for(&self, py: Python<'_>, selected: &str) -> PyResult<String> {
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        if let Some(control) = control {
+            let platform: String = control.bind(py).getattr("context")?.get_item("platform_id")?.extract()?;
+            if selected != format!("{platform}.md") {
+                return Err(pyo3::exceptions::PyValueError::new_err("learning_platform_mismatch"));
+            }
+        }
+        self.procedure_overlay(py)
+    }
+
+    pub fn conversational_intervention(&self, py: Python<'_>) -> PyResult<Option<Value>> {
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let Some(control) = control else { return Ok(None) };
+        let control = control.bind(py);
+        if !control.getattr("conversational")?.extract::<bool>()? { return Ok(None) }
+        control.call_method0("freeze_decision")?;
+        let (elements, stamp) = super::service::scan_op(py, &self.scanner, |scanner| {
+            Ok((scanner.mapping.clone(), scanner.platform_learning_stamp()?))
+        }).map_err(|error| match error {
+            ActErr::Py(error) => error,
+            ActErr::Msg(message) => pyo3::exceptions::PyValueError::new_err(message),
+        })?;
+        control.call_method1("observe_native", (pythonize::pythonize(py, &elements)?, pythonize::pythonize(py, &stamp)?))?;
+        let teaching = control.getattr("teaching")?;
+        if !teaching.is_none() && !teaching.getattr("source")?.is_none() {
+            // The corrected public control is visible. Let the SAME model and
+            // controller execute it (with targeted approval when necessary).
+            return Ok(None);
+        }
+        let request = control.call_method0("learning_intervention")?;
+        if request.is_none() { Ok(None) } else { pythonize::depythonize(&request).map(Some).map_err(Into::into) }
+    }
+
+    fn request_dext_navigation(&self, py: Python<'_>, action: &Value) -> PyResult<Value> {
+        let control = self.dext_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let Some(control) = control else {
+            return Ok(json!({"status":"error", "tool":"dext_navigation", "code":"operator_channel_required", "operator_review_required":true}));
+        };
+        // This path never dispatches input. Native observation proves scope and
+        // download DENY, not unimplemented Dext target/frame/record semantics.
+        let stamp = match super::service::scan_op(py, &self.scanner, |s| s.dext_navigation_stamp()) {
+            Ok(stamp) => stamp,
+            Err(ActErr::Py(error)) => return Err(error),
+            Err(ActErr::Msg(_)) => return Ok(json!({"status":"error", "tool":"dext_navigation", "code":"unverified_navigation_observation", "operator_review_required":true})),
+        };
+        let elements = self.state.lock().unwrap().elements.clone();
+        let result = control.bind(py).call_method1("observe_native", (pythonize::pythonize(py, &elements)?, pythonize::pythonize(py, &stamp)?))
+            .and_then(|_| control.bind(py).call_method1("propose_navigation", (pythonize::pythonize(py, action)?,)))
+            .and_then(|_| control.bind(py).call_method0("wait_navigation_review"));
+        match result {
+            Ok(value) => pythonize::depythonize(&value).map_err(Into::into),
+            Err(_) => Ok(json!({"status":"error", "tool":"dext_navigation", "code":"navigation_preview_unavailable", "operator_review_required":true})),
+        }
     }
 
     #[cfg(test)]
@@ -132,6 +242,142 @@ impl ControllerView {
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => Err(error),
             Err(_) => Ok(crate::tool_registry::business::denied()),
         }
+    }
+
+    fn operator_execution(&self, py: Python<'_>, action: &Value) -> PyResult<Option<Value>> {
+        let kind = action["type"].as_str().unwrap_or_default();
+        if !matches!(kind, "click" | "hold_click" | "input" | "keyboard" | "dialog" | "call_function" | "download") { return Ok(None) }
+        let control = self.learning_control.lock().unwrap().as_ref().map(|c| c.clone_ref(py));
+        let Some(control) = control else { return Ok(None) };
+        let observed = self.state.lock().unwrap().elements.clone();
+        let refresh = matches!(kind, "click" | "hold_click" | "input" | "keyboard" | "dialog" | "download") || (kind == "call_function" && action["name"] == "dext.scribe_pdf");
+        
+        let (elements, stamp, surface_changed) =
+            super::service::scan_op(py, &self.scanner, |scanner| {
+                let previous_stamp = scanner.platform_learning_stamp()?;
+                let previous_url = scanner.url.clone();
+
+                if refresh {
+                    scanner.scan_core()?;
+                }
+
+                let mut stamp = scanner.platform_learning_stamp()?;
+
+                let surface_changed = previous_url != scanner.url
+                    || ["session", "tab", "profile", "config_revision", "platform_id"]
+                        .iter()
+                        .any(|key| previous_stamp.get(*key) != stamp.get(*key));
+
+                if kind == "keyboard" {
+                    stamp["focus"] =
+                        scanner.bridge_call(json!({"type":"execution_focus"}))?;
+                }
+
+                if kind == "dialog" {
+                    stamp["dialog"] =
+                        scanner.open_dialog().unwrap_or(Value::Null);
+                }
+
+                let page = ring::digest::digest(
+                    &ring::digest::SHA256,
+                    scanner.url.as_bytes(),
+                );
+
+                stamp["page"] = json!(
+                    page.as_ref()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                );
+
+                Ok((scanner.mapping.clone(), stamp, surface_changed))
+            })
+            .map_err(|e| match e {
+                ActErr::Py(e) => e,
+                ActErr::Msg(s) => pyo3::exceptions::PyValueError::new_err(s),
+            })?;
+
+        // Check the intended target, not every unrelated element on the page.
+        let target_changed = if matches!(
+            kind,
+            "click" | "hold_click" | "input" | "download"
+        ) {
+            let id = if kind == "download" {
+                action.get("target_id")
+            } else {
+                action.get("id")
+            };
+
+            let key = id
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+                .map(|id| id.to_string());
+
+            match key {
+                Some(key) => match (observed.get(&key), elements.get(&key)) {
+                    (Some(before), Some(after)) => {
+                        before != after
+                            || elements
+                                .values()
+                                .filter(|candidate| *candidate == after)
+                                .count() != 1
+                    }
+                    _ => true,
+                },
+                None => true,
+            }
+        } else {
+            // Actions without a numeric target keep the stricter check.
+            observed != elements
+        };
+
+        if refresh && (surface_changed || target_changed) {
+            return Ok(Some(json!({
+                "status": "reobserve",
+                "tool": kind,
+                "code": "target_changed_before_dispatch",
+                "executed": false,
+                "message": "No action was executed. The browser surface or the intended target changed. Observe the current page again and choose a fresh target ID. Do not reuse the previous ID."
+            })));
+        }
+
+        let decision = control.bind(py).call_method1("authorize_execution", (pythonize::pythonize(py, action)?,
+            pythonize::pythonize(py, &stamp)?, pythonize::pythonize(py, &elements)?))?;
+        let decision: Value = pythonize::depythonize(&decision)?;
+        if decision["unavailable"] == true {
+            if kind == "call_function" && self.business.lock().unwrap().is_none() {
+                return Ok(Some(json!({"status":"error","tool":kind,"code":"unregistered_capability","executed":false,
+                    "message":"No such capability is installed for this platform. Use only the installed registry, not browser searches."})));
+            }
+            return Ok(None)
+        }
+        if decision["allowed"] != true {
+            return Ok(Some(json!({"status":"waiting_operator","tool":kind,"executed":false,
+                "intervention":{"category":"confirmation","reason":"condition_confirmation",
+                "request":"Please review the exact proposed operation below. May I execute this action once? This is separate from saving a procedure."}})));
+        }
+        if kind == "call_function" {
+            let result = control.bind(py).call_method1("execute_capability", (pythonize::pythonize(py, action)?,))?;
+            return Ok(Some(pythonize::depythonize(&result)?));
+        }
+        if kind == "download" {
+            let pending = control.bind(py).getattr("execution")?.getattr("pending")?;
+            if decision["effect"] != "download" || !decision["decision_id"].is_string()
+                || pending.is_none() || pending.get_item("state")?.extract::<String>()? != "consumed"
+                || pending.get_item("id")?.extract::<String>()? != decision["decision_id"].as_str().unwrap_or_default() {
+                return Err(pyo3::exceptions::PyValueError::new_err(crate::platform_scope::APPROVAL_UNAVAILABLE));
+            }
+            let result = super::service::scan_op(py, &self.scanner, |scanner| {
+                scanner.arm_scoped_gesture("download", action)?;
+                let result = scanner.download_observed(action);
+                scanner.clear_scoped_gesture();
+                result
+            })
+                .map_err(|e| match e { ActErr::Py(e) => e, ActErr::Msg(s) => pyo3::exceptions::PyValueError::new_err(s) })?;
+            let receipt = control.bind(py).call_method1("save_download", (pythonize::pythonize(py, &result)?,))?;
+            return Ok(Some(pythonize::depythonize(&receipt)?));
+        }
+        Ok(Some(json!({"operator_authorized":true,"effect":decision["effect"]})))
     }
 
     /// Hand over the ids from the scan the model was just shown. The app-name
@@ -163,10 +409,12 @@ impl ControllerView {
         });
         match checked {
             Ok(()) => Ok(None),
-            Err(ActErr::Msg(message)) => Ok(Some(json!({
-                "status": "error", "tool": tool, "message": message,
-                "operator_review_required": true,
-            }))),
+            Err(ActErr::Msg(message)) => {
+                let undispatched = message == crate::platform_scope::APPROVAL_UNAVAILABLE;
+                Ok(Some(json!({"status":"error", "tool":tool, "message":message,
+                    "code": if undispatched { "unsupported_navigation" } else { "platform_scope_mismatch" },
+                    "executed": if undispatched { Some(false) } else { None }, "operator_review_required":true})))
+            },
             Err(ActErr::Py(error)) => Err(error),
         }
     }
@@ -223,9 +471,21 @@ impl ControllerView {
             _ => Vec::new(),
         };
 
-        if actions.len() > 1 && actions.iter().any(|a| a["type"] == "call_function") && actions.iter().any(|a| a["type"] == "done") {
+        if actions.len() > 1 && actions.iter().any(|a| a["type"] == "call_function" || a["type"] == "dext_navigation") && actions.iter().any(|a| a["type"] == "done") {
             return Ok(json!({"status":"error", "action":"multiple", "results": actions.iter().map(|a|
                 json!({"status":"not_run", "tool":a["type"], "code":"done_must_be_alone"})).collect::<Vec<_>>()}));
+        }
+        if let Some(ask) = actions.iter().find(|a| a["type"] == "ask_operator") {
+            let mut request = ask.clone(); request.as_object_mut().unwrap().remove("type");
+            let checked = py.import("AutoCua.saccade.operator_requests")?.getattr("validate_request")?
+                .call1((pythonize::pythonize(py, &request)?,));
+            let result = match checked {
+                Ok(value) => json!({"status":"waiting_operator","tool":"ask_operator","intervention":pythonize::depythonize::<Value>(&value)?}),
+                Err(_) => json!({"status":"waiting_operator","tool":"ask_operator","intervention":{"category":"blocked","reason":"unsafe_or_blocked","request":"The intervention request could not be safely displayed. Review the task privately."}}),
+            };
+            if actions.len() == 1 { return Ok(result); }
+            return Ok(json!({"status":"waiting_operator","action":"multiple","results":actions.iter().map(|a|
+                if a["type"] == "ask_operator" { result.clone() } else { json!({"status":"not_run","tool":a["type"],"code":"operator_suspension_preempts_batch"}) }).collect::<Vec<_>>()}));
         }
         if actions.len() == 1 {
             let (mut result, opened) = self.one(py, &actions[0])?;
@@ -353,6 +613,46 @@ impl ControllerView {
     /// or prompt): the page is frozen behind it until the model answers it, which
     /// the next input shows as `<dialog>`.
     fn one(&self, py: Python<'_>, action: &Value) -> PyResult<(Value, bool)> {
+        if self.stopped(py)? {
+            return Ok((json!({"status":"stopped", "tool":action["type"]}), false));
+        }
+        if action.get("type").and_then(Value::as_str) == Some("dext_navigation") {
+            if self.stopped(py)? { return Ok((json!({"status":"stopped", "tool":"dext_navigation"}), false)); }
+            return Ok((self.request_dext_navigation(py, action)?, false));
+        }
+        let execution = match self.operator_execution(py, action) {
+            Ok(result) => result,
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => return Err(error),
+            Err(error) => {
+                let detail = error.value(py).to_string();
+                let codes = ["scribe_client_mismatch", "invalid_invoice_direction", "scribe_document_confirmation_required", "scribe_authorization_changed", "download_origin_denied", "download_target_changed", "download_response_denied", "download_size_limit", "download_empty", "invalid_pdf_download", "download_requires_observed_link", "invalid_download_target", "unobserved_download_target", "invalid_download_url", "download_requires_platform", "download_observation_failed", "invalid_download_receipt", "verified_download_receipt_required", "foreign_download_receipt", "download_file_changed"];
+                let code = if detail.contains(crate::platform_scope::APPROVAL_UNAVAILABLE) {
+                    "APPROVAL_UNAVAILABLE"
+                } else if detail.contains("not in extension mode") { "chrome_bridge_unavailable" }
+                else if detail.contains("bridge state poisoned") { "chrome_bridge_poisoned" }
+                else if detail.contains("connection to AutoCuaBridge was lost") { "chrome_bridge_disconnected" }
+                else if detail.contains("no answer from AutoCuaBridge") { "chrome_bridge_timeout" }
+                else if detail.contains("connect") && detail.contains("AutoCuaBridge") { "chrome_bridge_unavailable" }
+                else if detail.contains("Failed to fetch") || detail.contains("fetch failed") { "download_fetch_failed" }
+                else { codes.iter().copied().find(|code| detail.contains(code)).unwrap_or(
+                    if action["type"] == "download" { "download_failed" } else { "execution_not_verified" }) };
+                // Preserve the owned browser for a supported alternative. A
+                // lost security boundary still takes the existing hard-failure
+                // path; an unsupported download must never become success.
+                if let Some(failure) = self.platform_check(py, None)? { return Ok((failure, false)); }
+                if let Some(control) = self.learning_control.lock().unwrap().as_ref() {
+                    control.bind(py).call_method0("fail_execution")?;
+                }
+                let request = match code {
+                    _ => format!("Operation blocked: {code}. Review the document, client, direction or download response before choosing a supported alternative. No successful effect is claimed; do not replay an uncertain effect."),
+                };
+                return Ok((json!({"status":"waiting_operator", "tool":action["type"], "code":code,
+                    "intervention":{"category":"blocked", "reason":"unsafe_or_blocked",
+                    "request":request}}), false));
+            }
+        };
+        let operator_authorized = execution.as_ref().is_some_and(|v| v["operator_authorized"] == true);
+        if let Some(result) = execution.as_ref().filter(|v| v["operator_authorized"] != true) { return Ok((result.clone(), false)); }
         if action.get("type").and_then(Value::as_str) == Some("call_function") {
             if self.stopped(py)? {
                 return Ok((json!({"status":"stopped", "tool":"call_function"}), false));
@@ -365,7 +665,7 @@ impl ControllerView {
         }
         // All model tools, including unknown or bookkeeping calls, reach this
         // boundary before any browser side effect or completion result.
-        if let Some(failure) = self.platform_check(py, Some(action))? {
+        if let Some(failure) = self.platform_check(py, if operator_authorized { None } else { Some(action) })? {
             return Ok((failure, false));
         }
         // What the page did before this action — while the model was
@@ -409,7 +709,60 @@ impl ControllerView {
             let message = format!("{WEB_STORE_BLOCKED}. Leave it with navigate_tab back, update_tab or new_tab");
             return Ok((json!({"status": "error", "tool": kind, "message": message}), false));
         }
-        let mut result = self.one_inner(py, action)?;
+        
+        let scoped_gesture = operator_authorized
+            && matches!(
+                kind.as_str(),
+                "click" | "hold_click" | "input" | "keyboard" | "dialog"
+            );
+
+        if scoped_gesture {
+            super::service::scan_op(py, &self.scanner, |scanner| {
+                scanner.arm_scoped_gesture(&kind, action)
+            })
+            .map_err(|error| match error {
+                ActErr::Py(error) => error,
+                ActErr::Msg(message) =>
+                    pyo3::exceptions::PyValueError::new_err(message),
+            })?;
+        }
+
+        // Use the existing AutoCua native action dispatcher.
+        let dispatched = self.one_inner(py, action);
+
+        // Always clear the temporary authority, even if the action failed.
+        let cleanup = super::service::scan_op(
+            py,
+            &self.scanner,
+            |scanner| {
+                scanner.clear_scoped_gesture();
+                Ok(())
+            },
+        );
+
+        cleanup.map_err(|error| match error {
+            ActErr::Py(error) => error,
+            ActErr::Msg(message) =>
+                pyo3::exceptions::PyValueError::new_err(message),
+        })?;
+
+        let mut result = dispatched?;
+        let observed_download_click = matches!(kind.as_str(), "click" | "hold_click") && {
+            let state = self.state.lock().unwrap();
+            let key = action["id"].as_i64().unwrap_or_default().to_string();
+            state.elements.get(&key).is_some_and(|target| {
+                let name = target["name"].as_str().unwrap_or_default().trim().to_lowercase();
+                matches!(name.as_str(), "download" | "download pdf" | "telecharger" | "télécharger" | "télécharger pdf") ||
+                    target["line"].as_str().unwrap_or_default().contains(" download=")
+            })
+        };
+        if result["status"] == "success" && (observed_download_click || execution.as_ref().is_some_and(|v|v["effect"] == "download")) {
+            return Ok((json!({"status":"waiting_operator","tool":kind,"code":"native_download_unconfirmed",
+                "intervention":{"category":"blocked","reason":"unsafe_or_blocked",
+                "request":"The native click was dispatched, but no completed browser download with a verified absolute file path is available. Scoped browser download DENY remains active. No download receipt or Scribe success is claimed. Do not repeat this unchanged action or automate a system Save/Print dialog."}}),false));
+        }
+
+
         // Where the tabs are now, in case the browser goes away before the
         // next scan (ScannerInner::revive reopens them).
         super::service::scan_op(py, &self.scanner, |s| {
@@ -714,14 +1067,19 @@ mod platform_tests {
     fn controller_blocks_effects_before_any_browser_dispatch() {
         Python::initialize();
         Python::attach(|py| {
-            for kind in ["click", "hold_click", "input", "vault", "keyboard", "scroll", "dialog",
+            for kind in ["click", "hold_click", "input", "vault", "keyboard", "dialog",
                          "run_script", "more", "index", "navigate_tab", "close_tab", "download", "call_function", "unknown"] {
                 let fixture = Fixture::new();
+                fixture.scanner.lock().unwrap().business_test_observations = Some(std::collections::VecDeque::from(vec![json!({
+                    "schema_version":1, "observer_id":"synthetic-observer", "failure":"", "overflow":false,
+                    "downloads_denied":true, "tabs":[{"id":"1", "url":"https://app.dext.com/login"}], "events":[]
+                }); 8]));
                 let result = fixture.view.route_action(py, &json!({"type": kind, "id": 1, "value": "synthetic"})).unwrap();
                 assert_eq!(result["status"], "error", "{kind}: {result}");
                 assert_eq!(result["tool"], kind);
                 assert_eq!(result["operator_review_required"], true);
-                assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+                assert!(fixture.scanner.lock().unwrap().platform_violation().is_none());
+                if result["code"] == "unsupported_navigation" { assert_eq!(result["executed"], false); }
             }
         });
     }
@@ -765,8 +1123,9 @@ mod platform_tests {
                         json!({"type": "navigate", "url": "https://app.dext.com.evil.test/"}),
                         json!({"type": "reload"})] {
             let fixture = Fixture::new();
+            let foreign_navigation = request["type"] == "navigate";
             assert!(fixture.scanner.lock().unwrap().bridge_request(request).is_err());
-            assert!(fixture.scanner.lock().unwrap().platform_violation().is_some());
+            assert_eq!(fixture.scanner.lock().unwrap().platform_violation().is_some(), foreign_navigation);
         }
         let root = std::env::temp_dir();
         let mut generic = ScannerInner::new(&root, 0, None, false);

@@ -2394,8 +2394,13 @@ fn show_by_tabs_api(port: u16, window: &Value, url: &str, twins: usize, place: u
 pub struct ScannerInner {
     #[cfg(test)]
     pub business_test_observations: Option<std::collections::VecDeque<Value>>,
+    #[cfg(test)]
+    pub business_test_actions: Vec<Value>,
+    #[cfg(test)]
+    pub business_test_download: Option<Value>,
     /// A selected platform is an execution policy, never page-provided context.
     platform_scope: Option<crate::platform_scope::PlatformScope>,
+    scoped_gesture: Option<(String, String, Option<Value>)>,
     scope_initialized: bool,
     scope_observer_id: String,
     pub port: u16,
@@ -2425,6 +2430,10 @@ pub struct ScannerInner {
     pub all_tabs: String,
     pub url: String,
     pub mapping: serde_json::Map<String, Value>,
+    /// The host broker owns this passive browser; keep its private pipe alive.
+    pub operator_handoff: bool,
+    scope_session_id: String,
+    scope_cleanup_verified: bool,
     /// device px per CSS px, from the most recent scan.
     pub dpr: f64,
     /// Wall time of the most recent scan_elements(), in seconds.
@@ -2523,7 +2532,12 @@ impl ScannerInner {
         ScannerInner {
             #[cfg(test)]
             business_test_observations: None,
+            #[cfg(test)]
+            business_test_actions: Vec::new(),
+            #[cfg(test)]
+            business_test_download: None,
             platform_scope: None,
+            scoped_gesture: None,
             scope_initialized: false,
             scope_observer_id: String::new(),
             port,
@@ -2554,6 +2568,9 @@ impl ScannerInner {
             all_tabs: String::new(),
             url: String::new(),
             mapping: serde_json::Map::new(),
+            operator_handoff: false,
+            scope_session_id: String::new(),
+            scope_cleanup_verified: false,
             dpr: 1.0,
             last_scan_seconds: 0.0,
             keep_requests: false,
@@ -2578,12 +2595,17 @@ impl ScannerInner {
     }
 
     pub fn set_platform_scope(&mut self, scope: crate::platform_scope::PlatformScope) {
+        self.scoped_gesture = None;
+        self.scope_cleanup_verified = false;
         self.platform_scope = Some(scope);
         self.scope_initialized = false;
         self.scope_observer_id = format!("{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_nanos());
+        if self.scope_session_id.is_empty() { self.scope_session_id = self.scope_observer_id.clone(); }
     }
+
+    pub(crate) fn navigation_scope(&self) -> Option<crate::platform_scope::PlatformScope> { self.platform_scope.clone() }
 
     pub fn platform_violation(&self) -> Option<String> {
         self.platform_scope.as_ref().and_then(|scope| scope.violation().map(str::to_string))
@@ -2594,6 +2616,7 @@ impl ScannerInner {
     }
 
     pub fn end_platform_scope(&mut self) -> SResult<()> {
+        self.scoped_gesture = None;
         if self.platform_scope.is_none() || self.scope_observer_id.is_empty() || !self.bridged() {
             return Ok(());
         }
@@ -2612,6 +2635,7 @@ impl ScannerInner {
             || reply.get("cleanup_failure").and_then(Value::as_str) != Some("") {
             return Err(self.platform_failure("Platform cleanup is unverified; operator review is required before using this profile again."));
         }
+        self.scope_cleanup_verified = true;
         #[cfg(windows)]
         {
             let Some(bridge) = self.bridge.clone() else {
@@ -2621,7 +2645,13 @@ impl ScannerInner {
             };
 
             let restored = match bridge.lock() {
-                Ok(mut guard) => guard.finish_scoped_download_session(),
+                Ok(mut guard) => {
+                    if self.operator_handoff {
+                        guard.ensure_scoped_downloads_denied()
+                    } else {
+                        guard.finish_scoped_download_session()
+                    }
+                },
                 Err(_) => Err(ScanErr::s(
                     "The protected Chrome bridge lock is unavailable."
                 )),
@@ -2664,6 +2694,17 @@ impl ScannerInner {
             };
             Some(json!({"id": id, "url": url, "pendingUrl": pending}))
         }).collect()
+    }
+
+    pub(crate) fn resume_target(remembered: Option<&str>, authorized: &[String]) -> Result<String, &'static str> {
+        if let Some(target) = remembered {
+            return if authorized.iter().any(|id| id == target) { Ok(target.to_string()) }
+                else { Err("Operator review required: the original controlled page is unavailable.") };
+        }
+        if authorized.len() != 1 {
+            return Err("Operator review required: resume needs exactly one authorized page in this profile.");
+        }
+        Ok(authorized[0].clone())
     }
 
     /// Open or resume the scoped surface before any model observation. A resumed
@@ -2718,10 +2759,8 @@ impl ScannerInner {
             return Err(self.platform_failure(format!("Operator review required before starting: {message}")));
         }
         let target = if resumed {
-            if authorized.len() != 1 {
-                return Err(self.platform_failure("Operator review required: resume needs exactly one authorized page in this profile."));
-            }
-            authorized.remove(0)
+            Self::resume_target(self.tab_id.as_deref(), &authorized)
+                .map_err(|message| self.platform_failure(message))?
         } else {
             self.create_tab_raw()?
         };
@@ -2735,6 +2774,7 @@ impl ScannerInner {
         }
         self.scope_initialized = true;
         self.check_platform_scope()?;
+        self.operator_handoff = false;
         self.show_tab(!resumed);
         Ok(())
     }
@@ -2876,6 +2916,11 @@ impl ScannerInner {
     pub fn authorize_platform_action(&mut self, action: &Value) -> SResult<()> {
         let Some(scope) = self.platform_scope.as_ref() else { return Ok(()) };
         if let Err(message) = scope.validate_action(action) {
+            // A pre-dispatch refusal proves that no action ran. It must not
+            // poison the browser ownership checkpoint as a scope violation.
+            if message == crate::platform_scope::APPROVAL_UNAVAILABLE {
+                return Err(ScanErr::s(message));
+            }
             return Err(self.platform_failure(message));
         }
         self.check_platform_scope()?;
@@ -2898,6 +2943,52 @@ impl ScannerInner {
             return Err(self.platform_failure(message));
         }
         self.check_platform_scope()
+    }
+
+    /// Scope evidence from this scanner and its enforced platform policy only.
+    /// This stamp is not a gesture, record or disclosure authorization.
+    pub fn platform_learning_stamp(&mut self) -> SResult<Value> {
+        self.check_platform_scope()?;
+        let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
+        Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
+            "platform_id": scope.platform_id, "profile": scope.browser_profile, "session": self.scope_session_id,
+            "config_revision": scope.config_revision}))
+    }
+
+    /// One explicitly approved, observed top-frame link, fetched by trusted
+    /// bridge code with redirect rejection; global download denial stays set.
+    pub fn download_observed(&mut self, action: &Value) -> SResult<Value> {
+        self.check_platform_scope()?;
+        let req = self.observed_download_request(action)?;
+        let result = self.bridge_request(req)?;
+        self.check_platform_scope()?;
+        Ok(result)
+    }
+
+    fn observed_download_request(&self, action: &Value) -> SResult<Value> {
+        let key = action.get("target_id").and_then(Value::as_i64).filter(|id| *id > 0)
+            .ok_or_else(|| ScanErr::s("invalid_download_target"))?.to_string();
+        let target = self.mapping.get(&key).ok_or_else(|| ScanErr::s("unobserved_download_target"))?;
+        let line = target["line"].as_str().unwrap_or_default();
+        let tag = line.split_once('<').and_then(|(_, s)| s.split_once('>')).map(|(s, _)| s).unwrap_or_default();
+        let href = tag.split_once("href=\"").and_then(|(_, s)| s.split_once('"')).map(|(s, _)| s)
+            .ok_or_else(|| ScanErr::s("download_requires_observed_link"))?;
+        let url = url::Url::parse(&self.url).and_then(|base| base.join(href)).map_err(|_| ScanErr::s("invalid_download_url"))?.to_string();
+        self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("download_requires_platform"))?.validate_url(&url).map_err(ScanErr::s)?;
+        let name = target["name"].as_str().unwrap_or_default().to_string();
+        let tab = self.tab_id.as_ref().ok_or_else(|| ScanErr::s("download_target_changed"))?;
+        Ok(json!({"type":"download_observed", "url":url, "name":name,"tabId":Self::bridge_tab_id(tab)}))
+    }
+
+    /// Scope-only metadata for a local UI preview; never an input permit.
+    pub fn dext_navigation_stamp(&mut self) -> SResult<Value> {
+        let scope = self.platform_scope.as_ref().ok_or_else(|| ScanErr::s("operator_channel_required"))?;
+        if scope.platform_id != "dext" || scope.execution_mode != "supervised" || scope.browser_profile != "saccade-dext" {
+            return Err(ScanErr::s("unsupported_navigation_session"));
+        }
+        self.check_platform_scope()?;
+        Ok(json!({"observer": self.scope_observer_id, "tab": self.tab_id,
+            "profile": "saccade-dext", "config_revision": self.platform_scope.as_ref().expect("scoped").config_revision}))
     }
 
     /// The agent just sent the tab it drives to `url` (new_tab, update_tab).
@@ -2973,6 +3064,9 @@ impl ScannerInner {
     /// A request that names no tab (tabs, new_tab, the cursor broadcasts, glow,
     /// release). Answered, or an error the tool reports as it reports any other.
     pub fn bridge_request(&mut self, req: Value) -> SResult<Value> {
+        if req["type"] == "download_observed" && self.platform_scope.is_none() {
+            return Err(ScanErr::s(crate::platform_scope::APPROVAL_UNAVAILABLE));
+        }
         // Defense in depth for native helpers and automatic tool paths. Only
         // trusted observation/cosmetic requests and scoped navigation can use
         // the existing bridge while a platform context is installed.
@@ -2986,13 +3080,62 @@ impl ScannerInner {
                         .unwrap_or_else(|| Err("Platform navigation requires an explicit URL.".into())),
                     None => Ok(()), // internal blank-first bootstrap only
                 },
+
+                "execution_focus" => {
+                    // Read-only focus inspection for keyboard authorization.
+                    self.check_platform_scope()?;
+                    Ok(())
+                },
+
+                "click" | "input" | "keyboard" | "dialog" | "download_observed" => {
+                    // A native controller action must have explicitly armed
+                    // this exact browser gesture on this exact tab.
+                    // Consume the permit before dispatch.
+                    let grant = self.scoped_gesture.take();
+                    let armed = grant.is_some();
+                    let permitted = grant.is_some_and(
+                        |(expected_kind, expected_tab, download)| {
+                            expected_kind == kind
+                                && self.tab_id.as_ref() == Some(&expected_tab)
+                                && (kind != "download_observed" || download.is_some_and(|bound| {
+                                    bound["request"] == req && bound["page"] == self.url
+                                        && self.mapping.get(bound["target_id"].as_str().unwrap_or_default()) == Some(&bound["target"])
+                                }))
+                                && req.get("tabId")
+                                    == Some(&Self::bridge_tab_id(&expected_tab))
+                        },
+                    );
+
+                    if permitted {
+                        self.check_platform_scope()?;
+                        Ok(())
+                    } else {
+                        Err(if armed && kind == "download_observed" { "download_target_changed".to_string() } else { crate::platform_scope::APPROVAL_UNAVAILABLE.to_string() })
+                    }
+                },
+
                 "scan" | "tabs" | "platform_scope_begin" | "platform_scope_observe" | "platform_scope_end"
                 | "platform_scope_protect_tab" | "wait_load" | "settle" | "cursor"
                 | "frame" | "glow" | "release" | "activate" => Ok(()),
                 _ => Err(crate::platform_scope::APPROVAL_UNAVAILABLE.to_string()),
             };
+            
             if let Err(message) = allowed {
+                // Missing action authority is a pre-dispatch refusal,
+                // not evidence that the browser escaped its platform.
+                if message == crate::platform_scope::APPROVAL_UNAVAILABLE || message == "download_target_changed" {
+                    return Err(ScanErr::s(message));
+                }
+
                 return Err(self.platform_failure(message));
+            }
+
+        }
+        #[cfg(test)]
+        if req["type"] == "download_observed" {
+            if let Some(result) = self.business_test_download.clone() {
+                self.business_test_actions.push(req);
+                return Ok(result);
             }
         }
         let Some(bridge) = self.bridge.clone() else {
@@ -3398,7 +3541,7 @@ impl ScannerInner {
     /// holding the profile) and only reopen their own tab. The model is told
     /// on its next action's result.
     fn revive(&mut self) -> SResult<()> {
-        if self.platform_scope.is_some() {
+        if self.platform_scope.is_some() || self.operator_handoff {
             return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
         }
         let Some((headless, profile)) = self.relaunch.clone() else {
@@ -3516,7 +3659,7 @@ impl ScannerInner {
     /// last listing had them. A tab Chrome brought back by itself (a launch that
     /// restores the last session) is taken as it is rather than opened twice.
     fn revive_bridged(&mut self) -> SResult<()> {
-        if self.platform_scope.is_some() {
+        if self.platform_scope.is_some() || self.operator_handoff {
             return Err(self.platform_failure("The scoped browser closed; automatic relaunch requires operator review."));
         }
         let Some(bridge) = self.bridge.clone() else {
@@ -3693,6 +3836,31 @@ impl ScannerInner {
         self.cdp.drop_conn();
     }
 
+    pub fn close_operator_handoff(&mut self) -> SResult<()> {
+        #[cfg(windows)]
+        if let Some(bridge) = self.bridge.clone() {
+            if bridge.lock().map_err(|_| ScanErr::s("Protected bridge lock unavailable."))?.close_exited_owned_process() {
+                self.operator_handoff = false;
+                self.scope_initialized = false;
+                self.scope_observer_id.clear();
+                self.scope_cleanup_verified = true;
+                return Ok(());
+            }
+        }
+        self.operator_handoff = false;
+        self.end_platform_scope()?;
+        if self.platform_scope.is_some() && !self.scope_cleanup_verified {
+            return Err(ScanErr::s("Browser ownership release is unverified; retaining protected transport and profile lease for operator review."));
+        }
+        // The pause already released tab ownership. Do not send another tab
+        // request after closing the pipe (Chrome may exit on that EOF).
+        #[cfg(windows)]
+        if let Some(bridge) = self.bridge.clone() {
+            bridge.lock().map_err(|_| ScanErr::s("Protected bridge lock unavailable."))?.close_operator_transport()?;
+        }
+        Ok(())
+    }
+
     /// Reload tree/element.config.json over the embedded defaults.
     pub fn reload_config(&mut self) {
         self.cfg = element::load_config(&self.cfg_path.display().to_string());
@@ -3804,9 +3972,9 @@ impl ScannerInner {
         self.check_platform_scope()?;
         #[cfg(test)]
         if self.business_test_observations.is_some() {
-            self.url = "https://app.dext.com/login".into();
-            self.tree_text = "<main><h1>Synthetic Dext fixture</h1><p>No customer records</p></main>".into();
-            self.all_tabs = "[1] Synthetic Dext fixture: https://app.dext.com/login".into();
+            self.url = self.platform_scope.as_ref().map(|scope| scope.start_url.clone()).unwrap_or_default();
+            self.tree_text = "<main><h1>Synthetic platform fixture</h1><p>No customer records</p></main>".into();
+            self.all_tabs = format!("[1] Synthetic platform fixture: {}", self.url);
             self.cursor_enabled = false;
             self.check_platform_scope()?;
             return Ok("Synthetic browser scan".into());
@@ -4149,6 +4317,43 @@ impl ScannerInner {
             .collect();
         self.save_tabs(&tabs);
     }
+
+
+    pub(crate) fn arm_scoped_gesture(
+        &mut self,
+        kind: &str,
+        action: &Value,
+    ) -> SResult<()> {
+        self.clear_scoped_gesture();
+        let bridge_kind = match kind {
+            "click" | "hold_click" => "click",
+            "input" => "input",
+            "keyboard" => "keyboard",
+            "dialog" => "dialog",
+            "download" => "download_observed",
+            _ => return Err(ScanErr::s(
+                "unsupported_scoped_gesture",
+            )),
+        };
+
+        self.check_platform_scope()?;
+
+        let tab = self.current_target_id()?;
+
+        let download = if kind == "download" {
+            let req = self.observed_download_request(action)?;
+            let id = action["target_id"].as_i64().ok_or_else(|| ScanErr::s("invalid_download_target"))?.to_string();
+            Some(json!({"request":req,"target_id":id,"target":self.mapping[&id],"page":self.url}))
+        } else { None };
+        self.scoped_gesture = Some((bridge_kind.to_string(), tab, download));
+
+        Ok(())
+    }
+
+    pub(crate) fn clear_scoped_gesture(&mut self) {
+        self.scoped_gesture = None;
+    }
+
 
     pub fn read_tabs(&mut self) -> String {
         let current = self.tab_id.clone().unwrap_or_default();
@@ -5329,6 +5534,9 @@ fn bridge_timeout(req: &Value) -> Duration {
         "blank_page" => 15.0,
         "click" => 10.0 + req.get("hold_s").and_then(Value::as_f64).unwrap_or(0.0),
         "input" | "vault_input" => 15.0,
+        // Fixed PDF.js/fetch acquisition has its own 20 s bound; let it return
+        // a precise failure and complete document revalidation before timeout.
+        "download_observed" => 35.0,
         _ => 10.0,
     };
     Duration::from_secs_f64(secs)
@@ -5844,5 +6052,83 @@ mod platform_observation_tests {
         let decoded = ScannerInner::scope_tabs(&absent_pending).unwrap();
         assert_eq!(decoded[0]["pendingUrl"], "");
         assert_eq!(decoded[0]["id"], "1");
+    }
+}
+
+#[cfg(test)]
+mod download_permit_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use tungstenite::{Message, WebSocket, protocol::Role};
+
+    #[test]
+    fn real_native_bridge_consumes_download_permit_and_rejects_changed_targets() {
+        Python::initialize();
+        let root = std::env::temp_dir().join(format!("saccade-download-permit-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("extension")).unwrap();
+        std::fs::write(root.join("extension/manifest.json"), r#"{"manifest_version":3,"name":"Synthetic","version":"1.0","background":{"service_worker":"background.js"}}"#).unwrap();
+        std::fs::write(root.join("extension/background.js"), "// Synthetic fixture").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut ws = WebSocket::from_raw_socket(client, Role::Client, None);
+            for index in 0..2 {
+                let Message::Text(text) = ws.read().unwrap() else { panic!("Expected request") };
+                let req: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(req["type"], "download_observed");
+                assert_eq!(req["tabId"], 1);
+                let reply = if index == 0 { json!({"id":req["id"],"result":{"size":19,"mime":"application/pdf","base64":"JVBERi0xLjQKU3ludGhldGljCg=="}}) }
+                    else { json!({"id":req["id"],"error":"download_response_denied"}) };
+                ws.send(Message::Text(reply.to_string())).unwrap();
+            }
+        });
+        let bridge = Bridge::test_scoped_socket(&root.join("extension"), &root.join("synthetic-profile"), server).unwrap();
+        let mut scanner = ScannerInner::new(&root, 0, None, false);
+        scanner.bridge = Some(Arc::new(Mutex::new(bridge)));
+        scanner.set_platform_scope(crate::platform_scope::PlatformScope::from_value(&json!({
+            "schema_version":1,"platform_id":"dext","execution_mode":"supervised","browser_profile":"saccade-dext",
+            "start_url":"https://app.dext.com/invoice","allowed_hosts":["app.dext.com"],"max_steps":45,"config_revision":"a".repeat(64)})).unwrap());
+        scanner.url = "https://app.dext.com/invoice".into();
+        scanner.business_test_observations = Some(VecDeque::from(vec![json!({"schema_version":1,"observer_id":"synthetic-observer","failure":"","overflow":false,"downloads_denied":true,
+            "tabs":[{"id":"1","url":"https://app.dext.com/invoice"}],"events":[]});64]));
+        scanner.mapping = json!({"2":{"name":"Invoice PDF","line":"<a href=\"/invoice.pdf\">Invoice PDF</a>"}}).as_object().unwrap().clone();
+        let action = json!({"type":"download","target_id":2});
+        assert!(scanner.check_platform_scope().is_ok());
+        let request = scanner.observed_download_request(&action).unwrap_or_else(|_| panic!("Expected observed link"));
+        assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+        assert_eq!(scanner.download_observed(&action).unwrap_or_else(|_| panic!("Expected permitted download"))["size"], 19);
+        assert!(scanner.scoped_gesture.is_none());
+        assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        for change in ["request", "request_tab", "mapping", "tab", "page"] {
+            scanner.url = "https://app.dext.com/invoice".into();
+            assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+            let original = scanner.mapping.clone();
+            let mut altered = request.clone();
+            match change {
+                "request" => altered["url"] = json!("https://app.dext.com/other.pdf"),
+                "request_tab" => altered["tabId"] = json!(2),
+                "mapping" => scanner.mapping.get_mut("2").unwrap()["name"] = json!("Different invoice"),
+                "tab" => scanner.tab_id = Some("2".into()),
+                "page" => scanner.url = "https://app.dext.com/other".into(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(scanner.bridge_request(altered), Err(ScanErr::Scanner(ref code)) if code == "download_target_changed"), "{change}");
+            assert!(scanner.scoped_gesture.is_none());
+            scanner.mapping = original;
+            assert!(matches!(scanner.bridge_request(request.clone()), Err(ScanErr::Scanner(ref code)) if code == crate::platform_scope::APPROVAL_UNAVAILABLE));
+        }
+        scanner.url = "https://app.dext.com/invoice".into();
+        assert!(scanner.arm_scoped_gesture("download", &action).is_ok());
+        assert!(matches!(scanner.download_observed(&action), Err(ScanErr::Scanner(ref code)) if code == "download_response_denied"));
+        scanner.clear_scoped_gesture();
+        assert!(scanner.scoped_gesture.is_none());
+        peer.join().unwrap();
+        drop(scanner);
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
