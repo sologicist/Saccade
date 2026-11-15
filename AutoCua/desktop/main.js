@@ -308,7 +308,7 @@ async function createWindow() {
   win = new BaseWindow({
     width: 1140,
     height: 700,
-    title: 'Saccade',
+    title: 'Saccade v1',
     backgroundColor: BACKGROUND,
     show: false,
     acceptFirstMouse: true,   // macOS: the click that focuses the window lands too
@@ -342,7 +342,13 @@ async function createWindow() {
   });
   titleBar.setBackgroundColor(BACKGROUND);
   titleBar.webContents.loadURL('data:text/html,' + encodeURIComponent(
-    `<style>html,body{margin:0;height:100%;background:${BACKGROUND};-webkit-app-region:drag}</style>`));
+    `<!doctype html><html><head><meta charset="utf-8"><title>Saccade v1</title>
+    <style>
+      html,body{margin:0;height:100%;background:${BACKGROUND};-webkit-app-region:drag}
+      body{display:grid;place-items:center;box-sizing:border-box;padding:0 140px;
+        color:${SYMBOLS};font:500 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;user-select:none}
+      span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none}
+    </style></head><body><span>Saccade v1</span></body></html>`));
   win.contentView.addChildView(titleBar);
   win.contentView.addChildView(page);
   const layout = () => {

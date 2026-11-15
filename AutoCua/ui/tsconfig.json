@@ -4,7 +4,7 @@
     "lib": [
       "ES2020",
       "DOM",
-      "DOM.Iterable"
+      "DOM.Iterable",
     ],
     "module": "ESNext",
     "moduleResolution": "bundler",
@@ -16,7 +16,10 @@
     "isolatedModules": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@/*": ["./*"]
+    },
   },
   "include": [
     "**/*.ts",

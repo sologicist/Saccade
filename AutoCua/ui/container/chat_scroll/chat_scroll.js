@@ -210,15 +210,19 @@
         if (t.rec) turn.dataset.rec = t.rec;
         if (t.msgH) turn.style.setProperty('--turn-msg-h', t.msgH);   // until it is measured in place
 
-        var msg = div('container-zone user-container');
-        if (t.via) {                      // where it came from ("sent via: Telegram"), as the live box shows it
-            var via = div('user-message-via');
-            via.textContent = t.via;
-            msg.appendChild(via);
-        }
-        var text = div('user-message-text');
+        // Clone the live TUFFUI message structure so saved and live turns use
+        // the same avatar, author and bubble. Only the live turn keeps IDs.
+        var template = byId('userContainer');
+        var msg = template ? template.cloneNode(true) : div('container-zone user-container');
+        msg.removeAttribute('id');
+        msg.querySelectorAll('[id]').forEach(function (el) { el.removeAttribute('id'); });
+        msg.classList.remove('is-empty', 'expanded', 'has-expand');
+        var via = msg.querySelector('.user-message-via');
+        if (via) { via.textContent = t.via || ''; via.hidden = !t.via; }
+        var text = msg.querySelector('.user-message-text');
+        if (!text) { text = div('user-message-text'); msg.appendChild(text); }
         text.textContent = t.text || '';
-        msg.appendChild(text);
+        if (window.userMessage) window.userMessage.setTime(msg, t.at);
         turn.appendChild(msg);
 
         if (t.reply != null) {
@@ -288,6 +292,7 @@
         var viaEl = byId('userMessageVia');
         var turn = buildTurn({
             text: msg.textContent,
+            at: msgZone.dataset.at || null,
             via: (viaEl && !viaEl.hidden) ? viaEl.textContent : '',
             stage: !!(screen && screen.classList.contains('cu-stage')),
             ar: live.style.getPropertyValue('--screen-ar'),
@@ -322,6 +327,7 @@
             if (!x) return;
             place(buildTurn({
                 text: x.task || '',
+                at: x.at || null,
                 stage: mode === 'computer',
                 bot: botOf(mode),
                 video: (mode === 'web' || mode === 'mobile') ? '' : (x.video_url || ''),

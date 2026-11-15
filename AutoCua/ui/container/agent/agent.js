@@ -2171,7 +2171,10 @@
     window.toolFlow = {
         steps: mainFlow.steps,
         // backend (app.py) calls: window.toolFlow.onFlow('<event>', '<json payload>')
-        onFlow: mainFlow.onFlow,
+        onFlow: function (event, payload) {
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'tools', event: event, payload: payload } }));
+            mainFlow.onFlow(event, payload);
+        },
         reset: mainFlow.reset,
         stopTest: mainFlow.stopDemo,                         // back-compat aliases
         startTest: mainFlow.startDemo,

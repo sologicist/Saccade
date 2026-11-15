@@ -1,0 +1,144 @@
+/* Layout isolation: keep native runtime targets without inheriting its fixed
+   glass-panel geometry in the TUFFUI screen. Component visuals live in TUFFUI. */
+body.tuffui-app {
+  display: block;
+  height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+  --left-bar-w: 0px;
+  font-family: 'Geist Variable', sans-serif;
+  background: var(--background);
+  color: var(--foreground);
+  color-scheme: light;
+}
+.dark body.tuffui-app { color-scheme: dark; }
+.tuffui-app #root { width: 100%; height: 100%; }
+.saccade-legacy-runtime { display: none; }
+.saccade-chat-screen { position: fixed; inset: 0; z-index: 1; background: var(--background); }
+.autocua-scene { position: absolute; inset: 0; overflow: hidden; }
+.autocua-scene #mainGrid,
+.autocua-scene #welcomeHero {
+  position: absolute; top: 0; left: 12px; right: 12px;
+  bottom: calc(var(--composer-inset) + 12px);
+}
+.autocua-scene #mainGrid { z-index: 1; }
+.autocua-scene #welcomeHero { z-index: 0; }
+.autocua-scene #chatWrapper {
+  position: absolute; left: 50%; right: auto; top: auto; bottom: 0;
+  width: min(100% - 24px, 728px); height: var(--composer-inset);
+  padding: 0; visibility: hidden; pointer-events: none; z-index: 2;
+}
+.autocua-scene #modeBot {
+  position: absolute; left: 50%; bottom: 100%; margin: 0;
+  transform: translateX(-50%); visibility: visible;
+}
+.autocua-scene #memoryRing { display: none; }
+body.skills-open .autocua-scene #modeBot { visibility: hidden; }
+.welcome-bloub { position: relative; width: clamp(100px, 15vw, 180px); aspect-ratio: 1; }
+.welcome-bloub .bot, .welcome-bloub .bot > img { position: absolute; inset: 0; width: 100%; height: 100%; }
+body.saccade-bloub #welcomeHero .bot > img { visibility: hidden; }
+.autocua-scene .user-container {
+  display: flex; flex-direction: row-reverse; align-items: flex-start; gap: 10px;
+  max-width: min(80%, 680px); padding: 0; border: 0; border-radius: 0;
+  background: transparent; color: var(--foreground); font-family: inherit; font-weight: 400;
+}
+.autocua-scene .user-container.is-empty { display: none; }
+.autocua-scene .user-message-avatar { flex: 0 0 28px; }
+.autocua-scene .user-message-body { display: flex; min-width: 0; flex-direction: column; align-items: flex-end; gap: 4px; }
+.autocua-scene .user-message-meta { display: flex; flex-direction: row-reverse; align-items: baseline; gap: 8px; font-size: 13px; }
+.autocua-scene .user-message-name { font-weight: 500; }
+.autocua-scene .user-message-time { color: var(--muted-foreground); font-size: 12px; font-variant-numeric: tabular-nums; }
+.autocua-scene .user-message-text {
+  max-width: 100%; padding: 8px 14px; border-radius: 16px 6px 16px 16px;
+  background: var(--surface-raised); font-size: 14px; line-height: 1.625;
+}
+.autocua-scene .user-container.has-expand .user-message-text { padding-bottom: 34px; }
+.autocua-scene .user-expand { right: 46px; }
+.dark .autocua-scene .agent-container.show-reply { border-color: var(--border); }
+.dark .autocua-scene :is(.reply-panel, .br-text, .tool-response-label, .scratchpad-label) { color: var(--foreground); }
+.dark .autocua-scene .user-expand { background: var(--surface-raised); color: var(--foreground); border-color: var(--border); }
+.dark .autocua-scene :is(.tool-flow, .br-flow) { --tf-line: rgba(255, 255, 255, 0.22); }
+.saccade-chat-screen .saccade-history-sidebar {
+  height: 50vh;
+  height: 50dvh;
+}
+.saccade-chat-screen .conversation-list-scroll::-webkit-scrollbar { width: 3px; height: 3px; }
+.saccade-chat-screen .conversation-list-scroll::-webkit-scrollbar-track { background: transparent; margin-block: 8px; }
+.saccade-chat-screen .conversation-list-scroll::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.16); border-radius: 999px; min-height: 24px;
+}
+.saccade-chat-screen .conversation-list-scroll:hover::-webkit-scrollbar-thumb,
+.saccade-chat-screen .conversation-list-scroll:focus-within::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.38); }
+.saccade-chat-screen .conversation-list-scroll::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+@supports not selector(::-webkit-scrollbar) {
+  .saccade-chat-screen .conversation-list-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(128, 128, 128, 0.16) transparent;
+  }
+  .saccade-chat-screen .conversation-list-scroll:hover,
+  .saccade-chat-screen .conversation-list-scroll:focus-within { scrollbar-color: rgba(128, 128, 128, 0.38) transparent; }
+}
+.saccade-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; width: 100%; }
+.saccade-controls .agent-mode-wrap {
+  position: relative; inset: auto; height: 30px; flex-shrink: 0;
+  font-family: inherit; z-index: 10;
+}
+.saccade-controls .chat-model-dropdown { margin-left: auto; max-width: 180px; }
+.saccade-controls .model-dropdown-trigger,
+.saccade-controls #agentBtn { font-family: inherit; font-size: 12px; font-weight: 500; }
+.saccade-controls .fast-quality-toggle { flex-shrink: 0; }
+.saccade-controls .link-toggle { display: none; }
+.saccade-controls:has([data-mode="mobile"]) .link-toggle,
+.saccade-controls:has([data-sub="daisy"]) .link-toggle { display: inline-flex; }
+.saccade-controls:has([data-mode="shell"]) .fast-quality-toggle { display: none; }
+.dark .saccade-controls .agent-mode-wrap {
+  --am-surface: var(--surface);
+  --am-border: var(--border);
+  --am-text: var(--foreground);
+  --am-text-muted: var(--muted-foreground);
+  --am-hover-row: var(--surface-raised);
+  --am-active: var(--positive);
+}
+.dark .saccade-controls :is(.model-dropdown-trigger, .model-dropdown-option, .agent-opt, .agent-subopt) {
+  color: var(--foreground);
+}
+.dark .saccade-controls :is(.model-dropdown-value.placeholder, .chat-dropdown-chevron, .am-mode-icon, .am-sub-icon, .am-chev, .si-icon) {
+  color: var(--muted-foreground);
+}
+.dark .saccade-controls .model-dropdown.chat-model-dropdown .model-dropdown-menu {
+  background: var(--surface); border-color: var(--border);
+}
+.dark .saccade-controls :is(.model-dropdown-trigger, .model-dropdown-option, .agent-btn):hover {
+  background: var(--surface-raised);
+}
+.dark .saccade-controls .fast-quality-toggle { background: var(--surface-raised); }
+.dark .saccade-controls .fq-thumb { background: var(--surface-inset); }
+.dark .saccade-controls .skills-btn { color: var(--muted-foreground); }
+.dark .tuffui-app :is(.settings-panel, .vertex-popup, .telegram-prompt-popup) {
+  background: var(--background); color: var(--foreground);
+}
+.dark .tuffui-app :is(.settings-panel-content, .settings-title, .settings-section-heading, .settings-provider-name,
+  .model-select-label, .device-name, .remote-row-label, .vertex-label, .vertex-popup-title) { color: var(--foreground); }
+.dark .tuffui-app :is(.settings-provider-input, .vertex-input, .dc-select, .model-dropdown-menu) {
+  background: var(--surface); color: var(--foreground); border-color: var(--border);
+}
+.dark .tuffui-app .settings-panel :is(.model-dropdown-trigger, .model-dropdown-option,
+  .settings-cancel-btn, .settings-savebar-btn) { background: var(--surface); color: var(--foreground); }
+.dark .tuffui-app .settings-panel .model-dropdown-option:hover { background: var(--surface-raised); }
+.saccade-run-media { display: block; width: 100%; max-height: 420px; object-fit: contain; border-radius: 12px; background: var(--surface); }
+.saccade-answer { overflow-wrap: anywhere; font-size: 14px; line-height: 1.7; }
+.saccade-answer pre { max-width: 100%; overflow-x: auto; }
+.saccade-answer table { display: block; max-width: 100%; overflow-x: auto; }
+.saccade-answer img { max-width: 100%; }
+.tuffui-app #zoneBigCenter { display: none; }
+.tuffui-app.skills-open #zoneBigCenter.active {
+  display: block; position: fixed; inset: 64px 24px 190px; z-index: 50;
+  width: auto; height: auto; background: var(--background); border-radius: 22px;
+  box-shadow: 0 0 0 100vmax rgb(0 0 0 / 25%); overflow: hidden;
+}
+@media (max-width: 600px) {
+  .saccade-controls .chat-model-dropdown { max-width: 125px; }
+  .saccade-controls .fast-quality-toggle { display: none; }
+  .tuffui-app.skills-open #zoneBigCenter.active { inset: 60px 8px 180px; }
+}

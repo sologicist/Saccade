@@ -888,6 +888,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Function to update the image stream (called from Python)
     window.updateAgentImage = (base64Image) => {
+        document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'image', image: base64Image } }));
         // The live turn's screen: the chat's earlier turns have one too.
         const imgElement = document.querySelector('#screenContainer .stream-image');
         if (imgElement && base64Image) {
@@ -963,6 +964,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (streamingTimeout) { clearTimeout(streamingTimeout); streamingTimeout = null; }
     };
     window.streamAgentText = (text) => {
+        document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'progress', text: String(text || '') } }));
         const agentText = document.getElementById('agentText');
         const agentStrip = document.getElementById('agentResponseStrip');
 

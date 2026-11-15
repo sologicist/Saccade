@@ -78,6 +78,7 @@ function replyMood(reply: Element): Mood {
 
 function moodOf(host: HTMLElement): Mood {
     if (host.closest('#splashOverlay')) return 'intro';
+    if (host.closest('#welcomeHero')) return 'ready';
     if (host.matches('.agent-container.show-reply, .cc-line.cc-answer')) return replyMood(host);
     if (host.matches('#modeBot .mb-bot')) return 'ready';
     if (host.matches('.chain-bot')) {
@@ -94,15 +95,19 @@ function moodOf(host: HTMLElement): Mood {
 
 function shouldDisplay(host: HTMLElement): boolean {
     if (host.matches('.agent-container.show-reply')) {
-        return !host.closest('.chat-turn')?.querySelector(':scope > .chain-bot.docked');
+        const turn = host.closest('.chat-turn');
+        return !!turn?.classList.contains('live') && !turn.querySelector(':scope > .chain-bot.docked');
     }
-    // Only the new answer waits for the flying Shell bot. Earlier answers in
-    // the same card must keep their avatars while another run is in progress.
+    if (host.matches('.cc-line.cc-answer')) {
+        const answers = host.closest('.coder-card')?.querySelectorAll('.cc-line.cc-answer');
+        if (!answers || answers[answers.length - 1] !== host) return false;
+    }
+    // The latest answer waits for the flying Shell bot to hand over.
     return !host.matches('.cc-line.cc-answer.cc-bot-wait');
 }
 
 const TARGETS = [
-    '#splashOverlay .bot', '#modeBot .mb-bot', '#liveTurn > .chain-bot',
+    '#splashOverlay .bot', '#welcomeHero .bot', '#modeBot .mb-bot', '#liveTurn > .chain-bot',
     '.sub-box > .sub-bot', '.coder-card .cc-rbot', '.coder-card .cc-mbot',
     '.agent-container.show-reply', '.coder-card .cc-line.cc-answer',
 ].join(', ');
