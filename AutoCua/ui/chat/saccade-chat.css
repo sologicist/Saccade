@@ -106,11 +106,39 @@ body.saccade-bloub #welcomeHero .bot > img { visibility: hidden; }
 .saccade-controls .chat-model-dropdown { margin-left: auto; max-width: 180px; }
 .saccade-controls .model-dropdown-trigger,
 .saccade-controls #agentBtn { font-family: inherit; font-size: 12px; font-weight: 500; }
-.saccade-controls .fast-quality-toggle { flex-shrink: 0; }
-.saccade-controls .link-toggle { display: none; }
-.saccade-controls:has([data-mode="mobile"]) .link-toggle,
-.saccade-controls:has([data-sub="daisy"]) .link-toggle { display: inline-flex; }
-.saccade-controls:has([data-mode="shell"]) .fast-quality-toggle { display: none; }
+
+/* Les deux sélecteurs natifs TUFFUI */
+.saccade-controls .saccade-link-segmented,
+.saccade-controls .saccade-speed-segmented {
+  flex-shrink: 0;
+}
+
+/* Wi-Fi / Wired masqué par défaut */
+.saccade-controls .saccade-link-segmented {
+  display: none;
+}
+
+/* Visible en Mobile */
+.saccade-controls:has(
+  #agentModeWrap[data-mode="mobile"]
+) .saccade-link-segmented {
+  display: inline-flex;
+}
+
+/* Visible en Computer -> Daisy Chain */
+.saccade-controls:has(
+  #agentModeWrap[data-mode="computer"][data-sub="daisy"]
+) .saccade-link-segmented {
+  display: inline-flex;
+}
+
+/* Fast / Quality masqué uniquement en Shell */
+.saccade-controls:has(
+  #agentModeWrap[data-mode="shell"]
+) .saccade-speed-segmented {
+  display: none;
+}
+
 .dark .saccade-controls .agent-mode-wrap {
   --am-surface: var(--surface);
   --am-border: var(--border);
@@ -131,8 +159,6 @@ body.saccade-bloub #welcomeHero .bot > img { visibility: hidden; }
 .dark .saccade-controls :is(.model-dropdown-trigger, .model-dropdown-option, .agent-btn):hover {
   background: var(--surface-raised);
 }
-.dark .saccade-controls .fast-quality-toggle { background: var(--surface-raised); }
-.dark .saccade-controls .fq-thumb { background: var(--surface-inset); }
 .dark .saccade-controls .skills-btn { color: var(--muted-foreground); }
 .dark .tuffui-app :is(.settings-panel, .vertex-popup, .telegram-prompt-popup) {
   background: var(--background); color: var(--foreground);
@@ -158,6 +184,12 @@ body.saccade-bloub #welcomeHero .bot > img { visibility: hidden; }
 }
 @media (max-width: 600px) {
   .saccade-controls .chat-model-dropdown { max-width: 125px; }
-  .saccade-controls .fast-quality-toggle { display: none; }
+  .saccade-controls :is(
+  .saccade-link-segmented,
+  .saccade-speed-segmented
+) button {
+  padding-inline: 8px;
+  font-size: 11px;
+}
   .tuffui-app.skills-open #zoneBigCenter.active { inset: 60px 8px 180px; }
 }
