@@ -162,66 +162,70 @@ async function handle(msg, line) {
     let result;
     switch (msg.type) {
       case "scan": {
-        const tab = await targetTab(msg.tabId);
-        // A page no extension may read, shown or on its way (a redirect to the Web Store
-        // still pending): its own scan, which says so.
-        const away = [tab.url, tab.pendingUrl].find((u) => u && toolsUnreachable(u));
-        if (away) {
-          result = toolsChromePageScan({ ...tab, url: away });
-          break;
-        }
-        // A popup holds the page (before the read, or opening during it):
-        // nothing can be read until it is answered, so the answer is the popup.
-        const held = () => ({ dialog: toolsDialogs.get(tab.id) });
-        if (toolsDialogs.has(tab.id)) {
-          result = held();
-          break;
-        }
-        // A page that froze is closed and opened again, which ends the read here with an
-        // error (tools.js toolsWatchScan: a question just ahead of the read, 5 s for the
-        // picture once the read is back, and a backstop for a read that never comes back).
-        const watch = toolsWatchScan(tab.id);
+        const tab = await toolsScanTarget(msg,line);
         try {
-          try {
-            // Read once the page has loaded, and again when the tab moves on to a new
-            // page during the read (tools.js toolsScanLoaded). A tab in the background
-            // (the person is looking at another one) is read where it is and
-            // photographed through the debugger, like element.rs does.
-            const read = (now) => elementScan(now, { ...msg, fallback: toolsScanFallback, watch });
-            result = await toolsUnlessDialog(tab.id, toolsScanLoaded(tab.id, read), held);
-          } catch (e) {
-            // When that picture cannot be taken, the tab is put on show for Chrome's own
-            // capture; not after the person took the browser back.
-            if (tab.active || toolsStoppedByPerson || !/^screenshot failed/.test(String((e && e.message) || e))) throw e;
-            await chrome.tabs.update(tab.id, { active: true });
-            await new Promise((r) => setTimeout(r, 300));
-            result = await toolsScanLoaded(tab.id, (now) =>
-              elementScan({ ...now, active: true }, { ...msg, fallback: toolsScanFallback, watch }));
-          }
-        } catch (e) {
-          // The tab moved on during the read to a page no extension may read (a redirect
-          // that landed on the Web Store): that page's scan instead of the error.
-          const now = await chrome.tabs.get(tab.id).catch(() => null);
-          const gone = now && [now.url, now.pendingUrl].find((u) => u && toolsUnreachable(u));
-          if (gone) {
-            result = toolsChromePageScan({ ...now, url: gone });
+          // A page no extension may read, shown or on its way (a redirect to the Web Store
+          // still pending): its own scan, which says so.
+          const away = [tab.url, tab.pendingUrl].find((u) => u && toolsUnreachable(u));
+          if (away) {
+            result = toolsChromePageScan({ ...tab, url: away });
             break;
           }
-          // A read that ran out of time (the screenshot, a frame): a page that does not
-          // answer a cheap question within TOOLS_FROZEN_MS either froze during the read,
-          // and is opened again (browser.rs page_froze).
-          if (/timed out/i.test(String((e && e.message) || e)) && toolsOurs.has(tab.id) &&
-              !toolsDialogs.has(tab.id) && !(await toolsAnswers(tab.id, TOOLS_FROZEN_MS))) {
-            toolsReopen(tab.id, "froze").catch(() => {});
+          // A popup holds the page (before the read, or opening during it):
+          // nothing can be read until it is answered, so the answer is the popup.
+          const held = () => ({ dialog: toolsDialogs.get(tab.id) });
+          if (toolsDialogs.has(tab.id)) {
+            result = held();
+            break;
           }
-          // The page crashed or froze under the read and is being opened again: the agent
-          // side hears which tab took its place before it hears of this failure.
-          await toolsAwaitReopen(tab.id);
-          throw e;
+          // A page that froze is closed and opened again, which ends the read here with an
+          // error (tools.js toolsWatchScan: a question just ahead of the read, 5 s for the
+          // picture once the read is back, and a backstop for a read that never comes back).
+          const watch = toolsWatchScan(tab.id);
+          try {
+            try {
+              // Read once the page has loaded, and again when the tab moves on to a new
+              // page during the read (tools.js toolsScanLoaded). A tab in the background
+              // (the person is looking at another one) is read where it is and
+              // photographed through the debugger, like element.rs does.
+              const read = (now) => elementScan(now, { ...msg, fallback: toolsScanFallback, watch });
+              result = await toolsUnlessDialog(tab.id, toolsScanLoaded(tab.id, read), held);
+            } catch (e) {
+              // When that picture cannot be taken, the tab is put on show for Chrome's own
+              // capture; not after the person took the browser back.
+              if (tab.active || toolsStoppedByPerson || !/^screenshot failed/.test(String((e && e.message) || e))) throw e;
+              await chrome.tabs.update(tab.id, { active: true });
+              await new Promise((r) => setTimeout(r, 300));
+              result = await toolsScanLoaded(tab.id, (now) =>
+                elementScan({ ...now, active: true }, { ...msg, fallback: toolsScanFallback, watch }));
+            }
+          } catch (e) {
+            // The tab moved on during the read to a page no extension may read (a redirect
+            // that landed on the Web Store): that page's scan instead of the error.
+            const now = await chrome.tabs.get(tab.id).catch(() => null);
+            const gone = now && [now.url, now.pendingUrl].find((u) => u && toolsUnreachable(u));
+            if (gone) {
+              result = toolsChromePageScan({ ...now, url: gone });
+              break;
+            }
+            // A read that ran out of time (the screenshot, a frame): a page that does not
+            // answer a cheap question within TOOLS_FROZEN_MS either froze during the read,
+            // and is opened again (browser.rs page_froze).
+            if (/timed out/i.test(String((e && e.message) || e)) && toolsOurs.has(tab.id) &&
+                !toolsDialogs.has(tab.id) && !(await toolsAnswers(tab.id, TOOLS_FROZEN_MS))) {
+              toolsReopen(tab.id, "froze").catch(() => {});
+            }
+            // The page crashed or froze under the read and is being opened again: the agent
+            // side hears which tab took its place before it hears of this failure.
+            await toolsAwaitReopen(tab.id);
+            throw e;
+          } finally {
+            watch.stop();
+          }
+          break;
         } finally {
-          watch.stop();
+          if (result && typeof result === 'object') result.tab_id = tab.id;
         }
-        break;
       }
       case "tabs":
         result = await chrome.tabs.query({});

@@ -20,7 +20,7 @@ export function LeftBar() {
                     {/* Header: AutoCua logo (top-left). Brand mark: AutoCua's logo shape
                         (logo/logo.html) in grey (left_bar.css draws it from left_bar/logo_mark.svg). */}
                     <div className="left-bar-header" id="leftBarHeader">
-                        <span className="left-bar-logo" role="img" aria-label="AutoCua"></span>
+                       {/*<span className="left-bar-logo" role="img" aria-label="AutoCua"></span>*/}
                         <span className="left-bar-brand-name">Saccade</span>
                     </div>
                     {/* Body: the New chat button; chat.js adds the history list under it. */}

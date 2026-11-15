@@ -54,6 +54,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!AutoCua/ui/lib/
+!AutoCua/ui/lib/*.ts
 lib64/
 parts/
 sdist/

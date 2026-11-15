@@ -700,10 +700,23 @@ fn route_model_actions(py: Python<'_>, controller: &crate::controller::view::Con
     Ok(result)
 }
 
-fn business_result_texts(result: &Value) -> Vec<String> {
+pub(crate) fn business_result_texts(result: &Value) -> Vec<String> {
     let results = result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![result.clone()]);
     results.iter().filter(|value| value.get("tool").and_then(Value::as_str) == Some("call_function"))
-        .map(|value| format!("\nFunction result (synthetic):\n```json\n{}\n```\n", view::dumps_pretty(value))).collect()
+        .map(|value| format!("\nFunction result:\n```json\n{}\n```\n", view::dumps_pretty(value))).collect()
+}
+
+pub(crate) fn download_failure(result: &Value) -> Option<String> {
+    let items=result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(||vec![result.clone()]);
+    items.iter().find_map(|item|item["download"]["state"].as_str().filter(|state|matches!(*state,
+        "source_unverified"|"ambiguous"|"interrupted"|"unconfirmed"|"incomplete"|"file_unavailable"|
+        "file_verification_failed"|"observation_overflow"|"observation_unavailable")).map(|state| {
+            let reason=item["download"]["reason"].as_str().unwrap_or_default();
+            let mechanism=item["download"]["mechanism"].as_str().unwrap_or_default();
+            if !reason.is_empty() && [reason,mechanism].iter().all(|value|value.len()<80 && value.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'_')) {
+                format!("{state} ({mechanism}/{reason})")
+            } else {state.to_owned()}
+        }))
 }
 
 fn business_review_required(result: &Value) -> bool {
@@ -711,6 +724,19 @@ fn business_review_required(result: &Value) -> bool {
     results.iter().any(|value| value.get("tool").and_then(Value::as_str) == Some("call_function")
         && value.get("status").and_then(Value::as_str) != Some("stopped")
         && value.get("operator_review_required").and_then(Value::as_bool) == Some(true))
+}
+
+fn business_review_outcome(result: &Value, legacy: bool) -> (String,String) {
+    if legacy { return ("waiting_operator".into(),"Business function requires operator review; no automatic retry was performed.".into()) }
+    let items=result.get("results").and_then(Value::as_array).cloned().unwrap_or_else(||vec![result.clone()]);
+    if let Some(failure)=items.iter().find(|item|item["tool"]=="call_function" && item["status"]!="success") {
+        let code=failure["code"].as_str().filter(|code|code.len()<80 && code.bytes().all(|b|b.is_ascii_lowercase() || b==b'_' || b.is_ascii_digit())).unwrap_or("business_gate_denied");
+        let detail=if code=="business_revision_changed" {
+            "The trusted business code or client registration changed after the model selected the tool. Start a fresh turn after the build has finished."
+        } else {"Check the reported download, client, reference or provider error before starting another attempt."};
+        return ("incomplete".into(),format!("Business function was not completed: {code}. {detail} No automatic retry or accounting write was performed."));
+    }
+    ("done".into(),"Accounting analysis returned a proposal requiring review. No accounting entry was written.".into())
 }
 
 fn whole_envelope(calls: &[Value], compacted: &Value) -> Vec<Value> {
@@ -999,6 +1025,14 @@ impl AgentService {
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         controller.configure_business(py, context.as_ref().map(|value| value.bind(py)))?;
+        if let Some(extra) = _extra.as_ref() {
+            if let Some(session) = extra.get_item("web_session")? {
+                controller.configure_web_session(py,Some(session.unbind()),browser_profile.as_deref()==Some("saccade-dext"))?;
+            }
+        }
+        if _extra.as_ref().map(|extra|extra.contains("web_session")).transpose()?.unwrap_or(false)==false && browser_profile.as_deref()==Some("saccade-dext") && context.is_none() {
+            controller.configure_web_session(py,None,true)?;
+        }
 
         // Load system prompt — __init__ already downgraded the speed, so the
         // prompt and the tool schema are guaranteed to agree here.
@@ -1231,6 +1265,7 @@ impl AgentService {
         }
         self.controller.configure_business(py, self.platform_context.as_ref().map(|value| value.bind(py)))?;
         let task: String = task.str()?.extract()?;
+        self.controller.set_task(&task);
         // A run's indexes (what the agent keeps from its scrapes, the `index`
         // tool) are numbered from 1 and stored in a folder of their own,
         // AutoCua_data/scrapes/<run>/, made on the first index. Nothing of an
@@ -1696,6 +1731,7 @@ impl AgentService {
             final_message = format!("Platform cleanup requires operator review: {}", py_err_str(py, &error));
         }
         let _ = self.scanner.get().stop(py);
+        self.controller.release_web_profile(py);
 
         if final_status == "error" {
             self.emit_flow(py, "error", Some(&json!({"text": "llm service not responding"})));
@@ -1767,6 +1803,7 @@ impl AgentService {
         };
         let core = self.llm_manager.get();
         // Freeze the trusted source revision before the model chooses a call.
+        self.controller.configure_google_runtime(&core.provider,&core.model_short_name,core.runtime_api_key.as_deref());
         // A changed bundle after this point must be rejected, never refreshed
         // into permission to run the stale selection.
         match self.controller.refresh_business(py) {
@@ -1777,6 +1814,7 @@ impl AgentService {
                 return Ok(Flow::Break);
             }
         }
+        if self.controller.take_profile_handoff() { return Ok(Flow::Continue); }
         // The screens the last scrape read covered go with this input, once,
         // after the page's own screenshot (run_script window.rs). Fast mode
         // sends no picture at all.
@@ -1933,7 +1971,7 @@ impl AgentService {
         // model enters this branch.
         let mut extra_results: Vec<Value> = Vec::new();
         let is_done = |a: &Value| a.get("type").and_then(Value::as_str) == Some("done");
-        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if (self.llm_manager.get().async_tools() || self.platform_context.is_some())
+        let (actions_val, calls): (Vec<Value>, Vec<Value>) = if (self.llm_manager.get().async_tools() || self.platform_context.is_some() || self.llm_manager.get().business_enabled())
             && actions_val.len() + rejects.len() > 1
             && actions_val.iter().any(|a| is_done(a))
         {
@@ -2028,7 +2066,7 @@ impl AgentService {
             self.save_conversation_files(py, messages, &display_payload, image_sent, *step_number);
             am.append(&normalized)?;
             tr.append(view::encode_results(&note_results))?;
-            println!("{}", view::format_response_impl(&display_payload, true));
+            if !self.llm_manager.get().business_enabled() { println!("{}", view::format_response_impl(&display_payload, true)); }
             if let Some(cb) = &self.text_callback {
                 cb.call1(py, (view::format_response_impl(&display_payload, false),))?;
             }
@@ -2177,7 +2215,7 @@ impl AgentService {
 
         // Format the response with emojis for console output.
         let formatted_response = view::format_response_impl(&display_payload, true);
-        if self.platform_context.is_some() {
+        if self.platform_context.is_some() || self.llm_manager.get().business_enabled() {
             println!("Scoped model turn received; contents are available only in the active conversation.");
         } else {
             println!("{formatted_response}");
@@ -2260,16 +2298,42 @@ impl AgentService {
             if let Some(callback) = &self.text_callback {
                 for text in business_result_texts(&action_result) { callback.call1(py, (text,))?; }
             }
+            if self.controller.analysis_requested() && self.llm_manager.get().business_enabled() {
+                if let Some(reason) = download_failure(&action_result) {
+                    *final_status = "incomplete".into();
+                    *final_message = format!("PDF retrieval stopped: {reason}. No unverified PDF was sent for analysis and no accounting entry was written. The failed operation will not be clicked again.");
+                    return Ok(Flow::Break);
+                }
+            }
             if let Some(message) = self.platform_violation() {
                 *final_status = "waiting_operator".into();
                 *final_message = message;
                 return Ok(Flow::Break);
             }
             if business_review_required(&action_result) {
-                *final_status = "waiting_operator".into();
-                *final_message = "Business function requires operator review; no automatic retry was performed.".into();
-                return Ok(Flow::Break);
-            }
+                let results = action_result
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| vec![action_result.clone()]);
+
+                let has_failure = results.iter().any(|r| {
+                    r["tool"] == "call_function"
+                        && r["status"] != "success"
+                });
+
+                if has_failure || self.platform_context.is_some() {
+                    (*final_status, *final_message) =
+                        business_review_outcome(
+                            &action_result,
+                            self.platform_context.is_some()
+                        );
+                    return Ok(Flow::Break);
+                }
+
+    // Successful analysis requiring review:
+    // keep the result and let the agent explain it.
+}
             // The pictures a scrape read took this step go with the next
             // input; a step without a read leaves none (run_script window.rs).
             let shots = crate::controller::run_script::service::window::take_shots();
@@ -2389,8 +2453,10 @@ impl AgentService {
                 }
             }
 
-            // Print action result
-            if action_result.get("status").and_then(Value::as_str) == Some("success") {
+            // Business contents belong in the private conversation, never diagnostics.
+            if !business_result_texts(&action_result).is_empty() {
+                println!("Business function result delivered to the active conversation.");
+            } else if action_result.get("status").and_then(Value::as_str) == Some("success") {
                 println!("Action executed successfully");
                 match action_result.get("action").and_then(Value::as_str) {
                     Some("todo_created") => println!("Todo list created"),
@@ -2447,6 +2513,18 @@ fn py_str_of_value(v: &Value) -> String {
 #[cfg(test)]
 mod business_turn_tests {
     use super::*;
+
+    #[test]
+    fn automatic_business_errors_preserve_codes_and_valid_review_is_not_failure() {
+        let error=json!({"tool":"call_function","status":"error","code":"business_revision_changed","operator_review_required":true});
+        let (status,message)=business_review_outcome(&error,false);
+        assert_eq!(status,"incomplete");
+        assert!(message.contains("business_revision_changed"));
+        assert!(message.contains("fresh turn"));
+        assert_eq!(business_review_outcome(&error,true).0,"waiting_operator");
+        let review=json!({"tool":"call_function","status":"success","operator_review_required":true,"result":{"statut":"a_revoir"}});
+        assert_eq!(business_review_outcome(&review,false).0,"done");
+    }
     use std::collections::VecDeque;
     use std::ffi::CString;
     use std::sync::Arc;

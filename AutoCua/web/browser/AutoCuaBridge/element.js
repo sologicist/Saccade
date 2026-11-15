@@ -796,7 +796,7 @@ function elementScanPage(cfg, scan) {
         const kind = act ? "a" : land ? "l" : "t";
         const rec = {
           el, tag, role, parent: parent[ni], node: ni, doc: docI, rect: r, kind,
-          name: clip(axName || text, lim.max_name),
+          name: clip(axName || text || (tag === "button" && el.classList.contains("download") ? "Download PDF" : ""), lim.max_name),
           idx: null, ty: null, href: null, checked: false, expanded: null, val: null, editable: false,
         };
         if (act) {

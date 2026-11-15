@@ -494,6 +494,7 @@
         // the rest wait FIFO. Bare "[minion] " task_starts are ignored. Computer use: its box
         // in the chat instead (mountBox; agentId is its sub-agent registry id).
         window.cliTaskStart = function (taskId, desc, agentId) {
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'task-start', id: String(taskId), description: String(desc || '') } }));
             if (typeof desc === 'string' && desc.indexOf('[minion] ') === 0) return;
             if (!shellPinned && window.subAgents) { mountBox(taskId, desc, agentId); return; }
             if (cards.has(taskId)) return;                                   // already visible
@@ -502,6 +503,7 @@
             else queue.push({ taskId: taskId, desc: desc });
         };
         window.cliTaskLine = function (taskId, line, stream) {
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'task-line', id: String(taskId), text: String(line || '') } }));
             var card = boxes.get(taskId) || cards.get(taskId);   // queued (unmounted) agents' lines are dropped until shown
             if (card) card.setLine(line);
         };
@@ -513,6 +515,7 @@
             if (card && card.setTodo) card.setTodo(payload);
         };
         window.cliTaskEnd = function (taskId, status, summary, summaryHtml) {
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'task-end', id: String(taskId), status: String(status || ''), summary: summary } }));
             // Computer use: its box stops where it is and closes (sub_agents.js disposes the
             // card once it is gone)
             var box = boxes.get(taskId);
@@ -573,6 +576,7 @@
         }
 
         window.cliShellNote = function (text, chatId) {
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'shell-note', text: String(text || ''), chatId: chatId } }));
             // A late run-end note carries its CHAT id — if the user has since
             // opened a DIFFERENT chat, that outcome belongs to the other chat's
             // terminal, not the one on screen: drop it. (A New chat needs no

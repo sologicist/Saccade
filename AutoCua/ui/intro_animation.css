@@ -76,11 +76,20 @@
   opacity: 0;
   pointer-events: none;
 }
+
+@property --saccade-intro-zoom {
+    syntax: "<number>";
+    inherits: false;
+    initial-value: 1;
+}
+
 .row {
   position: absolute;
   left: 0;
   right: 0;
   transform-origin: 50% 100%;   /* Atlas: grows and shrinks from its feet */
+  zoom: var(--saccade-intro-zoom);
+
 }
 /* The side bots fade in as ONE group, behind the lead: while they
    still overlap, the inner ones then hide the outer ones like solid
@@ -129,8 +138,10 @@
   z-index: 1;       /* over the team while it is still big */
   display: flex;
   justify-content: center;
-  font: 500 min(5vmin, 40px)/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #A0A0A8;   /* a light cool grey */
+  font: 600 min(5vmin, 40px)/1.15
+        "Avenir Next", "Segoe UI", sans-serif;
+  letter-spacing: -0.06em;
+  color: #30343a;  color: #A0A0A8;   /* a light cool grey */
   -webkit-user-select: none;
   user-select: none;
 }

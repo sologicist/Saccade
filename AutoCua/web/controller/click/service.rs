@@ -135,6 +135,7 @@ pub fn click(
     raw_id: &Value,
     times: &Value,
     elements: &Map<String, Value>,
+    download_operation: Option<u64>,
 ) -> ActResult<Value> {
     let idx = resolve_element_id(elements, raw_id)?;
     reject_viewport(idx, "click")?;
@@ -142,19 +143,21 @@ pub fn click(
     refuse_web_store_link(elements, idx, &page)?;
     let n = py_int_value(times).map(|n| n.clamp(1, MAX_CLICK_TIMES)).unwrap_or(1);
     let rect = rect_for(elements, idx)?;
-    with_cursor(py, scanner, &rect, |s| {
+    let download = with_cursor(py, scanner, &rect, |s| {
         if s.bridged() {
             // Extension mode: the same press, dispatched by AutoCuaBridge (tools.js).
-            return s.bridge_call(json!({"type": "click", "rect": rect, "times": n})).map(|_| ());
+            return s.bridge_call(json!({"type": "click", "rect": rect, "times": n,
+                "download_operation":download_operation.map(|id|id.to_string())}))
+                .map(|reply|reply.get("download").cloned().unwrap_or(Value::Null));
         }
-        s.with_tab(|cdp, sess| press(cdp, sess, &rect, 0.0, n))
+        s.with_tab(|cdp, sess| press(cdp, sess, &rect, 0.0, n)).map(|_|Value::Null)
     })?;
     let how = if n == 2 { "double-clicked" } else { "clicked" };
     let message = format!("{how} [{idx}] {}", label_for(elements, idx))
         .trim()
         .to_string();
     Ok(json!({"status": "success", "tool": "click", "id": idx, "times": n,
-              "message": message}))
+              "message": message,"download":download}))
 }
 
 /// Press and hold [id] for `seconds`, then release.
@@ -164,6 +167,7 @@ pub fn hold_click(
     raw_id: &Value,
     seconds: &Value,
     elements: &Map<String, Value>,
+    download_operation: Option<u64>,
 ) -> ActResult<Value> {
     let idx = resolve_element_id(elements, raw_id)?;
     reject_viewport(idx, "hold_click")?;
@@ -173,13 +177,14 @@ pub fn hold_click(
         .map(|s| s.max(MIN_HOLD_SECONDS))
         .unwrap_or(DEFAULT_HOLD_SECONDS);
     let rect = rect_for(elements, idx)?;
-    with_cursor(py, scanner, &rect, |s| {
+    let download = with_cursor(py, scanner, &rect, |s| {
         if s.bridged() {
             return s
-                .bridge_call(json!({"type": "click", "rect": rect, "times": 1, "hold_s": secs}))
-                .map(|_| ());
+                .bridge_call(json!({"type": "click", "rect": rect, "times": 1, "hold_s": secs,
+                    "download_operation":download_operation.map(|id|id.to_string())}))
+                .map(|reply|reply.get("download").cloned().unwrap_or(Value::Null));
         }
-        s.with_tab(|cdp, sess| press(cdp, sess, &rect, secs, 1))
+        s.with_tab(|cdp, sess| press(cdp, sess, &rect, secs, 1)).map(|_|Value::Null)
     })?;
     let message = format!(
         "held [{idx}] {} for {}s",
@@ -189,5 +194,5 @@ pub fn hold_click(
     .trim()
     .to_string();
     Ok(json!({"status": "success", "tool": "hold_click", "id": idx, "time": secs,
-              "message": message}))
+              "message": message,"download":download}))
 }

@@ -168,8 +168,9 @@ impl PlatformScope {
         Ok(())
     }
 
-    /// Scope validation is separate from approval: selecting Auto never grants
-    /// mutation, credential, script, download, or unclassified capabilities.
+    /// Legacy explicitly scoped sessions retain their restrictive policy.
+    /// Automatic website detection only adds resources to the generic Web
+    /// controller; it must not create this scope or invoke this fallback.
     pub fn validate_action(&self, action: &Value) -> Result<(), String> {
         if let Some(message) = self.violation() {
             return Err(message.to_string());

@@ -17,6 +17,7 @@
     function zone() { return document.getElementById('agentContainer'); }
 
     window.showRunReply = function (html, status, still) {
+        document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'reply', html: String(html == null ? '' : html) } }));
         var z = zone();
         var el = z && z.querySelector('.reply-panel');
         if (!el) return;

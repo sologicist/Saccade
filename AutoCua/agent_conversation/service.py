@@ -840,6 +840,11 @@ class ConversationService:
         meta = self._read_index().get(str(session_id))
         if not meta:
             return None
+        try:
+            legacy_context = self.get_platform_binding(session_id)[1]
+        except ValueError:
+            # Historical selection metadata no longer controls Web execution.
+            legacy_context = None
         return {
             "id": str(session_id),
             "name": meta.get("title") or "New chat",
@@ -848,7 +853,7 @@ class ConversationService:
             "last_done_message": meta.get("last_done_message", ""),
             "run_pkg": meta.get("run_pkg") or "",
             "agent_mode": meta.get("agent_mode", ""),
-            "platform_context": self.get_platform_binding(session_id)[1],
+            "platform_context": legacy_context,
             "exchanges": self._read_exchanges(session_id),
         }
 

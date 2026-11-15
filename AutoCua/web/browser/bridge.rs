@@ -457,8 +457,10 @@ mod win {
 /// extension staged into its usual place (stage_bridge::default_dest), the server
 /// open, and Chrome taken (`Bridge::take_chrome`).
 pub fn open_on_chrome(src: &Path, user_data_dir: Option<PathBuf>) -> SResult<Arc<Mutex<Bridge>>> {
-    let dest = stage_bridge::default_dest();
-    let mut bridge = Bridge::open(src, &dest)
+    let mut bridge = match user_data_dir.as_ref() {
+        Some(profile) => open_scoped_bridge(src,profile),
+        None => Bridge::open(src, &stage_bridge::default_dest()),
+    }
         .map_err(|e| ScanErr::s(format!("could not open the bridge to AutoCuaBridge: {e}")))?;
     bridge.take_chrome(user_data_dir)?;
     Ok(Arc::new(Mutex::new(bridge)))
@@ -593,6 +595,13 @@ impl Bridge {
     /// lock is held for as long as the bridge lives: the app's idle line steps aside.
     pub fn open(src: &Path, dest: &Path) -> io::Result<Bridge> {
         Self::open_with(src, dest, true)
+    }
+
+    /// Synthetic peers use the real authenticated transport without acquiring
+    /// the desktop app's global run lock or starting a browser.
+    #[cfg(test)]
+    pub fn open_test_peer(src: &Path, dest: &Path) -> io::Result<Bridge> {
+        Self::open_with(src, dest, false)
     }
 
     /// `open`, holding the run lock or not: the app's idle line (`idle_serve`) holds
@@ -801,6 +810,9 @@ impl Bridge {
             if wake_extension(&self.extension_id, user_data_dir.as_deref()) && self.wait_connected(WAKE_WAIT)? {
                 self.note_launch(user_data_dir, true, Vec::new());
                 return Ok(());
+            }
+            if user_data_dir.is_some() {
+                return Err(ScanErr::s("Dedicated Chrome is running without an authenticated bridge. Close that profile before retrying; it will not be taken over."));
             }
             quit = quit_chrome_on(&dir);
             if !quit {
