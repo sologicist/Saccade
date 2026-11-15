@@ -7,6 +7,7 @@
 // so that this folder is an output folder inside it and is never emptied.
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 // Vite fills this in for a config file: this folder. The paths below hang
 // off it, so a build started from any other folder never writes elsewhere.
@@ -14,7 +15,12 @@ declare const __dirname: string;
 
 export default defineConfig({
     root: __dirname + '/..',
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
+    resolve: {
+        alias: {
+            '@': __dirname,
+        },
+    },
     build: {
         outDir: 'ui',
         emptyOutDir: false,

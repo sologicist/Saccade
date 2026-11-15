@@ -2,6 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <!-- The host OS, for what the page offers: iOS needs a Mac (Xcode), so
          its rows hide elsewhere (agent_mode.css, device_connect.css). From
          navigator.platform, which the app's own webview reports for the
@@ -9,6 +10,11 @@
     <script>
         document.documentElement.dataset.host = /Mac/.test(navigator.platform) ? 'mac'
             : /Win/.test(navigator.platform) ? 'windows' : 'linux';
+        // Restore the theme before the first paint.
+        var savedTheme = null;
+        try { savedTheme = localStorage.getItem('saccade-theme'); } catch (_) {}
+        document.documentElement.classList.toggle('dark', savedTheme === 'dark'
+            || (savedTheme !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches));
     </script>
     <link rel="stylesheet" href="css/style.css">
     <!-- Text shimmer (the thinking orb pill's): agent strip, "Preparing video" -->
@@ -54,6 +60,7 @@
     <link rel="stylesheet" href="cli/cli_container/coder_card.css">
     <!-- The intro splash, drawn in #splashOverlay (intro_animation.tsx) -->
     <link rel="stylesheet" href="intro_animation.css">
+    <link rel="stylesheet" href="bloub/saccade_bloub.css">
 </head>
 <body>
     <!-- The page: index.tsx (React + TSX), built into index.js (npm run

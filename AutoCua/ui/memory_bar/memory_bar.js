@@ -111,6 +111,7 @@
     window.updateMemoryBar = function (u, c) {
         cap = Number(c) || CAP;
         used = Math.max(0, Number(u) || 0);
+        document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'context', used: used, limit: cap } }));
         paintState();
         glide();
     };

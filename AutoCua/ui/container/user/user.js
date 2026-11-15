@@ -10,13 +10,27 @@
 (function () {
     'use strict';
 
-    window.showUserMessage = function (text, via) {
+    function setTime(box, at) {
+        var date = at == null || at === '' ? null : new Date(typeof at === 'number' ? at * 1000 : at);
+        var iso = date && isFinite(date.getTime()) ? date.toISOString() : '';
+        box.dataset.at = iso;
+        var time = box.querySelector('.user-message-time');
+        if (!time) return;
+        time.dateTime = iso;
+        time.textContent = iso ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        time.hidden = !iso;
+    }
+    window.userMessage = { setTime: setTime };
+
+    window.showUserMessage = function (text, via, at) {
         var zone = document.getElementById('userContainer');
         var textEl = document.getElementById('userMessageText');
         var viaEl = document.getElementById('userMessageVia');
         var t = String(text == null ? '' : text).trim();
         var v = String(via == null ? '' : via).trim();
+        if (t) document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'user', text: t, via: v } }));
         if (!zone || !textEl) return;
+        setTime(zone, t ? (arguments.length >= 3 ? at : new Date().toISOString()) : null);
         textEl.textContent = t;
         textEl.scrollTop = 0;
         if (viaEl) {
@@ -61,9 +75,9 @@
             btn.setAttribute('aria-expanded', 'false');
             btn.innerHTML = CHEVRON;
             box.appendChild(btn);
-            var text = box.querySelector('.user-message-text');
-            if (ro && text) ro.observe(text);
         }
+        var text = box.querySelector('.user-message-text');
+        if (ro && text) ro.observe(text);
         fit(box);
     }
 

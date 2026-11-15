@@ -20,7 +20,7 @@
         if (!list) return;
         fetch('/api/chats')
             .then(function (r) { return r.json(); })
-            .then(function (rows) { renderChats(list, rows || []); })
+            .then(function (rows) { renderChats(list, rows || []); document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'history', rows: rows || [] } })); })
             .catch(function () { /* non-fatal: list just stays as-is */ });
     }
 
@@ -148,6 +148,7 @@
                 if (!data || data.error) {
                     var status = document.getElementById('agentText');
                     if (status) status.textContent = 'Could not load this conversation.';
+                    document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'error', text: 'Could not load this conversation.' } }));
                     return;
                 }
 
@@ -170,7 +171,7 @@
                         window.chatScroll.addPast(exchanges.slice(0, -1), data.agent_mode);
                         window.chatScroll.setLiveBot(data.agent_mode);
                     }
-                    if (last && window.showUserMessage) window.showUserMessage(last.task || '');
+                    if (last && window.showUserMessage) window.showUserMessage(last.task || '', '', last.at || null);
                     var reply = last ? (last.done_html || '') : (data.last_done_message_html || '');
                     // still: no glide to its end, the view opens on the last turn (below).
                     if (reply && window.showRunReply) window.showRunReply(reply, (last && last.status) || 'success', true);
@@ -194,6 +195,7 @@
                     // It opens on its last turn, the earlier ones a scroll up.
                     if (window.chatScroll) window.chatScroll.toLive(null, true);
                 }
+                document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'loaded', chat: Object.assign({}, data, { id: id }) } }));
                 // Restore the memory bar to this chat's last context size + cap and
                 // show it (the bar hides only for a brand-new chat).
                 if (window.updateMemoryBar) window.updateMemoryBar(data.context_tokens || 0, data.context_cap || 300000);
@@ -226,6 +228,7 @@
                 if (seq === openSeq && window.currentSessionId === id) {
                     var status = document.getElementById('agentText');
                     if (status) status.textContent = 'Could not load this conversation.';
+                    document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'error', text: 'Could not load this conversation.' } }));
                 }
             });
     }
@@ -387,6 +390,14 @@
         var list = document.querySelector('.chat-history-list');
         if (list) loadChats(list);
     });
+
+    // Same session lifecycle for the React TUFFUI screen.
+    window.saccadeChats = {
+        open: function (id) { openChat(id, document.querySelector('.chat-history-list')); },
+        create: startNewChat,
+        delete: function (id) { deleteChat(id, document.querySelector('.chat-history-list')); },
+        download: downloadChat
+    };
 
     // Wire when left_bar.js says the bar is ready.
     document.addEventListener('leftbar:ready', function (e) {

@@ -11,13 +11,12 @@
 // cloned them, which cli_stage.js replaced, and it checks for them first.
 import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
+import { startSaccadeBloub } from './bloub/saccade_bloub.tsx';
 import { IntroAnimation } from './intro_animation.tsx';
 import { BigCenterContainer } from './container/big_center_container/big_center_container.tsx';
-import { UserContainer } from './container/user/user.tsx';
-import { ScreenContainer } from './container/screen/screen.tsx';
-import { AgentContainer } from './container/agent/agent.tsx';
-import { ChatInput } from './chat_input/chat_input.tsx';
 import { LeftBar } from './left_bar/left_bar.tsx';
+import './tuffui.css';
+import { SaccadeChat } from './chat/saccade-chat.tsx';
 
 // The SVG filters the liquid-glass layers use (filter: url(#...), css/style.css).
 function GlassFilters() {
@@ -281,32 +280,15 @@ function App() {
                 container/dead/.) */}
             {/* Transient top-center notification (driven by window.showToast) */}
             <div id="appToast" className="app-toast" role="status" aria-live="polite"></div>
+            <SaccadeChat />
 
-            {/* Empty-state hero: centered "AutoCua / Agent with million moves." over the
-                main area. Shown on a fresh/new chat (default at launch + after New chat);
-                hidden the moment a task is sent or a saved chat is reopened. Toggled via
-                window.showWelcomeHero / window.hideWelcomeHero. */}
-            <div className="welcome-hero" id="welcomeHero" aria-hidden="true">
-                <div className="welcome-hero-title">Made to do...</div>
+            {/* The original sidebar remains a command target for legacy scripts.
+                AutoCua's scene is visible inside SaccadeChat. */}
+            <div className="saccade-legacy-runtime" aria-hidden="true">
+            <LeftBar />
             </div>
 
-            <div className="main-grid" id="mainGrid">
-                <div className="chat-scroll" id="chatScroll">
-                    <div className="chat-past" id="chatPast"></div>
-                    {/* The live turn's zones, top to bottom. */}
-                    <div className="chat-turn live" id="liveTurn">
-                        <UserContainer />
-                        <ScreenContainer />
-                        <AgentContainer />
-                    </div>
-                </div>
-                {/* Big center: the main container, the always-on frame around the zones */}
-                <BigCenterContainer />
-            </div>
-
-            {/* Chat input (the bottom text box): chat_input.js wires it and fires
-                'chatinput:ready' for the parts inside it. */}
-            <div className="chat-container-wrapper" id="chatWrapper"><ChatInput /></div>
+            <BigCenterContainer />
 
             <SettingsOverlay />
 
@@ -348,7 +330,6 @@ function App() {
             </div>
 
             {/* The left bar and its collapse toggle, last like the old loader appended them. */}
-            <LeftBar />
         </>
     );
 }
@@ -357,7 +338,9 @@ function App() {
 // index.js find the page in place.
 const host = document.getElementById('root');
 if (host) {
+    document.body.classList.add('tuffui-app');
     flushSync(() => {
         createRoot(host).render(<App />);
     });
+    startSaccadeBloub();
 }

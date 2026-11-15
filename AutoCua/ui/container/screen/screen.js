@@ -13,6 +13,7 @@
     // play leaves the last screenshot up.
     window.showRunVideo = function (url, chatId, runId) {
         if (chatId && window.currentSessionId !== chatId) return;
+        document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'video', url: url, runId: runId } }));
         if (window.chatScroll) {
             var turn = window.chatScroll.videoTurn(runId, url);
             if (turn !== document.getElementById('liveTurn')) {

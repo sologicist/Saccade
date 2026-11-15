@@ -66,7 +66,7 @@
         function startAgent() {
             // A phone pairing, or not paired yet, holds the box read only
             // (ios_session.js, android_session.js): nothing is sent till it is.
-            if (chatInput.readOnly) return;
+            if (chatInput.readOnly || chatInput.disabled || chatInput.classList.contains('agent-active')) return false;
             const message = chatInput.value.trim();
             // Live (provider, model) selection lives in script.js (Settings writes it).
             const sel = window.getModelSelection ? window.getModelSelection() : {};
@@ -240,7 +240,10 @@
             const runBot = run.runBot, chatGoesOn = run.chatGoesOn, agentMode = run.agentMode;
             // Adopt the backend's session id (a brand-new chat is minted
             // server-side) so the run-end save + future sends target it.
-            if (data.session_id) window.currentSessionId = data.session_id;
+            if (data.session_id) {
+                window.currentSessionId = data.session_id;
+                document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'session', id: data.session_id, runId: data.run_id } }));
+            }
 
             // Shell use: the run is this chat's (a brand-new one only has its id now)
             if (agentMode === 'shell' && window.cliShellStarted) window.cliShellStarted(data.session_id);
@@ -295,6 +298,8 @@
             const sendBtnFrame = getSendFrame();
             const stopBtnFrame = getStopFrame();
             const agentStrip = document.getElementById('agentResponseStrip');
+            const statusText = document.getElementById('agentText')?.textContent || '';
+            document.dispatchEvent(new CustomEvent('saccade:chat', { detail: { type: 'idle', error: /^(Error:|Failed to)/.test(statusText) ? statusText : undefined } }));
 
             chatInput.disabled = false;
             chatInput.classList.remove('agent-active');   // CSS: box re-expands + orbs crossfade back
@@ -383,6 +388,14 @@
                 labelTimer = setTimeout(() => flipToggle.classList.remove('show-label'), 1200);
             });
         }
+
+        window.saccadeChatInput = {
+            send: function (text) {
+                chatInput.value = text;
+                startAgent();
+                return chatInput.classList.contains('agent-active');
+            }
+        };
 
         // Enter (without Shift) starts the agent; Shift+Enter inserts a newline.
         chatInput.addEventListener('keydown', (e) => {
