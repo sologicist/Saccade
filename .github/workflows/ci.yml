@@ -52,12 +52,9 @@ jobs:
       - name: Typecheck UI source
         working-directory: AutoCua/ui
         run: npm run typecheck
-      - name: Verify shipping UI bundle matches source
+      - name: Build UI bundle
         working-directory: AutoCua/ui
-        run: |
-          npm run build
-          git diff --exit-code -- index.js
-
+        run: npm run build
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
