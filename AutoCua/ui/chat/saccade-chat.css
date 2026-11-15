@@ -24,6 +24,25 @@ body.tuffui-app {
 }
 .autocua-scene #mainGrid { z-index: 1; }
 .autocua-scene #welcomeHero { z-index: 0; }
+.autocua-scene[data-agent-mode="web"] #welcomeHero { visibility: hidden; }
+.agent-activity {
+  padding: 8px 12px;
+  --color-fg-default: var(--foreground);
+  --color-fg-muted: var(--muted-foreground);
+  --color-fg-subtle: var(--muted-foreground);
+  --color-border-subtle: var(--border);
+  --color-border-focus: var(--ring);
+  --space-8: 8px;
+  --radius-sm: 6px;
+  --reasoning-trace-max-height: min(28vh, 220px);
+  --ai-ember-0: #1d4ed8;
+  --ai-ember-1: #8b5cf6;
+  --ai-ember-2: #c6588f;
+  --ai-ember-3: #f04438;
+  --ai-ember-4: #ff4700;
+  --ai-ember-5: #f79009;
+  --ai-ember-6: #fec84b;
+}
 .autocua-scene #chatWrapper {
   position: absolute; left: 50%; right: auto; top: auto; bottom: 0;
   width: min(100% - 24px, 728px); height: var(--composer-inset);

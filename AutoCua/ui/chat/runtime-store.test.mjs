@@ -81,3 +81,21 @@ test('surfaces startup failures and shell output without mixing sessions', () =>
   assert.equal(store.getSnapshot().running, false);
   assert.equal(store.getSnapshot().turns[0].text, 'Error: provider unavailable');
 });
+
+test('retains public progress summaries after completion and isolates the next run', () => {
+  const store = createChatStore();
+  store.receive({ type: 'user', text: 'Research' });
+  store.receive({ type: 'progress', text: 'Opening page' });
+  store.receive({ type: 'progress', text: 'Opening page' });
+  store.receive({ type: 'progress', text: 'Reading page' });
+  store.receive({ type: 'reply', html: '<p>Done</p>' });
+  store.receive({ type: 'idle' });
+  store.receive({ type: 'progress', text: 'Late update' });
+  assert.deepEqual(store.getSnapshot().turns[0].updates, ['Opening page', 'Reading page']);
+  const endedAt = store.getSnapshot().turns[0].endedAt;
+  assert.ok(Number.isFinite(Date.parse(endedAt)));
+  store.receive({ type: 'idle' });
+  assert.equal(store.getSnapshot().turns[0].endedAt, endedAt);
+  store.receive({ type: 'user', text: 'Next task' });
+  assert.equal(store.getSnapshot().turns[1].updates, undefined);
+});

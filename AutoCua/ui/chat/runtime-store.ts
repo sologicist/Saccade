@@ -17,6 +17,9 @@ export type RuntimeTurn = {
   id: string; task: string; at: string; via?: string; text: string; html: string;
   progress: string; tools: RuntimeTool[]; image?: string; video?: string;
   runId?: string;
+  /** Public progress summaries emitted by the runtime, retained for this run. */
+  updates?: string[];
+  endedAt?: string;
 };
 export type ChatSnapshot = {
   conversations: SavedChat[]; activeId?: string; title: string; turns: RuntimeTurn[];
@@ -104,9 +107,16 @@ export function createChatStore() {
         });
         break;
       case 'reply': updateTurn(t => ({ ...finishTools(t), html: event.html, progress: '' })); break;
-      case 'progress': updateTurn(t => ({ ...t, progress: event.text })); break;
+      case 'progress':
+        if (state.running && event.text.trim()) updateTurn(t => {
+          const updates = t.updates || [];
+          return { ...t, progress: event.text,
+            updates: updates[updates.length - 1] === event.text ? updates : [...updates, event.text] };
+        });
+        break;
       case 'idle':
-        updateTurn(t => finishTools({ ...t, text: event.error || t.text }, !!event.error));
+        updateTurn(t => finishTools({ ...t, text: event.error || t.text,
+          endedAt: state.running ? new Date().toISOString() : t.endedAt }, !!event.error));
         publish({ running: false, ...(event.error ? { error: event.error } : {}) });
         break;
       case 'error': publish({ error: event.text, loading: false }); break;

@@ -5,6 +5,7 @@ import { IconButton } from '../components/ui/action-button';
 import type { Conversation } from '../components/ui/conversation-list';
 import { chatStore, timestamp } from './runtime-store';
 import { AutoCuaScene } from './autocua-scene';
+import { AgentActivity } from './agent-activity';
 import './saccade-chat.css';
 
 declare global {
@@ -47,7 +48,7 @@ function RuntimeControls() {
 
 export function SaccadeChat() {
   const state = useSyncExternalStore(chatStore.subscribe, chatStore.getSnapshot);
-  const [runtime, setRuntime] = useState({ model: '', ready: false, hint: 'Starting Saccade…' });
+  const [runtime, setRuntime] = useState({ model: '', mode: 'computer', ready: false, hint: 'Starting Saccade…' });
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'));
 
   useEffect(() => {
@@ -59,16 +60,19 @@ export function SaccadeChat() {
     const read = () => {
       const input = document.querySelector<HTMLTextAreaElement>('.chat-input');
       const selection = window.getModelSelection?.();
-      const next = { model: selection?.model || '', ready: !!window.saccadeChatInput && !!selection?.provider && !!selection.model
+      const next = { model: selection?.model || '', mode: document.getElementById('agentModeWrap')?.dataset.mode || 'computer',
+      ready: !!window.saccadeChatInput && !!selection?.provider && !!selection.model
         && !!input && !input.readOnly && (!input.disabled || input.classList.contains('agent-active')),
       hint: input?.placeholder || 'Select a model in Settings to start…' };
-      setRuntime(old => old.model === next.model && old.ready === next.ready && old.hint === next.hint ? old : next);
+      setRuntime(old => old.model === next.model && old.mode === next.mode && old.ready === next.ready && old.hint === next.hint ? old : next);
     };
     const observer = new MutationObserver(read);
     const input = document.querySelector('.chat-input');
     const model = document.getElementById('chatModelDropdown');
+    const mode = document.getElementById('agentModeWrap');
     if (input) observer.observe(input, { attributes: true, attributeFilter: ['disabled', 'readonly', 'placeholder', 'class'] });
     if (model) observer.observe(model, { subtree: true, childList: true, characterData: true });
+    if (mode) observer.observe(mode, { attributes: true, attributeFilter: ['data-mode'] });
     document.addEventListener('chatinput:ready', read);
     document.addEventListener('agentmode:changed', read);
     read();
@@ -105,7 +109,9 @@ export function SaccadeChat() {
         composerDisabled={state.loading || (!state.running && !runtime.ready)}
         allowAttachments={false}
         composerToolbar={<RuntimeControls />}
-        conversationContent={inset => <AutoCuaScene bottomInset={inset} />}
+        composerStatus={<AgentActivity key={state.turns[state.turns.length - 1]?.id || 'empty'}
+          turn={state.turns[state.turns.length - 1]} running={state.running} />}
+        conversationContent={inset => <AutoCuaScene bottomInset={inset} mode={runtime.mode} />}
         headerActions={<>
           <IconButton icon={dark ? Sun : Moon} label={dark ? 'Activer le mode clair' : 'Activer le mode sombre'}
             aria-pressed={dark} onClick={() => setDark(value => !value)} />

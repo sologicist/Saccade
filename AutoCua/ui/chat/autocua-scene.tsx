@@ -6,8 +6,8 @@ import { ChatInput } from '../chat_input/chat_input.tsx';
 
 // Keep AutoCua's original DOM targets and controllers together. React only
 // adjusts the available space; the native runtime owns the scene and its turns.
-export function AutoCuaScene({ bottomInset }: { bottomInset: number }) {
-  return <div className="autocua-scene" style={{ '--composer-inset': `${bottomInset}px` } as CSSProperties}>
+export function AutoCuaScene({ bottomInset, mode }: { bottomInset: number; mode: string }) {
+  return <div className="autocua-scene" data-agent-mode={mode} style={{ '--composer-inset': `${bottomInset}px` } as CSSProperties}>
     <div className="welcome-hero" id="welcomeHero" aria-hidden="true">
       <div className="welcome-bloub">
         <div className="bot" role="img" aria-label="AutoCua">

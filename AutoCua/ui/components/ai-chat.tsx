@@ -51,6 +51,7 @@ export type AIChatProps = {
   onDeleteConversation?: (conversation: Conversation) => void;
   headerActions?: React.ReactNode;
   composerToolbar?: React.ReactNode;
+  composerStatus?: React.ReactNode;
   composerDisabled?: boolean;
   allowAttachments?: boolean;
   notice?: React.ReactNode;
@@ -82,6 +83,7 @@ export function AIChat({
   onDeleteConversation,
   headerActions,
   composerToolbar,
+  composerStatus,
   composerDisabled = false,
   allowAttachments = true,
   notice,
@@ -300,6 +302,7 @@ export function AIChat({
               className="absolute inset-x-0 bottom-0 bg-background before:pointer-events-none before:absolute before:inset-x-0 before:-top-6 before:h-6 before:bg-gradient-to-t before:from-background before:to-transparent"
             >
               <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 px-3 pt-1 pb-3 @md:px-5 @md:pb-5">
+                {composerStatus}
                 {notice}
                 <AgentComposer
                   value={draft}
