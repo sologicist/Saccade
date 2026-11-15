@@ -97,7 +97,7 @@ class AutoLite(unittest.TestCase):
         ticket=run.prepare(action)
         self.assertEqual(ticket['arguments']['pdf'],str(path))
         self.assertEqual(ticket['effect'],'disclosure')
-        raw=f.invoice()['fixture-one']['expected']
+        raw=json.dumps(f.invoice()['fixture-one']['expected'], ensure_ascii=False)
         class Provider:
             def scribe(self,pdf,markdown,description,expected):
                 self.content,self.markdown=pdf,markdown
@@ -105,7 +105,7 @@ class AutoLite(unittest.TestCase):
         provider=Provider()
         context=AccountingContext(f.data,{'synthetic-alpha':{'synthetic':False}},automatic=True,downloads_dir=f.root,provider=provider)
         result=context.scribe(str(path),'synthetic-alpha','achat')
-        self.assertTrue(result['ecriture'])
+        self.assertEqual(result, raw)
         self.assertEqual(provider.content,content)
         self.assertEqual(provider.markdown,reference.read_text())
         with self.assertRaisesRegex(BusinessError,'unauthorized_client'):
@@ -145,7 +145,7 @@ class AutoLite(unittest.TestCase):
         run=BusinessRun(f.context,project_root=f.root,download_since_ns=since)
         self.chrome_confirms(run,path); run.refresh()
         action={'type':'call_function','version':1,'name':'dext.scribe','arguments':{'pdf':path.name,'client_id':'synthetic-alpha','sens':'achat'}}
-        raw=f.invoice()['fixture-one']['expected']
+        raw=json.dumps(f.invoice()['fixture-one']['expected'], ensure_ascii=False)
         def worker(request,**options): return execute(request)
         with patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-key'})),patch('AutoCua.saccade.business_process.run_worker',side_effect=worker) as dispatch,patch.object(GeminiAccountingProvider,'scribe',return_value=raw) as provider:
             result=run.execute(run.prepare(action))
@@ -387,8 +387,7 @@ class Client:
         with patch.dict('os.environ',{'GOOGLE_API_KEY':'synthetic-not-a-key'}),patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-not-a-key'})):
             result=run.execute(ticket)
         self.assertEqual(result['status'],'success',result)
-        self.assertTrue(result['result']['ecriture'])
-        self.assertEqual(result['result']['fournisseur'],'Société École 東京')
+        self.assertEqual(result['result'], raw)
         # A frozen launcher uses this same worker with an explicitly configured
         # trusted Python runtime, never the frozen application binary or PATH.
         import sys
@@ -398,6 +397,7 @@ class Client:
         with patch('AutoCua.IS_COMPILED',True),patch.dict('os.environ',{'SACCADE_WORKER_PYTHON':sys.executable}),patch('AutoCua.saccade.accounting_provider.settings',return_value=('gemini-4-argon',{'GOOGLE_API_KEY':'synthetic-not-a-key'})):
             result=frozen.execute(ticket)
         self.assertEqual(result['status'],'success',result)
+        self.assertEqual(result['result'], raw)
 
     def test_real_sdk_pdf_envelope_and_worker_validation_without_network(self):
         import sys

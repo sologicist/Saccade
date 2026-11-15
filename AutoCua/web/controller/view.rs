@@ -1116,6 +1116,7 @@ mod platform_tests {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").to_string_lossy().as_ref())).unwrap();
             py.run(&CString::new(r#"
 from unittest.mock import patch
+import json
 import AutoCua.saccade.automatic_platform as auto
 from tests.business_fixtures import BusinessFixture
 from AutoCua.saccade.business_run import BusinessRun
@@ -1129,7 +1130,7 @@ def analyze(provider, pdf, markdown, description, expected):
     assert markdown == (business_fixture.data/'synthetic-alpha/comptable_achats.md').read_bytes().decode('utf-8-sig')
     assert expected == {'client_id':'synthetic-alpha','sens':'achat'}
     provider_inputs.append((pdf,markdown))
-    return expected_proposal
+    return json.dumps(expected_proposal, ensure_ascii=False)
 created = []
 class Run:
     def __init__(self):

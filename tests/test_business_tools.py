@@ -167,10 +167,12 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
         action = self.fixture.action(name="dext.scribe", arguments={"pdf": "fixture-one", "client_id": "synthetic-alpha", "sens": "achat"})
         result = run.execute(run.prepare(action))
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["result"]["total_ttc"], "120.00")
-        self.assertEqual(result["result"]["fournisseur"], "Synthetic Party")
-        self.assertEqual(result["result"]["description"], None)
-        self.assertEqual(len(result["result"]["ecriture"]), 3)
+
+        payload = json.loads(result["result"])
+        self.assertEqual(payload["total_ttc"], "120.00")
+        self.assertEqual(payload["fournisseur"], "Synthetic Party")
+        self.assertEqual(payload["description"], None)
+        self.assertEqual(len(payload["ecriture"]), 3)
 
     def test_bank_exact_label_full_markdown_and_provider_validation(self):
         clients, _ = client_registration(self.fixture.data)
@@ -231,7 +233,12 @@ def public(x: Annotated[int, {"minimum": 1, "maximum": 4}], mode: Literal["one",
         good = self.fixture.invoice()["fixture-one"]["expected"]
         good["ecriture"][0]["debit_centimes"] += 1
         with self.assertRaisesRegex(BusinessError, "invoice_entries_mismatch"):
-            analysis(good, "achat", has_description_rule=False)
+            analysis(
+                good,
+                "achat",
+                has_description_rule=False,
+                expected=self.fixture.invoice()["fixture-one"]["critical"]
+            )
 
     def test_worker_validates_response_identity_independently(self):
         run = self.fixture.run()
